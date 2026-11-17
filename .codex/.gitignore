@@ -1,0 +1,9 @@
+# Local configuration and skills stay untracked; project hooks are shared.
+*
+!.gitignore
+skills/*
+hooks/*
+!hooks.json
+!hooks/
+!hooks/fallow-gate.sh
+!hooks/fallow-gate.ps1

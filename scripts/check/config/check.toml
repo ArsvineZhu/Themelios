@@ -1,0 +1,15 @@
+roots = ["apps", "packages", "crates", "scripts", "src", "tests"]
+exclude_dirs = [".git", "node_modules", "temp", "dist", "target", "__pycache__"]
+ruff_version = "0.17.1"
+
+[limits.python]
+warn = 800
+reject = 900
+
+[limits.typescript]
+warn = 800
+reject = 900
+
+[limits.rust]
+warn = 500
+reject = 600

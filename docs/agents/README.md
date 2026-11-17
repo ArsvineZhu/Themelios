@@ -1,0 +1,10 @@
+# 编码 Agent 文档
+
+| 内容 | 入口 |
+| --- | --- |
+| AntiRLHF 行为要求、背景与配套材料 | [antirlhf/](antirlhf/README.md) |
+| temp 目录、材料组织与管理命令 | [temp 管理工具](../../scripts/temp/README.md) |
+| 开发检查、格式、长度与测试 | [开发检查工具](../../scripts/check/README.md) |
+| 代码、文档与参考项目检索 | [retrieval.md](retrieval.md) |
+| 模型任务、输入与提示词 | [llm-use.md](llm-use.md) |
+| Python 接口文档 | [docstring-std.md](docstring-std.md) |

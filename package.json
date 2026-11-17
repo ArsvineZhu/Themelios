@@ -1,0 +1,31 @@
+{
+  "name": "themelios-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "bun@1.4.4",
+  "engines": {
+    "bun": "1.4.4"
+  },
+  "scripts": {
+    "lint:agent": "oxlint --format=agent",
+    "fallow:agent": "fallow --format json --quiet --lean"
+  },
+  "workspaces": {
+    "packages": [
+      "packages/*",
+      "apps/*"
+    ],
+    "catalog": {
+      "zod": "4.6.7"
+    }
+  },
+  "trustedDependencies": [],
+  "devDependencies": {
+    "@ast-grep/cli": "0.51.3",
+    "fallow": "3.43.2",
+    "fallow-type-aware": "3.43.2",
+    "lefthook": "2.2.2",
+    "oxlint": "1.93.0",
+    "typescript": "7.0.2"
+  }
+}
