@@ -56,7 +56,18 @@ async function call(cwd: string, command: string[], json = true) {
   ]);
   if (code !== 0)
     throw new Error(command.slice(1).join(" ") + " failed:\n" + stderr.trim());
-  return json ? JSON.parse(stdout) : stdout;
+  if (!json) return stdout;
+  try {
+    return JSON.parse(stdout);
+  } catch (cause) {
+    throw new Error(
+      command.slice(1).join(" ") +
+        " did not return JSON (" +
+        stdout.length +
+        " characters)",
+      { cause },
+    );
+  }
 }
 
 try {
@@ -125,14 +136,22 @@ try {
     const initial = join(sandbox, "Portable 原目录");
     const moved = join(sandbox, "Portable 已搬迁");
     await cp(resolve(directory), initial, { recursive: true });
-    const invoke = (root: string, args: string[]) =>
-      call(sandbox, [
-        join(root, "runtime", process.platform === "win32" ? "bun.exe" : "bun"),
-        "--no-install",
-        join(root, "app/launch.mjs"),
-        "--json",
-        ...args,
-      ]);
+    const invoke = (root: string, args: string[], json = true) =>
+      call(
+        sandbox,
+        [
+          join(
+            root,
+            "runtime",
+            process.platform === "win32" ? "bun.exe" : "bun",
+          ),
+          "--no-install",
+          join(root, "app/launch.mjs"),
+          "--json",
+          ...args,
+        ],
+        json,
+      );
     await invoke(initial, ["instance", "init"]);
     const item = (await invoke(initial, [
       "material",
@@ -158,7 +177,7 @@ try {
       await invoke(moved, ["result", "read", result.ref]),
       result,
     );
-    await invoke(moved, ["material", "export", item.ref, "moved.txt"]);
+    await invoke(moved, ["material", "export", item.ref, "moved.txt"], false);
     equal(await Bun.file(join(sandbox, "moved.txt")).text(), "UTF-8 原件🍎");
     console.log("Portable reopened after moving to " + moved);
   }
