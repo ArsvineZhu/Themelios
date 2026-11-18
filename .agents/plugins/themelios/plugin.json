@@ -1,0 +1,6 @@
+{
+  "name": "themelios",
+  "displayName": "Themelios Workspace",
+  "version": "0.1.0",
+  "description": "Themelios workspace MCP integrations (Fallow and ast-grep)."
+}

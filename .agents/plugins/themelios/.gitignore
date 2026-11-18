@@ -1,0 +1,2 @@
+# Machine-local MCP paths are generated during workspace initialization.
+/mcp_config.json

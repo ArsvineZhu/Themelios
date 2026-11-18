@@ -1,6 +1,6 @@
 # 代码与资料检索
 
-工作区入口 `dev.ps1` 和 `dev.sh` 的 `env` 模式设置当前 shell 的开发环境并创建所需的 `temp/` 目录，不安装工具或配置 MCP。`init` 模式准备指定版本的 Bun 和开发依赖，安装缺失的 CodeGraph 和 Zvec-grep、准备本仓库索引并更新用户的 Codex MCP 配置；按用户要求初始化后，重新连接 MCP 或重启 Codex。检索索引排除 `legacy/`；Zvec-grep 也排除历史讨论目录 `docs/sources/`。
+工作区入口 `dev.ps1` 和 `dev.sh` 的 `env` 模式设置当前 shell 的开发环境并创建所需的 `temp/` 目录，不安装工具或配置 MCP。`init` 模式准备指定版本的 Bun 和开发依赖，安装缺失的 CodeGraph 和 Zvec-grep、准备本仓库索引并通过 `scripts/harness/` 同步已检测到的 Agent Harness（Codex、Antigravity 等）MCP 配置；按用户要求初始化后，在对应客户端重连 MCP 或重启生效。检索索引排除 `legacy/`；Zvec-grep 也排除历史讨论目录 `docs/sources/`。
 
 ## 检索本仓库
 

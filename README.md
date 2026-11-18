@@ -20,6 +20,6 @@ Linux 或 macOS：
 source ./dev.sh init
 ```
 
-之后每个新终端先运行 `. ./dev.ps1` 或 `source ./dev.sh`，再使用 `bun`。要重新安装工作区依赖，运行 `bun install --frozen-lockfile`。初始化会配置 Codex 的 CodeGraph、Zvec-grep、Fallow 和 ast-grep 连接；已有的其他连接保持原样。
+之后每个新终端先运行 `. ./dev.ps1` 或 `source ./dev.sh`，再使用 `bun`。要重新安装工作区依赖，运行 `bun install --frozen-lockfile`。初始化会检测已安装的 Agent Harness（如 Codex、Antigravity）并配置对应的 CodeGraph、Zvec-grep、Fallow 和 ast-grep MCP 连接；已有的全局或其它连接保持原样。
 
 [开发工具](scripts/README.md)介绍工作区和检查命令，[文档目录](docs/README.md)介绍现有资料。

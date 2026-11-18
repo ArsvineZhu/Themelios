@@ -1,4 +1,4 @@
-# Dot-source this file: . ./dev.ps1 env
+﻿# Dot-source this file: . ./dev.ps1 env
 param([ValidateSet('env', 'init', 'status')][string]$Action = 'env')
 $themeliosRepoRoot = $PSScriptRoot
 $themeliosTempRoot = Join-Path $themeliosRepoRoot 'temp'
@@ -17,7 +17,7 @@ foreach ($themeliosEntry in $themeliosEnvPaths.GetEnumerator()) {
     [Environment]::SetEnvironmentVariable($themeliosEntry.Key, $themeliosPath, 'Process')
 }
 [Environment]::SetEnvironmentVariable('UV_NO_EDITABLE', '1', 'Process')
-if (($env:CODEX_THREAD_ID -or $env:CODEX_SESSION_ID) -and $null -eq [Environment]::GetEnvironmentVariable('AGENT', 'Process')) {
+if (($env:CODEX_THREAD_ID -or $env:CODEX_SESSION_ID -or $env:ANTIGRAVITY_AGENT -or $env:CLAUDECODE) -and $null -eq [Environment]::GetEnvironmentVariable('AGENT', 'Process')) {
     $env:AGENT = '1'
 }
 $themeliosPythonScripts = Join-Path $env:UV_PROJECT_ENVIRONMENT 'Scripts'

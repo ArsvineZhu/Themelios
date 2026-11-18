@@ -5,7 +5,7 @@ export THEMELIOS_REPO_ROOT
 export UV_CACHE_DIR="$THEMELIOS_REPO_ROOT/temp/cache/uv"
 export UV_PROJECT_ENVIRONMENT="$THEMELIOS_REPO_ROOT/temp/venvs/themelios"
 export UV_NO_EDITABLE=1
-if [ -n "${CODEX_THREAD_ID:-}${CODEX_SESSION_ID:-}" ] && [ "${AGENT+x}" != x ]; then
+if [ -n "${CODEX_THREAD_ID:-}${CODEX_SESSION_ID:-}${ANTIGRAVITY_AGENT:-}${CLAUDECODE:-}" ] && [ "${AGENT+x}" != x ]; then
     export AGENT=1
 fi
 export UV_PYTHON_INSTALL_DIR="$THEMELIOS_REPO_ROOT/temp/tools/python"

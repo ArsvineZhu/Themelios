@@ -1,5 +1,6 @@
 {
   "$schema": "./node_modules/fallow/schema.json",
+  "supportEntry": ["scripts/harness/run.mjs"],
   "typeAware": {
     "enabled": true
   },

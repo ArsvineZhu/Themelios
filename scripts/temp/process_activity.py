@@ -9,7 +9,7 @@ import shutil
 import sys
 from collections.abc import Sequence
 from pathlib import Path
-from typing import TypedDict, Union, cast
+from typing import TypedDict, cast
 
 from shared import Unsafe, command, within
 
@@ -58,7 +58,7 @@ def process_references() -> tuple[list[ProcessReference], list[str]]:
         ancestors.add(str(parent))
         try:
             status = Path(f"/proc/{parent}/status").read_text()
-            match = re.search(r"^PPid:\s+(\d+)", status, re.M)
+            match = re.search(r"^PPid:\s+(\d+)", status, re.MULTILINE)
             parent = int(match[1]) if match else 0
         except OSError:
             break
@@ -67,11 +67,11 @@ def process_references() -> tuple[list[ProcessReference], list[str]]:
             continue
         try:
             status = (proc / "status").read_text()
-            if re.search(r"^State:\s+[ZX]\b|^Kthread:\s+1\b", status, re.M):
+            if re.search(r"^State:\s+[ZX]\b|^Kthread:\s+1\b", status, re.MULTILINE):
                 continue
-            uid = re.search(r"^Uid:\s+(\d+)", status, re.M)
+            uid = re.search(r"^Uid:\s+(\d+)", status, re.MULTILINE)
             owned = uid is not None and int(uid[1]) == os.getuid()
-            name_match = re.search(r"^Name:\s+(.+)", status, re.M)
+            name_match = re.search(r"^Name:\s+(.+)", status, re.MULTILINE)
             if name_match is None:
                 raise ValueError("missing process name")
             name = name_match[1]
@@ -147,7 +147,7 @@ def process_references() -> tuple[list[ProcessReference], list[str]]:
             unreadable.append("fd")
         try:
             current = (proc / "status").read_text()
-            if re.search(r"^State:\s+[ZX]\b", current, re.M):
+            if re.search(r"^State:\s+[ZX]\b", current, re.MULTILINE):
                 continue
         except FileNotFoundError:
             continue
@@ -234,7 +234,7 @@ def windows_busy_paths() -> BusyPaths:
             "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine | ConvertTo-Json -Compress"
         )
         raw = command(["pwsh", "-NoProfile", "-NonInteractive", "-Command", script])
-        data = cast(Union[ProcessInfo, list[ProcessInfo]], json.loads(raw.decode("utf-8-sig")))  # noqa: UP007
+        data = cast(ProcessInfo | list[ProcessInfo], json.loads(raw.decode("utf-8-sig")))
         items = [data] if isinstance(data, dict) else data
         parents = {item["ProcessId"]: item["ParentProcessId"] for item in items}
         ancestors: set[int] = set()

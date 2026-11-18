@@ -10,7 +10,9 @@ import stat
 import sys
 import uuid
 from collections.abc import Generator, Sequence
+from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 from process_activity import block_reason, busy_paths
 from shared import Unsafe, command, within
@@ -51,18 +53,53 @@ MATERIAL_DIRS = (
     "Diagnostics/Fixtures",
     "Incoming",
 )
-MEDIA = set(
-    (
-        ".pdf .png .jpg .jpeg .gif .webp .bmp .tif .tiff .avif .heic .svg "
-        ".wav .mp3 .flac .ogg .opus .m4a .aac .aiff .aif .wma .amr .pcm "
-        ".mp4 .mov .mkv .webm .avi .m4v .mpg .mpeg "
-        ".doc .docx .ppt .pptx .xls .xlsx .epub .srt .vtt"
-    ).split()
-)
+MEDIA = {
+    ".pdf",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".bmp",
+    ".tif",
+    ".tiff",
+    ".avif",
+    ".heic",
+    ".svg",
+    ".wav",
+    ".mp3",
+    ".flac",
+    ".ogg",
+    ".opus",
+    ".m4a",
+    ".aac",
+    ".aiff",
+    ".aif",
+    ".wma",
+    ".amr",
+    ".pcm",
+    ".mp4",
+    ".mov",
+    ".mkv",
+    ".webm",
+    ".avi",
+    ".m4v",
+    ".mpg",
+    ".mpeg",
+    ".doc",
+    ".docx",
+    ".ppt",
+    ".pptx",
+    ".xls",
+    ".xlsx",
+    ".epub",
+    ".srt",
+    ".vtt",
+}
 EXCLUDED_TOP = re.compile(
     r"^(build|cache|dist|runtime|work|reference-code|wheel-installed|"
     r"sdist-check|tools|venvs|new-api.*|native-.*|themelios-.*|pytest-.*)$",
-    re.I,
+    re.IGNORECASE,
 )
 EXCLUDED_PARTS = {
     ".git",
@@ -88,7 +125,7 @@ Snapshot = dict[Path, Fingerprint]
 
 
 @contextlib.contextmanager
-def directory(path: Path, create: bool = False) -> Generator[int, None, None]:  # noqa: UP043
+def directory(path: Path, create: bool = False) -> Generator[int, None, None]:
     """Walk from / using directory handles; never traverse a symbolic link."""
     fd = os.open("/", DIR_FLAGS)
     try:
@@ -161,7 +198,7 @@ def initialize_agents() -> None:
 
 
 @contextlib.contextmanager
-def cleanup_lock() -> Generator[Identity, None, None]:  # noqa: UP043
+def cleanup_lock() -> Generator[Identity, None, None]:
     if os.name == "nt":
         with windows_cleanup_lock() as root_id:
             yield root_id
@@ -202,7 +239,7 @@ def is_material(path: Path, top: str) -> bool:
         or path.name.lower() == "custom-array-schema.json"
         or (
             ext == ".txt"
-            and re.search(r"material|sample|transcript|script", path.stem, re.I) is not None
+            and re.search(r"material|sample|transcript|script", path.stem, re.IGNORECASE) is not None
         )
     )
 
@@ -413,7 +450,17 @@ def selected_targets(values: Sequence[str]) -> list[Path]:
     return sorted(result)
 
 
-def clean(args: argparse.Namespace, locked_root: Identity | None = None) -> None:
+@dataclass(frozen=True)
+class TempArgs:
+    """Parsed CLI arguments for the temp directory tool."""
+
+    action: str
+    targets: list[str]
+    apply: bool
+    include_toolchains: bool
+
+
+def clean(args: TempArgs, locked_root: Identity | None = None) -> None:
     busy = busy_paths()
     if args.apply and busy[2]:
         raise Unsafe("；".join(busy[2]))
@@ -499,7 +546,7 @@ def clean(args: argparse.Namespace, locked_root: Identity | None = None) -> None
 
 
 @contextlib.contextmanager
-def cleanup_directory(locked_root: Identity | None) -> Generator[None, None, None]:  # noqa: UP043
+def cleanup_directory(locked_root: Identity | None) -> Generator[None, None, None]:
     if os.name == "nt":
         windows_assert_directory(TEMP)
         if identity(TEMP.stat()) != locked_root:
@@ -556,7 +603,7 @@ def windows_initialize_agents() -> None:
 
 
 @contextlib.contextmanager
-def windows_cleanup_lock() -> Generator[Identity, None, None]:  # noqa: UP043
+def windows_cleanup_lock() -> Generator[Identity, None, None]:
     import msvcrt
 
     windows_assert_directory(TEMP)
@@ -696,7 +743,13 @@ def main() -> None:
         action="store_true",
         help="clean 同时清理 tools 和 venvs",
     )
-    args = parser.parse_args()
+    ns = parser.parse_args()
+    args = TempArgs(
+        action=cast(str, ns.action),
+        targets=[str(item) for item in cast(Sequence[object], ns.targets)],
+        apply=cast(bool, ns.apply),
+        include_toolchains=cast(bool, ns.include_toolchains),
+    )
     if args.action != "clean" and (args.apply or args.include_toolchains or args.targets):
         parser.error("指定路径、--apply 和 --include-toolchains 仅适用于 clean")
     if args.action == "init":

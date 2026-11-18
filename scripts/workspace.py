@@ -1,4 +1,4 @@
-"""Prepare the workspace search tools and their Codex connections."""
+"""Prepare the workspace search tools and Agent Harness integrations."""
 
 from __future__ import annotations
 
@@ -8,21 +8,40 @@ import platform
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
+from collections.abc import Mapping
 from pathlib import Path
-
-import tomlkit  # pyright: ignore[reportMissingImports]
+from typing import cast
 
 ROOT = Path(__file__).resolve().parents[1]
+HARNESS_DIR = ROOT / "scripts" / "harness"
+if str(HARNESS_DIR) not in sys.path:
+    sys.path.insert(0, str(HARNESS_DIR))
+
+from manage import (
+    build_mcp_servers,
+    sync_mcp,
+)
+from manage import (
+    load_config as load_harness_config,
+)
+from manage import (
+    print_status as print_harness_status,
+)
+
 TOOLS = ROOT / "temp" / "tools"
 BUN_TOOLS = Path(
     os.environ.get("THEMELIOS_BUN_DIR", TOOLS / f"bun-{platform.system().lower()}")
 )
-BUN = BUN_TOOLS / "node_modules" / "bun" / "bin" / "bun.exe"
+BUN = (
+    BUN_TOOLS
+    / "node_modules"
+    / "bun"
+    / "bin"
+    / ("bun.exe" if os.name == "nt" else "bun")
+)
 ZG_BIN = TOOLS / "zvec-grep" / "node_modules" / "@zvec" / "zvec-grep" / "bin"
 ZG = ZG_BIN / ("zg.exe" if os.name == "nt" else "zg")
-CODEGRAPH_TOOLS = "explore,node,search,callers,callees,impact"
 AST_GREP_MCP = (
     "git+https://github.com/ast-grep/ast-grep-mcp@"
     "51d5a23f025c73c02032a98748dc06942548c5e1"
@@ -81,8 +100,13 @@ def install(prefix: Path, package: str) -> None:
 
 
 def prepare_toolchain() -> None:
-    package = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
-    manager = package["packageManager"]
+    raw_package = cast(
+        object, json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
+    )
+    if not isinstance(raw_package, Mapping):
+        raise TypeError("package.json 格式无效。")
+    package = cast(Mapping[str, object], raw_package)
+    manager = package.get("packageManager")
     if not isinstance(manager, str) or not manager.startswith("bun@"):
         raise RuntimeError("package.json 必须指定 Bun 版本。")
     version = manager.removeprefix("bun@")
@@ -120,10 +144,21 @@ def prepare_git_hook() -> None:
         text=True,
         check=True,
     )
-    hook = json.loads(result.stdout)["hooks"]["git"]
-    if hook["installed"]:
-        if not hook["managed_block_present"]:
-            raise RuntimeError("已有其他 Git pre-commit 钩子，请将 Fallow 门禁合并到现有钩子。")
+    raw_status = cast(object, json.loads(result.stdout))
+    if not isinstance(raw_status, Mapping):
+        raise TypeError("无法解析 Git 钩子状态。")
+    hooks = cast(Mapping[str, object], raw_status).get("hooks")
+    if not isinstance(hooks, Mapping):
+        raise TypeError("无法解析 Git 钩子状态。")
+    hook = cast(Mapping[str, object], hooks).get("git")
+    if not isinstance(hook, Mapping):
+        raise TypeError("无法解析 Git 钩子状态。")
+    git_hook = cast(Mapping[str, object], hook)
+    if git_hook.get("installed"):
+        if not git_hook.get("managed_block_present"):
+            raise RuntimeError(
+                "已有其他 Git pre-commit 钩子，请将 Fallow 门禁合并到现有钩子。"
+            )
         return
     run(str(BUN), "run", "fallow", "hooks", "install", "--target", "git")
 
@@ -144,66 +179,8 @@ def sync_graph(graph: str) -> None:
         time.sleep(1)
 
 
-def write_config(path: Path, original: str, doc: object) -> None:
-    updated = tomlkit.dumps(doc)
-    if updated == original:
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        mode="w", encoding="utf-8", dir=path.parent, delete=False
-    ) as temp:
-        temporary = Path(temp.name)
-        temp.write(updated)
-    try:
-        temporary.replace(path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def configure_mcp(
-    graph_command: str, graph_args: list[str], zg: str, environment: dict[str, str]
-) -> None:
-    """Update only the two managed servers, preserving other Codex settings."""
-    home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
-    path = home / "config.toml"
-    original = path.read_text(encoding="utf-8") if path.exists() else ""
-    doc = tomlkit.parse(original) if original else tomlkit.document()
-    servers = doc.setdefault("mcp_servers", tomlkit.table())
-    for name, command, args, values in (
-        (
-            "codegraph",
-            graph_command,
-            graph_args,
-            {"CODEGRAPH_MCP_TOOLS": CODEGRAPH_TOOLS},
-        ),
-        (
-            "zvec-grep",
-            zg,
-            ["--server", "--stdio"],
-            {
-                "ZVEC_GREP_HOME": environment["ZVEC_GREP_HOME"],
-                "ZVEC_GREP_MODEL_CACHE": environment["ZVEC_GREP_MODEL_CACHE"],
-            },
-        ),
-    ):
-        server = servers.setdefault(name, tomlkit.table())
-        server.pop("url", None)
-        server.pop("enabled_tools", None)
-        server.pop("disabled_tools", None)
-        server["command"] = command
-        server["args"] = args
-        server["enabled"] = True
-        if name == "zvec-grep":
-            server.setdefault("startup_timeout_sec", 120)
-        server_env = server.setdefault("env", tomlkit.table())
-        for key, value in values.items():
-            server_env[key] = value
-    write_config(path, original, doc)
-    print("Codex MCP 已配置。", flush=True)
-
-
-def configure_project_mcp(environment: dict[str, str]) -> None:
-    """Register the project-local analysis tools without changing other settings."""
+def prepare_ast_grep_mcp(environment: dict[str, str]) -> None:
+    """Install the pinned ast-grep MCP server binary into temp/tools when needed."""
     receipt = AST_GREP_TOOL / "sg-mcp" / "uv-receipt.toml"
     revision = AST_GREP_MCP.rsplit("@", 1)[1]
     installed = receipt.is_file() and revision in receipt.read_text(encoding="utf-8")
@@ -235,37 +212,6 @@ def configure_project_mcp(environment: dict[str, str]) -> None:
             f"sg-mcp @ {AST_GREP_MCP}",
             env=tool_environment,
         )
-    path = ROOT / ".codex" / "config.toml"
-    original = path.read_text(encoding="utf-8") if path.exists() else ""
-    doc = tomlkit.parse(original) if original else tomlkit.document()
-    servers = doc.setdefault("mcp_servers", tomlkit.table())
-    for name, executable_path, args, values in (
-        (
-            "fallow",
-            str(BUN),
-            ["run", "fallow-mcp"],
-            {"FALLOW_CACHE_DIR": environment["FALLOW_CACHE_DIR"]},
-        ),
-        (
-            "ast-grep",
-            str(AST_GREP_SERVER),
-            [],
-            {"AST_GREP_PATH": f'"{BUN}" run ast-grep', "PYTHONHOME": ""},
-        ),
-    ):
-        server = servers.setdefault(name, tomlkit.table())
-        server.pop("url", None)
-        server["command"] = executable_path
-        server["args"] = args
-        server["cwd"] = str(ROOT)
-        server["enabled"] = True
-        if values:
-            server_env = server.setdefault("env", tomlkit.table())
-            for key, value in values.items():
-                server_env[key] = value
-        server.setdefault("startup_timeout_sec", 60)
-    write_config(path, original, doc)
-    print("工作区的 Fallow 和 ast-grep MCP 已配置。", flush=True)
 
 
 def init() -> None:
@@ -304,8 +250,7 @@ def init() -> None:
         "!docs/sources/**",
         env=environment,
     )
-    executable("codex")
-    # An installed npm shim is resolved by Codex using PATH; a local install uses Node directly.
+    # An installed npm shim is resolved via PATH; a local install uses Node directly.
     if Path(graph) == local_graph:
         graph_command = executable("node")
         shim = (
@@ -319,9 +264,18 @@ def init() -> None:
         graph_args = [str(shim), "serve", "--mcp"]
     else:
         graph_command, graph_args = graph, ["serve", "--mcp"]
-    configure_mcp(graph_command, graph_args, zg, environment)
-    configure_project_mcp(environment)
-    print("工作区检索工具已就绪。Codex 中重连 MCP 或重启后使用新配置。", flush=True)
+    prepare_ast_grep_mcp(environment)
+    servers = build_mcp_servers(
+        load_harness_config(),
+        graph_command=graph_command,
+        graph_args=graph_args,
+        zg_path=zg,
+    )
+    sync_mcp("all", servers=servers)
+    print(
+        "工作区检索工具与 Harness 适配器已就绪。各客户端重连 MCP 或重启后生效。",
+        flush=True,
+    )
 
 
 def status() -> None:
@@ -331,6 +285,7 @@ def status() -> None:
     if not zg:
         raise RuntimeError("找不到 zg，请先初始化工作区。")
     run(zg, "--status", "--mode", "direct")
+    print_harness_status("all")
 
 
 if __name__ == "__main__":
@@ -338,6 +293,12 @@ if __name__ == "__main__":
         if len(sys.argv) != 2 or sys.argv[1] not in ("init", "status"):
             raise RuntimeError("用法：workspace init|status")
         (init if sys.argv[1] == "init" else status)()
-    except (OSError, RuntimeError, ValueError, subprocess.CalledProcessError) as error:
+    except (
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+        subprocess.CalledProcessError,
+    ) as error:
         print(f"工作区初始化失败：{error}", file=sys.stderr)
         sys.exit(1)

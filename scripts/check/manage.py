@@ -10,8 +10,10 @@ import shutil
 import subprocess
 import sys
 import tomllib
+from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import TypedDict, cast
 
 from metrics import python_code_lines, rust_code_lines
 
@@ -29,6 +31,24 @@ LANGUAGES = {
     ".mjs": "typescript",
     ".cjs": "typescript",
 }
+
+
+class _ByteOffset(TypedDict):
+    start: int
+    end: int
+
+
+class _LineCol(TypedDict):
+    line: int
+
+
+class _AstRange(TypedDict):
+    start: _LineCol
+    byteOffset: _ByteOffset
+
+
+class _AstMatch(TypedDict):
+    range: _AstRange
 
 
 def command(argv: list[str], source: bytes, *, no_match_ok: bool = False) -> bytes:
@@ -64,10 +84,15 @@ def typescript_lines(source: bytes, path: Path, bun: str) -> int:
     formatted = command([bun, "fmt", "--stdin-filepath", str(path)], source)
     lang = "tsx" if path.suffix in {".tsx", ".jsx"} else "typescript"
     query = [bun, "run", "ast-grep", "run", "--stdin", "--lang", lang]
-    errors = json.loads(
-        command(
-            [*query, "--kind", "ERROR", "--json=compact"], formatted, no_match_ok=True
-        )
+    errors = cast(
+        list[_AstMatch],
+        json.loads(
+            command(
+                [*query, "--kind", "ERROR", "--json=compact"],
+                formatted,
+                no_match_ok=True,
+            )
+        ),
     )
     if errors:
         line = errors[0]["range"]["start"]["line"] + 1
@@ -77,7 +102,7 @@ def typescript_lines(source: bytes, path: Path, bun: str) -> int:
         formatted,
         no_match_ok=True,
     )
-    comments = json.loads(matches or b"[]")
+    comments = cast(list[_AstMatch], json.loads(matches or b"[]"))
     code = bytearray(formatted)
     for match in comments:
         span = match["range"]["byteOffset"]
@@ -87,17 +112,20 @@ def typescript_lines(source: bytes, path: Path, bun: str) -> int:
     return sum(bool(line.strip()) for line in code.splitlines())
 
 
-def count(path: Path, language: str, config: dict) -> int:
+def count(path: Path, language: str, config: Mapping[str, object]) -> int:
     source = path.read_bytes()
-    source.decode("utf-8")
+    _ = source.decode("utf-8")
     if language == "typescript":
         return typescript_lines(source, path, bun_path())
     if language == "python":
+        ruff_version = config.get("ruff_version")
+        if not isinstance(ruff_version, str):
+            raise ValueError("配置文件缺少有效的 ruff_version。")
         formatted = command(
             [
                 "uvx",
                 "--from",
-                f"ruff=={config['ruff_version']}",
+                f"ruff=={ruff_version}",
                 "ruff",
                 "format",
                 "--stdin-filename",
@@ -122,10 +150,17 @@ def count(path: Path, language: str, config: dict) -> int:
     return rust_code_lines(formatted.decode("utf-8"))
 
 
-def discover(config: dict) -> list[Path]:
+def _string_list(config: Mapping[str, object], key: str) -> list[str]:
+    raw = config.get(key)
+    if not isinstance(raw, list | tuple):
+        raise TypeError(f"配置文件中的 {key} 必须是列表。")
+    return [str(item) for item in cast(Sequence[object], raw)]
+
+
+def discover(config: Mapping[str, object]) -> list[Path]:
     paths: list[Path] = []
-    excluded = set(config["exclude_dirs"])
-    for name in config["roots"]:
+    excluded = set(_string_list(config, "exclude_dirs"))
+    for name in _string_list(config, "roots"):
         root = ROOT / name
         if not root.exists():
             continue
@@ -150,23 +185,26 @@ def main() -> int:
     parser.add_argument("paths", nargs="*")
     parser.add_argument("--stdin", action="store_true")
     parser.add_argument("--zero", action="store_true")
-    args = parser.parse_args()
-    if args.zero and not args.stdin:
+    ns = parser.parse_args()
+    stdin = cast(bool, ns.stdin)
+    zero = cast(bool, ns.zero)
+    raw_paths = [str(item) for item in cast(Sequence[object], ns.paths)]
+    if zero and not stdin:
         parser.error("--zero 需要和 --stdin 一起使用")
-    if args.stdin and args.paths:
+    if stdin and raw_paths:
         parser.error("--stdin 不能和文件参数一起使用")
     try:
-        config = tomllib.loads(CONFIG.read_text(encoding="utf-8"))
-        selected = args.stdin or bool(args.paths)
-        names = args.paths
-        if args.stdin:
-            separator = b"\0" if args.zero else b"\n"
+        config: Mapping[str, object] = tomllib.loads(CONFIG.read_text(encoding="utf-8"))
+        selected = stdin or bool(raw_paths)
+        names: list[str] = raw_paths
+        if stdin:
+            separator = b"\0" if zero else b"\n"
             names = [
                 item.decode("utf-8")
                 for item in sys.stdin.buffer.read().split(separator)
                 if item
             ]
-        paths = []
+        paths: list[Path] = []
         for name in names:
             path = (ROOT / name).resolve()
             if not path.is_relative_to(ROOT) or not path.is_file():
@@ -182,6 +220,11 @@ def main() -> int:
             except (OSError, ValueError, SyntaxError, UnicodeError, KeyError) as error:
                 return path, None, str(error)
 
+        raw_limits = config.get("limits")
+        if not isinstance(raw_limits, Mapping):
+            raise TypeError("配置文件缺少 limits。")
+        limits_map = cast(Mapping[str, object], raw_limits)
+
         failed = False
         warnings = 0
         with ThreadPoolExecutor(max_workers=min(4, max(1, len(paths)))) as pool:
@@ -191,13 +234,18 @@ def main() -> int:
                     failed = True
                     print(f"{label}  拒绝  {error}")
                     continue
-                limits = config["limits"][LANGUAGES[path.suffix]]
-                if lines > limits["reject"]:
+                lang_limits_raw = limits_map[LANGUAGES[path.suffix]]
+                if not isinstance(lang_limits_raw, Mapping):
+                    raise TypeError(f"配置文件缺少 {LANGUAGES[path.suffix]} 限制。")
+                lang_limits = cast(Mapping[str, object], lang_limits_raw)
+                reject_limit = cast(int, lang_limits["reject"])
+                warn_limit = cast(int, lang_limits["warn"])
+                if lines > reject_limit:
                     failed = True
-                    print(f"{label}  {lines}  拒绝  > {limits['reject']}")
-                elif lines > limits["warn"]:
+                    print(f"{label}  {lines}  拒绝  > {reject_limit}")
+                elif lines > warn_limit:
                     warnings += 1
-                    print(f"{label}  {lines}  警告  > {limits['warn']}")
+                    print(f"{label}  {lines}  警告  > {warn_limit}")
                 elif selected:
                     print(f"{label}  {lines}  通过")
         print("长度检查失败" if failed else f"长度检查通过，警告 {warnings}")
@@ -205,6 +253,7 @@ def main() -> int:
     except (
         OSError,
         UnicodeError,
+        TypeError,
         ValueError,
         KeyError,
         tomllib.TOMLDecodeError,

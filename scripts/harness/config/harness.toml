@@ -1,0 +1,13 @@
+harnesses = ["codex", "antigravity"]
+
+[paths]
+runtime = "temp/runtime"
+fallow_cache = "temp/cache/fallow"
+gate_report = "temp/work/fallow-gate/report.json"
+zvec_home = "temp/tools/zvec-grep/runtime"
+zvec_models = "temp/tools/zvec-grep/models"
+
+[mcp]
+codegraph_tools = "explore,node,search,callers,callees,impact"
+zvec_startup_timeout_sec = 120
+workspace_startup_timeout_sec = 60

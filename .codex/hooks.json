@@ -4,8 +4,8 @@
       {
         "hooks": [
           {
-            "command": "d=\"$(pwd)\"; until [ -f \"$d/.codex/hooks/fallow-gate.sh\" ] || [ -e \"$d/.git\" ] || [ \"$d\" = / ]; do d=\"$(dirname \"$d\")\"; done; if [ -f \"$d/.codex/hooks/fallow-gate.sh\" ]; then cd \"$d\" || exit 2; export TMPDIR=\"$d/temp/runtime\" FALLOW_CACHE_DIR=\"$d/temp/cache/fallow\" FALLOW_GATE_REPORT=\"$d/temp/work/fallow-gate/report.json\"; mkdir -p \"$TMPDIR\" \"$FALLOW_CACHE_DIR\" \"$(dirname \"$FALLOW_GATE_REPORT\")\"; exec ./.codex/hooks/fallow-gate.sh; fi; exit 0",
-            "commandWindows": "pwsh -NoProfile -Command \"& (Join-Path (git rev-parse --show-toplevel) '.codex/hooks/fallow-gate.ps1'); exit `$LASTEXITCODE\"; exit $LASTEXITCODE",
+            "command": "d=\"$(pwd)\"; until [ -f \"$d/scripts/harness/run.sh\" ] || [ -e \"$d/.git\" ] || [ \"$d\" = / ]; do d=\"$(dirname \"$d\")\"; done; if [ -f \"$d/scripts/harness/run.sh\" ]; then cd \"$d\" || exit 2; exec sh ./scripts/harness/run.sh gate --harness codex; fi; exit 0",
+            "commandWindows": "& (Join-Path (git rev-parse --show-toplevel) 'scripts/harness/run.ps1') gate --harness codex; exit $LASTEXITCODE",
             "type": "command"
           }
         ],

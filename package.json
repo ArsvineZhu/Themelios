@@ -22,6 +22,7 @@
   "trustedDependencies": [],
   "devDependencies": {
     "@ast-grep/cli": "0.51.3",
+    "@types/node": "26.6.6",
     "fallow": "3.43.2",
     "fallow-type-aware": "3.43.2",
     "lefthook": "2.2.2",
