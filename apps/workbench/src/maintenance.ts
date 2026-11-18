@@ -73,8 +73,6 @@ export function maintain(installationRoot: string, request: OfflineRequest) {
                 ? {}
                 : { retainSince: request.retainSince },
             );
-          if (request.action === "migrate")
-            return { status: "current", formatId, cut: database.cut() };
           const storage = await verifyStorage(database, cas);
           await verifyContent(database, cas);
           return storage;

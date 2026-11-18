@@ -2,7 +2,7 @@ import { extname } from "node:path";
 import { AppError } from "@themelios/core";
 import type { BlobInfo, Cas } from "@themelios/storage";
 import { fileTypeFromBuffer } from "file-type";
-import type { Extent } from "./contracts.js";
+import type { Extent } from "./artifacts.js";
 import { contentError } from "./validation.js";
 
 const textExtensions: Partial<Record<string, string>> = {

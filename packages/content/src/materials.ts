@@ -3,31 +3,76 @@ import {
   openCall,
   selectionSchema,
   throwIfAborted,
+  type AgentArtifactRef,
   type ArtifactRef,
+  type CallOptions,
+  type Selection,
 } from "@themelios/core";
-import { resolveCut, type Cas, type Database } from "@themelios/storage";
+import {
+  resolveCut,
+  type Cas,
+  type Database,
+  type WriteTransaction,
+} from "@themelios/storage";
 import { z } from "zod";
 import {
   addArtifact,
+  agentRefFor,
   decodeSelection,
   listArtifacts,
   prepareAdoption,
   publicInfo,
+  resolveArtifactRef,
   retain,
   storedArtifact,
+  type ArtifactInfo,
   type Query,
+  type SourceLink,
 } from "./artifacts.js";
-import type { Materials, PreparedMaterial, SourceLink } from "./contracts.js";
 import {
   captureImport,
   importArtifact,
-  type CapturedImport,
+  type AcceptInput,
   type ImportLimits,
 } from "./imports.js";
 import { rawBytes, selectionText, utf8Text } from "./selections.js";
-import { structureText } from "./text-structure.js";
+import { structureText, type TextBlock } from "./text-structure.js";
 import { contentError, validated } from "./validation.js";
-import type { ScheduleContentWrite } from "./write-schedule.js";
+
+export interface PreparedMaterial {
+  readonly info: Omit<ArtifactInfo, "createdAt" | "createdAtCut">;
+  adopt(tx: WriteTransaction): Selection;
+  close(): Promise<void>;
+}
+
+export interface MaterialRead {
+  readonly info: ArtifactInfo;
+  readonly body: ReadableStream<Uint8Array>;
+}
+
+export interface Materials {
+  prepare(input: AcceptInput, options?: CallOptions): Promise<PreparedMaterial>;
+  accept(input: AcceptInput, options?: CallOptions): Promise<Selection>;
+  inspect(ref: ArtifactRef): ArtifactInfo;
+  resolve(refOrAgentRef: string): ArtifactRef;
+  agentRef(ref: ArtifactRef): AgentArtifactRef;
+  read(ref: ArtifactRef, options?: CallOptions): Promise<MaterialRead>;
+  text(selection: Selection, options?: CallOptions): Promise<string>;
+  structure(ref: ArtifactRef, options?: CallOptions): Promise<TextBlock[]>;
+  sources(ref: ArtifactRef, options?: { depth?: number }): SourceLink[];
+  list(options?: {
+    at?: string;
+    after?: ArtifactRef;
+    limit?: number;
+  }): ArtifactInfo[];
+  retain(ref: ArtifactRef): void;
+  release(ref: ArtifactRef): void;
+  export(
+    ref: ArtifactRef,
+    destination: string,
+    options?: CallOptions,
+  ): Promise<void>;
+}
 
 function readSources(
   sql: Query,
@@ -64,59 +109,60 @@ export function createMaterials(
   database: Database,
   cas: Cas,
   limits: ImportLimits,
-  scheduleWrite: ScheduleContentWrite,
 ): Materials {
   const lookup = (ref: ArtifactRef) =>
     database.read((tx) => storedArtifact(tx.sql, ref));
-  async function prepare(
-    captured: CapturedImport,
-    signal: AbortSignal,
+
+  async function prepareImport(
+    input: AcceptInput,
+    operation: string,
+    options?: CallOptions,
   ): Promise<PreparedMaterial> {
-    const artifact = await importArtifact(cas, captured, limits, { signal });
-    const { blob: _blob, ...info } = artifact;
-    return {
-      info: structuredClone(info),
-      ...prepareAdoption(database, "materials.prepare", (tx) => {
-        if (addArtifact(tx, artifact)) retain(tx.sql, artifact.ref, tx.seq);
-        return { ref: artifact.ref };
-      }),
-    };
+    database.requireWritable(operation);
+    const scope = openCall(operation, options);
+    try {
+      const captured = captureImport(input, limits.maxInlineBytes);
+      const artifact = await importArtifact(cas, captured, limits, {
+        signal: scope.signal,
+      });
+      const { blob: _blob, ...info } = artifact;
+      return {
+        info: structuredClone(info),
+        ...prepareAdoption(database, operation, (tx) => {
+          if (addArtifact(tx, artifact)) retain(tx.sql, artifact.ref, tx.seq);
+          return { ref: artifact.ref };
+        }),
+      };
+    } finally {
+      scope.close();
+    }
   }
-  const materials: Materials = {
+
+  return {
     prepare(input, options) {
-      return scheduleWrite(
-        "materials.prepare",
-        () => {
-          database.requireWritable("materials.prepare");
-          const captured = captureImport(input, limits.maxInlineBytes);
-          return (signal) => prepare(captured, signal);
-        },
-        options,
-      );
+      return prepareImport(input, "materials.prepare", options);
     },
 
-    accept(input, options) {
-      return scheduleWrite(
-        "materials.accept",
-        () => {
-          database.requireWritable("materials.accept");
-          const captured = captureImport(input, limits.maxInlineBytes);
-          return async (signal) => {
-            const prepared = await prepare(captured, signal);
-            try {
-              throwIfAborted(signal);
-              return database.write((tx) => prepared.adopt(tx));
-            } finally {
-              await prepared.close();
-            }
-          };
-        },
-        options,
-      );
+    async accept(input, options) {
+      const prepared = await prepareImport(input, "materials.accept", options);
+      try {
+        throwIfAborted(options?.signal);
+        return database.write((tx) => prepared.adopt(tx));
+      } finally {
+        await prepared.close();
+      }
     },
 
     inspect(ref) {
       return publicInfo(lookup(ref));
+    },
+
+    resolve(refOrAgentRef) {
+      return database.read((tx) => resolveArtifactRef(tx.sql, refOrAgentRef));
+    },
+
+    agentRef(ref) {
+      return database.read((tx) => agentRefFor(tx.sql, ref));
     },
 
     async read(ref, options) {
@@ -160,6 +206,7 @@ export function createMaterials(
           ref,
           utf8Text(bytes, artifact),
           artifact.mediaType === "text/markdown",
+          artifact.blob,
         );
         scope.throwIfAborted();
         return blocks;
@@ -207,5 +254,4 @@ export function createMaterials(
       await cas.export(lookup(ref).blob, destination, options);
     },
   };
-  return materials;
 }

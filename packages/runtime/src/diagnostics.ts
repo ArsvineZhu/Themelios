@@ -1,29 +1,22 @@
-import { AsyncLocalStorage } from "node:async_hooks";
+import { randomBytes } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { finished } from "node:stream/promises";
-import {
-  ROOT_CONTEXT,
-  SpanStatusCode,
-  trace,
-  type Context,
-  type Span,
-} from "@opentelemetry/api";
-import { OTLPMetricExporter } from "@opentelemetry/exporter-metrics-otlp-http";
-import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
-import {
-  MeterProvider,
-  PeriodicExportingMetricReader,
-} from "@opentelemetry/sdk-metrics";
-import { BatchSpanProcessor, TracerProvider } from "@opentelemetry/sdk-trace";
 import { AppError, type Json } from "@themelios/core";
 import pino from "pino";
 import { createStream } from "rotating-file-stream";
 import type { RuntimeSettings } from "./settings.js";
-import type { Secrets } from "./secrets.js";
 
 export interface LogFields {
   [key: string]: Json;
+}
+
+export interface TraceFrame {
+  readonly traceId: string;
+  readonly spanId: string;
+  readonly parentSpanId?: string;
+  readonly operation: string;
+  completedEvent?: boolean;
 }
 
 export interface ModelAttemptDiagnostic {
@@ -50,7 +43,12 @@ export interface ModelContentDiagnostic {
 }
 
 export interface Diagnostics {
-  log(level: LogLevel, event: string, fields?: LogFields): void;
+  log(
+    level: LogLevel,
+    event: string,
+    fields?: LogFields,
+    traceOverride?: TraceFrame,
+  ): void;
   span<T>(name: string, work: () => Promise<T>, fields?: LogFields): Promise<T>;
   flush(): Promise<void>;
   close(): void | Promise<void>;
@@ -65,6 +63,10 @@ export interface Diagnostics {
   recordNetworkBytes?(direction: "sent" | "received", size: number): void;
 }
 
+export interface RuntimeDiagnostics extends Diagnostics {
+  correlate(): { traceId?: string; spanId?: string };
+}
+
 type LogLevel = RuntimeSettings["logging"]["level"];
 const levels: Record<LogLevel, number> = {
   debug: 10,
@@ -74,6 +76,14 @@ const levels: Record<LogLevel, number> = {
 };
 const secretField =
   /(?:authorization|cookie|api[-_]?key|access[-_]?token|refresh[-_]?token|secret|password|credential|private[-_]?key)$/i;
+
+export function newTraceId(): string {
+  return randomBytes(16).toString("hex");
+}
+
+export function newSpanId(): string {
+  return randomBytes(8).toString("hex");
+}
 
 export function redactDiagnostics(value: Json): Json {
   if (Array.isArray(value)) return value.map(redactDiagnostics);
@@ -132,36 +142,18 @@ export function bootstrapDiagnostics(correlationId: string): Diagnostics {
   };
 }
 
-type Trace = {
-  context: Context;
-  span: Span;
-  operation: string;
-  completedEvent?: true;
-};
-const errorTraces = new WeakMap<Error, string>();
-
-export function diagnoseError(error: Error, traceId?: string): void {
-  if (traceId) errorTraces.set(error, traceId);
-}
-
-export function diagnosticTrace(error: unknown): string | undefined {
-  return error instanceof Error ? errorTraces.get(error) : undefined;
-}
-
-export interface RuntimeDiagnostics extends Diagnostics {
-  operation<T>(name: string, work: () => Promise<T>): Promise<T>;
-  correlate(): { traceId?: string };
-}
-
 export async function createRuntimeDiagnostics(input: {
   settings: RuntimeSettings;
   logs: string;
-  secrets: Secrets;
   correlationId: string;
   level: () => LogLevel | undefined;
   capture: () => boolean | undefined;
+  traceScope: {
+    current(): TraceFrame | undefined;
+    enter<T>(frame: TraceFrame, work: () => Promise<T>): Promise<T>;
+  };
 }): Promise<RuntimeDiagnostics> {
-  const { settings, logs, secrets, correlationId } = input;
+  const { settings, logs, correlationId, traceScope } = input;
   const logFile = join(logs, "runtime.jsonl");
   let file: ReturnType<typeof createStream> | undefined;
   let fileDone: Promise<void> | undefined;
@@ -233,112 +225,62 @@ export async function createRuntimeDiagnostics(input: {
       },
     },
   );
-  const traceContext = new AsyncLocalStorage<Trace>();
-  const { endpoint, credential } = settings.telemetry;
-  const getHeaders = async () =>
-    credential ? { Authorization: await secrets.resolve(credential) } : {};
-  const telemetryUrl = (suffix: string) =>
-    endpoint!.replace(/\/$/, "") + "/v1/" + suffix;
-  const metrics = new MeterProvider({
-    readers: endpoint
-      ? [
-          new PeriodicExportingMetricReader({
-            exporter: new OTLPMetricExporter({
-              url: telemetryUrl("metrics"),
-              headers: getHeaders,
-              timeoutMillis: 2000,
-            }),
-            exportTimeoutMillis: 2000,
-          }),
-        ]
-      : [],
-  });
-  const tracerProvider = new TracerProvider({
-    spanProcessors: endpoint
-      ? [
-          new BatchSpanProcessor({
-            exporter: new OTLPTraceExporter({
-              url: telemetryUrl("traces"),
-              headers: getHeaders,
-              timeoutMillis: 2000,
-            }),
-            exportTimeoutMillis: 2000,
-            maxQueueSize: 512,
-            maxExportBatchSize: 128,
-          }),
-        ]
-      : [],
-  });
-  const tracer = tracerProvider.getTracer("themelios.runtime");
-  const meter = metrics.getMeter("themelios.runtime");
-  const duration = meter.createHistogram("themelios.operation.duration", {
-    unit: "ms",
-  });
-  const active = meter.createUpDownCounter("themelios.operation.active", {
-    unit: "{operation}",
-  });
-  const modelAttempts = meter.createCounter("themelios.model.attempts", {
-    unit: "{request}",
-  });
-  const modelTokens = meter.createCounter("themelios.model.tokens", {
-    unit: "{token}",
-  });
-  const queueWait = meter.createHistogram("themelios.queue.wait", {
-    unit: "ms",
-  });
-  const networkBytes = meter.createCounter("themelios.network.bytes", {
-    unit: "By",
-  });
   let attachments = 0;
+
   const diagnostics: RuntimeDiagnostics = {
     correlate() {
-      const traceId = traceContext.getStore()?.span.spanContext().traceId;
-      return traceId ? { traceId } : {};
+      const current = traceScope.current();
+      return current
+        ? { traceId: current.traceId, spanId: current.spanId }
+        : {};
     },
-    log(level, event, fields = {}) {
+
+    log(level, event, fields = {}, traceOverride) {
       if (
         closed ||
         levels[level] < levels[input.level() ?? settings.logging.level]
       )
         return;
-      const current = traceContext.getStore();
-      const ids = current?.span.spanContext();
+      const current = traceOverride ?? traceScope.current();
       logger[level]({
         ...(redactDiagnostics(fields) as LogFields),
         event,
         correlationId,
-        ...(current ? { operation: current.operation } : {}),
-        ...(ids ? { traceId: ids.traceId, spanId: ids.spanId } : {}),
+        ...(current
+          ? {
+              operation: current.operation,
+              traceId: current.traceId,
+              spanId: current.spanId,
+              ...(current.parentSpanId === undefined
+                ? {}
+                : { parentSpanId: current.parentSpanId }),
+            }
+          : {}),
       });
     },
+
     async span(name, work, fields = {}) {
-      const parent = traceContext.getStore();
-      const context = parent?.context ?? ROOT_CONTEXT;
-      const span = tracer.startSpan(name, {}, context);
-      const operation = parent?.operation ?? name;
+      const parent = traceScope.current();
+      const frame: TraceFrame = {
+        traceId: parent?.traceId ?? newTraceId(),
+        spanId: newSpanId(),
+        ...(parent ? { parentSpanId: parent.spanId } : {}),
+        operation: parent?.operation ?? name,
+      };
       const root = !parent;
       const begin = performance.now();
-      if (root) active.add(1, { operation });
-      let outcome = "success";
+      let outcome: "success" | "failure" = "success";
       let code = "";
-      const current: Trace = {
-        context: trace.setSpan(context, span),
-        span,
-        operation,
-      };
-      return traceContext.run(current, async () => {
+      return traceScope.enter(frame, async () => {
         try {
-          const result = await work();
-          span.setStatus({ code: SpanStatusCode.OK });
-          return result;
+          return await work();
         } catch (error) {
           outcome = "failure";
           code = error instanceof AppError ? error.code : "internal.unexpected";
-          span.setStatus({ code: SpanStatusCode.ERROR, message: code });
           throw error;
         } finally {
           const durationMs = Math.round(performance.now() - begin);
-          if (!current.completedEvent || root) {
+          if (!frame.completedEvent || root) {
             diagnostics.log(
               outcome === "success" ? "info" : "warn",
               root ? "operation.completed" : "stage.completed",
@@ -349,19 +291,13 @@ export async function createRuntimeDiagnostics(input: {
                 outcome,
                 ...(code ? { code } : {}),
               },
+              frame,
             );
           }
-          if (root) {
-            duration.record(durationMs, { operation, outcome, code });
-            active.add(-1, { operation });
-          }
-          span.end();
         }
       });
     },
-    operation(name, work) {
-      return diagnostics.span(name, work);
-    },
+
     recordModelAttempt(record) {
       const {
         connection,
@@ -376,24 +312,16 @@ export async function createRuntimeDiagnostics(input: {
         reasoningTokens,
         providerStatus,
       } = record;
-      const span = traceContext.getStore();
-      if (span) span.completedEvent = true;
-      const labels = { connection, binding, outcome, code };
-      modelAttempts.add(1, labels);
-      for (const [category, value] of Object.entries({
-        input: inputTokens,
-        output: outputTokens,
-        cache: cacheTokens,
-        reasoning: reasoningTokens,
-      })) {
-        if (value !== undefined && Number.isSafeInteger(value) && value >= 0)
-          modelTokens.add(value, { ...labels, category });
-      }
+      const frame = traceScope.current();
+      if (frame) frame.completedEvent = true;
       diagnostics.log(
         outcome === "success" ? "info" : "warn",
         "model.request.completed",
         {
-          ...labels,
+          connection,
+          binding,
+          outcome,
+          ...(code ? { code } : {}),
           stage: "model.request",
           attempt,
           durationMs,
@@ -403,15 +331,17 @@ export async function createRuntimeDiagnostics(input: {
           ...(cacheTokens === undefined ? {} : { cacheTokens }),
           ...(reasoningTokens === undefined ? {} : { reasoningTokens }),
         },
+        frame,
       );
     },
+
     async captureModelContent({ attempt, secrets = [], ...contents }) {
       if (!diagnostics.capturesModelContent?.()) return;
-      const ids = traceContext.getStore()?.span.spanContext();
-      if (!ids) return;
-      const directory = join(logs, "model-content", ids.traceId);
+      const frame = traceScope.current();
+      if (!frame) return;
+      const directory = join(logs, "model-content", frame.traceId);
       const sequence = attachments++;
-      const filename = join(directory, `${ids.spanId}-${sequence}.json`);
+      const filename = join(directory, `${frame.spanId}-${sequence}.json`);
       try {
         await mkdir(directory, { recursive: true });
         const sanitized = withoutSecrets(
@@ -429,67 +359,32 @@ export async function createRuntimeDiagnostics(input: {
         });
       }
     },
+
     capturesModelContent() {
       return (
-        !closed && (input.capture() ?? settings.telemetry.captureModelContent)
+        !closed && (input.capture() ?? settings.logging.captureModelContent)
       );
     },
+
     recordQueueWait(stage, queueMs, labels = {}) {
-      queueWait.record(queueMs, { stage, ...labels });
       diagnostics.log("debug", "queue.acquired", { stage, queueMs, ...labels });
     },
-    recordNetworkBytes(direction, size) {
-      networkBytes.add(size, { direction });
-    },
+
+    recordNetworkBytes() {},
+
     async flush() {
       const stream = file;
       if (stream)
         await new Promise<void>((resolve) => stream.write("", () => resolve()));
-      await capped(
-        "flush",
-        Promise.all([
-          tracerProvider.forceFlush({ timeoutMillis: 2000 }),
-          metrics.forceFlush(),
-        ]),
-        correlationId,
-      );
     },
+
     async close() {
       if (closed) return;
       await diagnostics.flush();
       closed = true;
       file?.end();
       await fileDone;
-      await capped(
-        "shutdown",
-        Promise.all([tracerProvider.shutdown(), metrics.shutdown()]),
-        correlationId,
-      );
     },
   };
   return diagnostics;
-}
-
-async function capped(
-  stage: string,
-  work: Promise<unknown>,
-  correlationId: string,
-): Promise<void> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    await Promise.race([
-      work,
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error("deadline_exceeded")), 2000);
-      }),
-    ]);
-  } catch (error) {
-    stderr("diagnostics.telemetry_failed", {
-      stage,
-      reason: String(error),
-      correlationId,
-    });
-  } finally {
-    clearTimeout(timer);
-  }
 }

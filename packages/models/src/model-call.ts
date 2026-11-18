@@ -23,7 +23,7 @@ import type {
   ModelNotice,
   ModelsOptions,
   Usage,
-} from "./contracts.js";
+} from "./types.js";
 import {
   logDiagnostic,
   type ModelReply,

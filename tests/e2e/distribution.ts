@@ -8,6 +8,10 @@ import {
 } from "node:fs/promises";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { deepStrictEqual, equal, ok } from "node:assert/strict";
+import {
+  Client,
+  StreamableHTTPClientTransport,
+} from "@modelcontextprotocol/client";
 import { repoRoot, run } from "../../scripts/workspaces.js";
 
 const flags = process.argv.slice(2).filter((arg) => arg !== "--");
@@ -70,15 +74,110 @@ async function call(cwd: string, command: string[], json = true) {
   }
 }
 
+async function verifyInventoryServer(
+  inventory: string,
+  original: string,
+  sourceRef: string,
+) {
+  const token = crypto.randomUUID();
+  const server = Bun.spawn(
+    [bun, "--no-install", "main.ts", "--installation", "demo", "serve"],
+    {
+      cwd: inventory,
+      env: { ...process.env, THEMELIOS_INVENTORY_TOKEN: token },
+      stdout: "ignore",
+      stderr: "pipe",
+      stdin: "ignore",
+    },
+  );
+  const client = new Client({ name: "inventory-consumer", version: "0.1.0" });
+  const reader = server.stderr.getReader();
+  const headers = { authorization: "Bearer " + token };
+  const signal = AbortSignal.timeout(15_000);
+  const deadline = Promise.withResolvers<never>();
+  function onTimeout() {
+    deadline.reject(signal.reason);
+  }
+  signal.addEventListener("abort", onTimeout, { once: true });
+  try {
+    const decoder = new TextDecoder();
+    let ready = "";
+    while (!ready.includes("\n")) {
+      const entry = await Promise.race([reader.read(), deadline.promise]);
+      if (entry.done)
+        throw new Error("Inventory server did not start: " + ready);
+      ready += decoder.decode(entry.value, { stream: true });
+    }
+    const { endpoints } = JSON.parse(ready.split("\n")[0]!);
+    const http = (path: string, init?: RequestInit) =>
+      fetch(new URL(path, endpoints.http), {
+        ...init,
+        signal,
+        headers: { ...headers, ...init?.headers },
+      });
+    const csv = "sku,name,quantity\nPEN,签字笔,3\n";
+    const stream = (body: string) =>
+      http("/inventory/import-stream", {
+        method: "POST",
+        headers: { "content-type": "text/csv" },
+        body,
+      });
+    const sse = await stream(csv);
+    equal(sse.status, 200);
+    const events = await sse.text();
+    ok(events.includes("event: progress") && events.includes('"cut":"3"'));
+    const invalid = await stream("sku,name,quantity\nPEN,签字笔,-1\n");
+    ok((await invalid.text()).includes("event: error"));
+    const download = await http("/inventory/source/" + sourceRef);
+    equal(download.status, 200);
+    deepStrictEqual(
+      new Uint8Array(await download.arrayBuffer()),
+      new TextEncoder().encode(original),
+    );
+    await client.connect(
+      new StreamableHTTPClientTransport(new URL(endpoints.mcp), {
+        requestInit: { headers },
+      }),
+    );
+    const tool = await client.callTool({
+      name: "inventory_history",
+      arguments: { sku: "PEN" },
+    });
+    const report = tool.structuredContent as {
+      result: { cut: string; rows: Array<{ quantity: number }> };
+    };
+    equal(report.result.cut, "3");
+    deepStrictEqual(
+      report.result.rows.map((row) => row.quantity),
+      [12, 7, 3],
+    );
+  } finally {
+    signal.removeEventListener("abort", onTimeout);
+    await client.close();
+    server.kill();
+    await reader.cancel();
+    reader.releaseLock();
+    await server.exited;
+  }
+}
+
 try {
   const inventory = await prepare("inventory");
   const execute = (args: string[]) =>
-    call(inventory, [bun, "--no-install", "main.ts", "demo", ...args]);
+    call(inventory, [
+      bun,
+      "--no-install",
+      "main.ts",
+      "--installation",
+      "demo",
+      "--json",
+      ...args,
+    ]);
   const first = "sku,name,quantity\r\nPEN,签字笔,12\r\nBOOK,练习本,0\r\n";
   const second = "sku,name,quantity\nPEN,签字笔,7\nPAPER,A4纸,1000000000\n";
   await Bun.write(join(inventory, "first.csv"), first);
   await Bun.write(join(inventory, "second.csv"), second);
-  await execute(["init"]);
+  await execute(["instance", "init"]);
   const a = (await execute(["import", "first.csv"])) as {
     cut: string;
     sourceRef: string;
@@ -95,6 +194,7 @@ try {
   ok(latest.includes('"quantity":7') && latest.includes("PAPER"));
   await execute(["export", a.sourceRef, "exported.csv"]);
   equal(await Bun.file(join(inventory, "exported.csv")).text(), first);
+  await verifyInventoryServer(inventory, first, a.sourceRef);
   const resolved = await call(
     inventory,
     [
@@ -113,7 +213,7 @@ try {
     bun,
     "--no-install",
     "-e",
-    "await import('@themelios/models/prompts'); await import('@themelios/application/tasks'); console.log(true)",
+    "await import('@themelios/models'); await import('@themelios/models/tasks'); let hasApp = true; try { import.meta.resolve('@themelios/application'); } catch { hasApp = false; } if (hasApp) throw new Error('Expected standalone embedded install without @themelios/application'); console.log(true)",
   ]);
   if (live) {
     const model = (await call(embedded, [
@@ -126,6 +226,14 @@ try {
     };
     ok(model.value.title && model.value.sections.length);
     ok(model.value.sections.every((item) => item.sourceKeys.includes("S1")));
+    const fromFile = (await call(embedded, [
+      bun,
+      "--no-install",
+      "embedded-summary.ts",
+      "--file-prompt",
+    ])) as typeof model;
+    ok(fromFile.value.title && fromFile.value.sections.length);
+    ok(fromFile.value.sections.every((item) => item.sourceKeys.includes("S1")));
     console.log("External model: " + model.producer.details.providerModel);
   }
 

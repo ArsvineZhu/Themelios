@@ -4,6 +4,7 @@
   "properties": {
     "language": {
       "default": "zh-CN",
+      "descriptionKey": "tasks.mediaDescription.fields.language",
       "type": "string",
       "enum": [
         "zh-CN",
@@ -13,6 +14,7 @@
     },
     "instructions": {
       "default": null,
+      "descriptionKey": "tasks.mediaDescription.fields.instructions",
       "anyOf": [
         {
           "type": "string",

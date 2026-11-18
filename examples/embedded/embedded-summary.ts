@@ -1,15 +1,12 @@
 import { fileURLToPath } from "node:url";
-import { createPreparation } from "@themelios/application/inputs";
-import { createTasks } from "@themelios/application/tasks";
-import { createModels } from "@themelios/models";
-import { createPrompts } from "@themelios/models/prompts";
-import { defineTask } from "@themelios/models/tasks";
-import { z } from "zod";
+import { createModels, defineTask, z } from "@themelios/models";
+
+const filePrompt = process.argv.includes("--file-prompt");
 
 const task = defineTask({
   id: "sample.summary",
-  titleKey: "sample.summary.title",
-  purposeKey: "sample.summary.purpose",
+  title: "Sample Summary",
+  purpose: "Summarize text materials into structured markdown sections.",
   input: z.strictObject({ language: z.enum(["en", "zh-CN"]).default("en") }),
   output: z.strictObject({
     title: z.string().min(1),
@@ -29,22 +26,24 @@ const task = defineTask({
     maxMaterials: 1,
     inputs: [{ mediaType: "text/plain", needs: ["text"] }],
   },
-  templates: { system: "system.md.liquid", user: "user.md.liquid" },
-  examples: [],
-  outputRuleKeys: ["sample.summary.sourceRequired"],
-  validateOutput(value, sources) {
-    return value.sections.every((section) =>
-      section.sourceKeys.every((key) => sources.has(key)),
-    )
+  templates: filePrompt
+    ? { system: "system.md.liquid", user: "user.md.liquid" }
+    : {
+        inline: true,
+        system:
+          "Summarize the material concisely and cite source keys such as S1.",
+        user: "Language: {{ language }}\n{% for s in sources %}Source {{ s.key }} ({{ s.name }}): {{ s.originalExtent }}\n{% endfor %}",
+      },
+  validateOutput: (value, sources) =>
+    value.sections.every((s) => s.sourceKeys.every((k) => sources.has(k)))
       ? []
       : [
           {
             path: ["sections"],
             code: "unknown_source",
-            messageKey: "sample.summary.sourceRequired",
+            messageKey: "unknown_source",
           },
-        ];
-  },
+        ],
 });
 
 const baseURL = process.env.THEMELIOS_MODEL_URL;
@@ -54,7 +53,9 @@ if (!baseURL || !providerModel) {
     "Provide THEMELIOS_MODEL_URL and THEMELIOS_MODEL_ID for a structured-output model.",
   );
 }
+
 const models = createModels({
+  resourceRoot: fileURLToPath(new URL("./resources", import.meta.url)),
   connections: {
     local: {
       protocol: "openai-compatible",
@@ -81,27 +82,11 @@ const models = createModels({
 });
 
 try {
-  const prompts = createPrompts({
-    resourceRoot: fileURLToPath(new URL("./resources/", import.meta.url)),
-  });
-  const tasks = createTasks({
-    models,
-    prompts,
-    preparation: createPreparation(),
-    routes: { [task.id]: { model: "summary" } },
-  });
-  const bytes = await Bun.file(
-    new URL("./summary-material.txt", import.meta.url),
-  ).bytes();
-  const result = await tasks.run(task, {
+  const result = await models.runTask(task, {
     variables: {},
     materials: [
       {
-        source: {
-          bytes,
-          mediaType: "text/plain",
-          name: "summary-material.txt",
-        },
+        path: fileURLToPath(new URL("./summary-material.txt", import.meta.url)),
       },
     ],
   });

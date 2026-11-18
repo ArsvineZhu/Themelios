@@ -1,11 +1,19 @@
-import { appError, jsonSchema, parseJson, type Json } from "@themelios/core";
+import {
+  appError,
+  jsonSchema,
+  parseJson,
+  parseValue,
+  type Json,
+} from "@themelios/core";
 import { z } from "zod";
 import type {
   Connection,
   EmbeddingSpace,
   ModelBinding,
   ModelParameters,
-} from "./contracts.js";
+  SourceDirectory,
+  SourceEntry,
+} from "./types.js";
 
 export const modelNameSchema = z
   .string()
@@ -136,4 +144,65 @@ export function validateOutput<O extends Json>(
   }
   parseJson(result.data);
   return result.data;
+}
+
+export const sourceEntrySchema: z.ZodType<SourceEntry> = z.strictObject({
+  key: z
+    .string()
+    .regex(/^S[1-9]\d*$/)
+    .describe("Short key for a material in this call."),
+  mediaType: mimePatternSchema.describe("Media type of the original material."),
+  name: z
+    .string()
+    .optional()
+    .describe("Display name of the original material, when known."),
+  originalExtent: z
+    .string()
+    .describe("Range of the original material selected for this call."),
+  deliveredExtent: z
+    .array(z.string())
+    .describe("Actual representations or ranges passed to the task."),
+  role: z
+    .enum(["primary", "context"])
+    .describe("Material being processed or auxiliary context."),
+}) as z.ZodType<SourceEntry>;
+
+const directorySchema = z.array(sourceEntrySchema);
+
+export function createSourceDirectory(
+  input: readonly SourceEntry[],
+): SourceDirectory {
+  const entries = Object.freeze(
+    parseValue(directorySchema, input, "input.invalid").map((entry) =>
+      Object.freeze({
+        ...entry,
+        deliveredExtent: Object.freeze([...entry.deliveredExtent]),
+      }),
+    ),
+  );
+  const keys = new Set(entries.map((entry) => entry.key));
+  if (keys.size !== entries.length)
+    throw appError("input.invalid", {
+      details: {
+        issues: [{ path: ["sources"], reason: "Duplicate source key" }],
+      },
+    });
+  const result = { entries } as SourceDirectory;
+  Object.defineProperties(result, {
+    has: { value: (key: string) => keys.has(key) },
+    link: {
+      value: (key: string) => {
+        if (!keys.has(key))
+          throw appError("input.invalid_source_key", {
+            details: { sourceKey: key },
+          });
+        return "source:" + key;
+      },
+    },
+  });
+  return Object.freeze(result);
+}
+
+export function sourcesJsonSchema(): Json {
+  return parseJson(z.toJSONSchema(directorySchema));
 }

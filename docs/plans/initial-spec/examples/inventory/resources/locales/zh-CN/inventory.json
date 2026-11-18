@@ -1,0 +1,19 @@
+{
+  "inventory.settings.maxFileBytes.title": "CSV 大小上限",
+  "inventory.settings.maxFileBytes.description": "一次导入的文件字节数，允许 1 byte 至 8 MiB。",
+  "inventory.settings.maxFileBytes.impact": "下一次导入按此限制累计实际读取字节。",
+  "inventory.settings.maxRows.title": "导入记录上限",
+  "inventory.settings.maxRows.description": "表头之后的数据记录数，允许 1 至 100000。",
+  "inventory.settings.maxRows.impact": "下一次导入先校验全部记录数，再保存材料与库存行。",
+  "inventory.file_too_large": "源 CSV 超过配置的字节上限。",
+  "inventory.read_failed": "读取源 CSV 失败。",
+  "inventory.invalid_header": "CSV 表头必须按顺序恰好包含 sku,name,quantity。",
+  "inventory.invalid_csv": "源文件不是合法的 UTF-8 CSV。",
+  "inventory.row_count": "数据记录数量不在配置允许范围内。",
+  "inventory.invalid_row": "一条 CSV 记录包含无效字段。",
+  "inventory.duplicate_sku": "同一份导入文件重复出现了相同 SKU。",
+  "inventory.invalid_cut": "提交位置格式无效，或该位置尚未提交。",
+  "inventory.invalid_sku": "SKU 必须由 1 至 64 个大写字母、数字、点、下划线或连字符组成。",
+  "inventory.source_not_found": "该来源不是本库存应用的导入材料。",
+  "inventory.usage": "用法：main.ts ROOT init | import CSV | list [CUT] | history SKU [CUT] | export REF DESTINATION"
+}

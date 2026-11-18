@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { basename, join, relative } from "node:path";
 import { buildPackages } from "../build-packages.js";
 import { orderedWorkspaces, repoRoot, run, workspaces } from "../workspaces.js";
@@ -27,7 +28,13 @@ try {
   const files = git.stdout
     .toString()
     .split("\0")
-    .filter((path) => path && !path.includes("/generated/"));
+    .filter(
+      (path) =>
+        path &&
+        !path.includes("/generated/") &&
+        !path.startsWith("docs/plans/") &&
+        existsSync(join(repoRoot, path)),
+    );
   const roots = [...targeted].map((pkg) =>
     relative(repoRoot, pkg.root).replaceAll("\\", "/"),
   );
@@ -44,7 +51,7 @@ try {
   const tests = scope.filter(
     (path) => path.startsWith("tests/") && path.endsWith(".test.ts"),
   );
-  await buildPackages(names, true, true);
+  await buildPackages(names, true);
   if (names.length) {
     for (const pkg of targeted)
       await run(

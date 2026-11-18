@@ -7,7 +7,6 @@
   },
   "references": [
     { "path": "../application" },
-    { "path": "../content" },
     { "path": "../core" },
     { "path": "../runtime" }
   ],

@@ -10,6 +10,7 @@ import {
   type SavedResult,
   type Selection,
 } from "@themelios/core";
+import type { SourceLink } from "./artifacts.js";
 import { contentError, pointer, validated } from "./validation.js";
 
 export type CapturedOutput = {
@@ -142,9 +143,9 @@ export function selectOutput(
 }
 
 export function resultLinks(
-  result: Pick<SavedResult, "inputs" | "files" | "mappings">,
+  result: Pick<SavedResult, "inputs" | "files">,
   upstream: readonly ArtifactRef[],
-) {
+): SourceLink[] {
   return [
     ...result.inputs.flatMap((use) =>
       [use.source, ...use.delivered].map((selection) => ({
@@ -156,10 +157,6 @@ export function resultLinks(
       selection: file.material,
       relation: "file" as const,
     })),
-    ...(result.mappings?.map((mapping) => ({
-      selection: mapping.source,
-      relation: "copy" as const,
-    })) ?? []),
     ...upstream.map((ref) => ({
       selection: { ref },
       relation: "representation-source" as const,

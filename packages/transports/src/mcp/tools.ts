@@ -1,11 +1,12 @@
 import {
   callOperation,
+  type AgentRefBridge,
+  type BinaryReadResult,
   type Operation,
-  type OperationContext,
+  type OperationDirectory,
   type Principal,
-} from "@themelios/application";
-import type { MaterialRead } from "@themelios/content";
-import type { Json } from "@themelios/core";
+} from "@themelios/runtime/operations";
+import { jsonSchema, type Json } from "@themelios/core";
 import {
   McpServer,
   ProtocolError,
@@ -14,178 +15,228 @@ import {
   type ServerContext,
 } from "@modelcontextprotocol/server";
 import { z } from "zod";
+import { agentSchema } from "./agent-schema.js";
 import { localizedError, transportError } from "../errors.js";
 import { checkJsonSize, defaultMaxJsonBytes } from "../json.js";
 import type { RequestTracker } from "../request.js";
-import type { Translate } from "../types.js";
+import type { McpResourceSpec, Translate } from "../types.js";
 
-export type Directory = ReadonlyMap<string, Operation<unknown, unknown>>;
-type OperationRequest = OperationContext & { maxJsonBytes: number };
-const normalTools = new Set([
-  "materials.accept",
-  "materials.inspect",
-  "materials.text",
-  "materials.structure",
-  "materials.sources",
-  "materials.list",
-  "results.read",
-  "tasks.list",
-  "tasks.describe",
-  "tasks.preview",
-  "tasks.run",
-  "tasks.runMany",
-  "configuration.describe",
-  "configuration.explain",
-]);
-const destructive = new Set([
-  "materials.release",
-  "configuration.set",
-  "configuration.unset",
-  "prompts.setOverride",
-  "prompts.reset",
-]);
 const errorSchema = z.strictObject({
   code: z.string(),
   message: z.string(),
   retryable: z.boolean(),
-  details: z.json().optional(),
+  details: jsonSchema.optional(),
   traceId: z.string().optional(),
 });
 
-export function toolServer(
-  directory: Directory,
-  input: {
-    principal: Principal;
-    operations?: readonly string[];
-    translate?: Translate;
-    tracker: RequestTracker;
-    request(ctx: ServerContext, signal: AbortSignal): OperationRequest;
-  },
+export interface ToolServerOptions<App> {
+  readonly principal: Principal;
+  readonly translate?: Translate;
+  readonly tracker: RequestTracker;
+  readonly agentRefs?: (app: App) => AgentRefBridge;
+  readonly name?: string;
+  readonly resource?: McpResourceSpec;
+  request(
+    ctx: ServerContext,
+    signal: AbortSignal,
+  ): {
+    readonly principal: Principal;
+    readonly locale: string;
+    readonly options: import("@themelios/core").CallOptions;
+    readonly maxJsonBytes: number;
+  };
+}
+
+export function toolServer<App>(
+  app: App,
+  directory: OperationDirectory<App>,
+  input: ToolServerOptions<App>,
 ): McpServer {
-  const server = new McpServer({ name: "Themelios", version: "0.1.0" });
-  const allowed = input.operations ? new Set(input.operations) : normalTools;
+  const server = new McpServer({
+    name: input.name ?? "application",
+    version: "0.1.0",
+  });
+  const bridge = input.agentRefs?.(app);
+  const resource = input.resource;
+  const readable = resource && directory.get(resource.operation);
+  const canReadResource =
+    readable?.kind === "binary-read" &&
+    input.principal.permissions.includes(readable.permission);
+
   for (const item of directory.values()) {
     if (
-      !allowed.has(item.id) ||
-      !input.principal.permissions.includes(item.permission) ||
-      item.mode !== "unary"
-    )
-      continue;
-    if (item.id === "materials.read") continue;
-    const outputSchema = z.strictObject({
-      result: item.output.optional(),
-      error: errorSchema.optional(),
-    });
-    server.registerTool(
-      toolName(item.id),
-      {
-        description: item.description ?? item.id,
-        inputSchema: item.input,
-        outputSchema,
-        annotations: {
-          readOnlyHint: item.permission === "read",
-          destructiveHint: destructive.has(item.id),
-          idempotentHint:
-            item.permission === "read" ||
-            item.id === "materials.retain" ||
-            item.id === "materials.release",
-        },
-      },
-      async (args, ctx) => {
-        let lease: ReturnType<RequestTracker["take"]> | undefined;
-        let locale = "zh-CN";
-        try {
-          lease = input.tracker.take(ctx.mcpReq.signal);
-          const request = input.request(ctx, lease.signal);
-          locale = request.locale;
-          checkJsonSize(args, request.maxJsonBytes, "request");
-          const result = (await callOperation(
-            directory,
-            item.id,
-            args,
-            request,
-          )) as Json;
-          const encoded = checkJsonSize(result, request.maxJsonBytes, "result");
-          const summary =
-            encoded.length > 512 ? encoded.slice(0, 512) + "…" : encoded;
-          const content: CallToolResult["content"] = [
-            { type: "text", text: summary },
-          ];
-          if (
-            result &&
-            typeof result === "object" &&
-            !Array.isArray(result) &&
-            typeof result.ref === "string" &&
-            (item.id === "materials.accept" || item.id === "materials.inspect")
-          ) {
-            content.push({
-              type: "resource_link",
-              name: result.ref,
-              uri: resourceUri(result.ref),
-            });
-          }
-          return envelope({ result }, content, request.maxJsonBytes);
-        } catch (error) {
-          const info = localizedError(error, locale, input.translate);
-          return envelope({ error: info }, [
-            { type: "text", text: info.message },
-          ]);
-        } finally {
-          lease?.close();
-        }
-      },
-    );
+      (item.kind ?? "unary") === "unary" &&
+      item.mcp?.expose !== false &&
+      input.principal.permissions.includes(item.permission)
+    ) {
+      registerOperation(
+        server,
+        app,
+        directory,
+        input,
+        item,
+        bridge,
+        canReadResource ? resource : undefined,
+      );
+    }
   }
-  if (
-    input.principal.permissions.includes("read") &&
-    (!input.operations || allowed.has("materials.read"))
-  ) {
-    server.registerResource(
-      "material",
-      new ResourceTemplate("themelios://materials/{ref}", { list: undefined }),
-      {},
-      async (uri, variables, ctx) => {
-        const lease = input.tracker.take(ctx.mcpReq.signal);
-        let locale = "zh-CN";
-        try {
-          const request = input.request(ctx, lease.signal);
-          locale = request.locale;
-          const result = (await callOperation(
-            directory,
-            "materials.read",
-            { ref: variables.ref },
-            request,
-          )) as MaterialRead;
-          if (result.info.sizeBytes > request.maxJsonBytes) {
-            await result.body.cancel();
-            throw transportError("transport.result_too_large", {
-              ref: result.info.ref,
-              maxJsonBytes: request.maxJsonBytes,
-            });
-          }
-          const bytes = new Uint8Array(
-            await new Response(result.body).arrayBuffer(),
-          );
-          const payload = result.info.mediaType.startsWith("text/")
-            ? { text: new TextDecoder().decode(bytes) }
-            : { blob: Buffer.from(bytes).toString("base64") };
-          const response = {
-            contents: [
-              { uri: uri.href, mimeType: result.info.mediaType, ...payload },
-            ],
-          };
-          checkJsonSize(response, request.maxJsonBytes, "result");
-          return response;
-        } catch (error) {
-          const info = localizedError(error, locale, input.translate);
-          throw new ProtocolError(-32000, info.message, info);
-        } finally {
-          lease.close();
-        }
-      },
-    );
-  }
+  if (resource && canReadResource)
+    registerResource(server, app, directory, input, resource, bridge);
   return server;
+}
+
+function registerOperation<App>(
+  server: McpServer,
+  app: App,
+  directory: OperationDirectory<App>,
+  input: ToolServerOptions<App>,
+  item: Operation<App, unknown, unknown>,
+  bridge?: AgentRefBridge,
+  resource?: McpResourceSpec,
+) {
+  const outputSchema = z.strictObject({
+    result: (item.output ?? jsonSchema).optional(),
+    error: errorSchema.optional(),
+  });
+  const requestSchema = agentSchema(
+    item.mcp?.input ?? item.input,
+    "input",
+    bridge,
+  );
+  const responseSchema = agentSchema(outputSchema, "output", bridge);
+  server.registerTool(
+    toolName(item.id),
+    {
+      description: item.description || item.id,
+      inputSchema: requestSchema.advertised,
+      outputSchema: responseSchema.advertised,
+      annotations: {
+        readOnlyHint: item.mcp?.readOnlyHint ?? item.permission === "read",
+        destructiveHint: item.mcp?.destructiveHint ?? false,
+        idempotentHint: item.mcp?.idempotentHint ?? item.permission === "read",
+      },
+    },
+    async (args, ctx) => {
+      let lease: ReturnType<RequestTracker["take"]> | undefined;
+      let locale = "zh-CN";
+      try {
+        lease = input.tracker.take(ctx.mcpReq.signal);
+        const request = input.request(ctx, lease.signal);
+        locale = request.locale;
+        checkJsonSize(args, request.maxJsonBytes, "request");
+        const canonicalArgs = requestSchema.convert(args);
+        const rawResult = await callOperation(
+          app,
+          directory,
+          item.id,
+          canonicalArgs,
+          request,
+        );
+        const result = (
+          responseSchema.convert({ result: rawResult }) as { result: Json }
+        ).result as Json;
+        const encoded = checkJsonSize(result, request.maxJsonBytes, "result");
+        const summary =
+          encoded.length > 512 ? encoded.slice(0, 512) + "…" : encoded;
+        const content: CallToolResult["content"] = [
+          { type: "text", text: summary },
+        ];
+        appendResourceLink(content, resource, item.id, result);
+        return envelope({ result }, content, request.maxJsonBytes);
+      } catch (error) {
+        const info = localizedError(error, locale, input.translate);
+        return envelope({ error: info }, [
+          { type: "text", text: info.message },
+        ]);
+      } finally {
+        lease?.close();
+      }
+    },
+  );
+}
+
+function appendResourceLink(
+  content: CallToolResult["content"],
+  resource: McpResourceSpec | undefined,
+  id: string,
+  result: Json,
+) {
+  if (!resource?.linksFrom?.includes(id)) return;
+  if (
+    !result ||
+    typeof result !== "object" ||
+    Array.isArray(result) ||
+    typeof result.ref !== "string"
+  )
+    return;
+  content.push({
+    type: "resource_link",
+    name: result.ref,
+    uri: resource.template.replace("{ref}", encodeURIComponent(result.ref)),
+  });
+}
+
+function registerResource<App>(
+  server: McpServer,
+  app: App,
+  directory: OperationDirectory<App>,
+  input: ToolServerOptions<App>,
+  resource: McpResourceSpec,
+  bridge?: AgentRefBridge,
+) {
+  server.registerResource(
+    resource.name,
+    new ResourceTemplate(resource.template, { list: undefined }),
+    {},
+    async (uri, variables, ctx) => {
+      const lease = input.tracker.take(ctx.mcpReq.signal);
+      let locale = "zh-CN";
+      try {
+        const request = input.request(ctx, lease.signal);
+        locale = request.locale;
+        const rawRef = String(variables.ref);
+        const resolvedRef = bridge ? bridge.resolveRef(rawRef) : rawRef;
+        const result = (await callOperation(
+          app,
+          directory,
+          resource.operation,
+          { ref: resolvedRef },
+          request,
+        )) as BinaryReadResult;
+        if (result.info.sizeBytes > request.maxJsonBytes) {
+          await result.body.cancel();
+          throw transportError("transport.result_too_large", {
+            ...(result.info.ref
+              ? {
+                  ref: bridge
+                    ? bridge.formatRef(result.info.ref)
+                    : result.info.ref,
+                }
+              : {}),
+            maxJsonBytes: request.maxJsonBytes,
+          });
+        }
+        const bytes = new Uint8Array(
+          await new Response(result.body).arrayBuffer(),
+        );
+        const payload = result.info.mediaType.startsWith("text/")
+          ? { text: new TextDecoder().decode(bytes) }
+          : { blob: Buffer.from(bytes).toString("base64") };
+        const response = {
+          contents: [
+            { uri: uri.href, mimeType: result.info.mediaType, ...payload },
+          ],
+        };
+        checkJsonSize(response, request.maxJsonBytes, "result");
+        return response;
+      } catch (error) {
+        const info = localizedError(error, locale, input.translate);
+        throw new ProtocolError(-32000, info.message, info);
+      } finally {
+        lease.close();
+      }
+    },
+  );
 }
 
 function envelope(
@@ -210,8 +261,4 @@ function toolName(id: string): string {
   return id
     .replaceAll(".", "_")
     .replace(/[A-Z]/g, (letter) => "_" + letter.toLowerCase());
-}
-
-function resourceUri(ref: string): string {
-  return "themelios://materials/" + encodeURIComponent(ref);
 }

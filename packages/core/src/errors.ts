@@ -8,6 +8,7 @@ export interface AppErrorOptions {
   params?: MessageParams;
   details?: Json;
   retryable?: boolean;
+  traceId?: string;
   cause?: unknown;
 }
 
@@ -25,6 +26,7 @@ export class AppError extends Error {
   readonly params?: MessageParams;
   readonly details?: Json;
   readonly retryable: boolean;
+  traceId?: string;
 
   constructor(input: AppErrorOptions) {
     super(input.messageKey, { cause: input.cause });
@@ -34,6 +36,13 @@ export class AppError extends Error {
     this.retryable = input.retryable ?? false;
     if (input.params !== undefined) this.params = input.params;
     if (input.details !== undefined) this.details = input.details;
+    if (input.traceId !== undefined) this.traceId = input.traceId;
+  }
+}
+
+export function attachTraceId(error: unknown, traceId?: string): void {
+  if (traceId && error instanceof AppError && !error.traceId) {
+    error.traceId = traceId;
   }
 }
 
@@ -55,12 +64,20 @@ export function toErrorInfo(
   translate: (key: string, params?: MessageParams) => string = (key) => key,
   traceId?: string,
 ): ErrorInfo {
-  const { code, messageKey, params, details, retryable } = toAppError(error);
+  const {
+    code,
+    messageKey,
+    params,
+    details,
+    retryable,
+    traceId: attachedTraceId,
+  } = toAppError(error);
+  const resolvedTraceId = traceId ?? attachedTraceId;
   return {
     code,
     message: translate(messageKey, params),
     retryable,
     ...(details === undefined ? {} : { details }),
-    ...(traceId === undefined ? {} : { traceId }),
+    ...(resolvedTraceId === undefined ? {} : { traceId: resolvedTraceId }),
   };
 }

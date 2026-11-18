@@ -1,238 +1,64 @@
 import type { Context } from "hono";
 import { MIMEType } from "node:util";
-import type { OperationContext } from "@themelios/application";
-import { readJson } from "../json.js";
+import type {
+  AnyOperation,
+  HttpRouteSpec,
+  OperationContext,
+} from "@themelios/runtime/operations";
 import { transportError } from "../errors.js";
+import { readJson } from "../json.js";
 
 export type HttpEnvironment = {
   Bindings: { operation: OperationContext & { maxJsonBytes: number } };
 };
-type Ctx = Context<HttpEnvironment>;
-type Route = {
-  method: "GET" | "POST";
-  path: string;
-  id: string;
-  input: (context: Ctx) => unknown;
-  status?: number;
-  kind?: "binary" | "stream";
-};
+export type HttpContext = Context<HttpEnvironment>;
 
-const body = (ctx: Ctx) => {
+function jsonBody(ctx: HttpContext) {
   const { options, maxJsonBytes } = ctx.env.operation;
   const type = ctx.req.header("content-type");
   if (type && !/^application\/(?:json|[a-z0-9.+-]+\+json)(?:;|$)/i.test(type)) {
     throw transportError("transport.unsupported_media_type");
   }
   return readJson(ctx.req.raw, maxJsonBytes, options.signal!);
-};
-const ref = (ctx: Ctx) => ({ ref: ctx.req.param("ref") });
-const task = (ctx: Ctx) => ({ task: ctx.req.param("id") });
-const empty = () => ({});
-const taskBody = async (ctx: Ctx) => {
-  const value = await body(ctx);
-  if (
-    !value ||
-    Array.isArray(value) ||
-    typeof value !== "object" ||
-    Object.hasOwn(value, "task")
-  ) {
-    throw transportError("transport.invalid_request", {
-      reason: "task_path_identity",
-    });
-  }
-  return { ...value, ...task(ctx) };
-};
-function numericQuery(value: string | undefined, key: string) {
-  if (value === undefined) return {};
-  const number = Number(value);
-  if (!/^\d+$/.test(value) || !Number.isSafeInteger(number))
-    throw transportError("transport.invalid_request", { reason: key });
-  return { [key]: number };
-}
-function textQuery(value: string | undefined, key: string) {
-  return value === undefined ? {} : { [key]: value };
 }
 
-export const routes: readonly Route[] = [
-  { method: "GET", path: "/v1/instance", id: "instance.info", input: empty },
-  {
-    method: "POST",
-    path: "/v1/materials",
-    id: "materials.accept",
-    status: 201,
-    input(ctx) {
-      if (!ctx.req.raw.body)
-        throw transportError("transport.invalid_request", {
-          reason: "body_required",
-        });
-      return {
-        body: ctx.req.raw.body,
-        mediaType: mediaType(ctx.req.header("content-type")),
-        ...textQuery(ctx.req.query("name"), "name"),
-      };
-    },
-  },
-  {
-    method: "POST",
-    path: "/v1/materials/accept",
-    id: "materials.accept",
-    input: body,
-    status: 201,
-  },
-  {
-    method: "GET",
-    path: "/v1/materials/:ref",
-    id: "materials.inspect",
-    input: ref,
-  },
-  {
-    method: "GET",
-    path: "/v1/materials/:ref/content",
-    id: "materials.read",
-    input: ref,
-    kind: "binary",
-  },
-  {
-    method: "POST",
-    path: "/v1/materials/text",
-    id: "materials.text",
-    input: body,
-  },
-  {
-    method: "GET",
-    path: "/v1/materials/:ref/structure",
-    id: "materials.structure",
-    input: ref,
-  },
-  {
-    method: "GET",
-    path: "/v1/materials/:ref/sources",
-    id: "materials.sources",
-    input: (ctx) => ({
-      ...ref(ctx),
-      ...numericQuery(ctx.req.query("depth"), "depth"),
-    }),
-  },
-  {
-    method: "GET",
-    path: "/v1/materials",
-    id: "materials.list",
-    input: (ctx) => ({
-      ...textQuery(ctx.req.query("at"), "at"),
-      ...textQuery(ctx.req.query("after"), "after"),
-      ...numericQuery(ctx.req.query("limit"), "limit"),
-    }),
-  },
-  {
-    method: "POST",
-    path: "/v1/materials/:ref/retain",
-    id: "materials.retain",
-    input: ref,
-    status: 204,
-  },
-  {
-    method: "POST",
-    path: "/v1/materials/:ref/release",
-    id: "materials.release",
-    input: ref,
-    status: 204,
-  },
-  { method: "GET", path: "/v1/results/:ref", id: "results.read", input: ref },
-  {
-    method: "POST",
-    path: "/v1/results",
-    id: "results.save",
-    input: body,
-    status: 201,
-  },
-  { method: "GET", path: "/v1/tasks", id: "tasks.list", input: empty },
-  { method: "GET", path: "/v1/tasks/:id", id: "tasks.describe", input: task },
-  {
-    method: "POST",
-    path: "/v1/tasks/:id/preview",
-    id: "tasks.preview",
-    input: taskBody,
-  },
-  {
-    method: "POST",
-    path: "/v1/tasks/:id/run",
-    id: "tasks.run",
-    input: taskBody,
-  },
-  {
-    method: "POST",
-    path: "/v1/tasks/:id/stream",
-    id: "tasks.stream",
-    input: taskBody,
-    kind: "stream",
-  },
-  {
-    method: "POST",
-    path: "/v1/tasks/run-many",
-    id: "tasks.runMany",
-    input: body,
-  },
-  {
-    method: "GET",
-    path: "/v1/tasks/:id/prompts",
-    id: "prompts.read",
-    input: task,
-  },
-  {
-    method: "GET",
-    path: "/v1/tasks/:id/prompts/describe",
-    id: "prompts.describe",
-    input: task,
-  },
-  {
-    method: "GET",
-    path: "/v1/tasks/:id/prompts/diff",
-    id: "prompts.diff",
-    input: task,
-  },
-  {
-    method: "POST",
-    path: "/v1/tasks/:id/prompts/override",
-    id: "prompts.setOverride",
-    input: taskBody,
-  },
-  {
-    method: "POST",
-    path: "/v1/tasks/:id/prompts/reset",
-    id: "prompts.reset",
-    input: taskBody,
-  },
-  {
-    method: "GET",
-    path: "/v1/configuration",
-    id: "configuration.describe",
-    input: (ctx) => textQuery(ctx.req.query("path"), "path"),
-  },
-  {
-    method: "POST",
-    path: "/v1/configuration/explain",
-    id: "configuration.explain",
-    input: body,
-  },
-  {
-    method: "POST",
-    path: "/v1/configuration/set",
-    id: "configuration.set",
-    input: body,
-  },
-  {
-    method: "POST",
-    path: "/v1/configuration/unset",
-    id: "configuration.unset",
-    input: body,
-  },
-  {
-    method: "POST",
-    path: "/v1/configuration/reload",
-    id: "configuration.reload",
-    input: body,
-  },
-];
+function mappedParams(
+  ctx: HttpContext,
+  paramMap?: Readonly<Record<string, string>>,
+) {
+  if (!paramMap) return {};
+  const result: Record<string, string> = {};
+  for (const [paramName, fieldName] of Object.entries(paramMap)) {
+    const value = ctx.req.param(paramName);
+    if (value !== undefined) result[fieldName] = value;
+  }
+  return result;
+}
+
+function numericQuery(ctx: HttpContext, keys?: readonly string[]) {
+  const result: Record<string, number> = {};
+  if (!keys) return result;
+  for (const key of keys) {
+    const value = ctx.req.query(key);
+    if (value === undefined) continue;
+    const parsed = Number(value);
+    if (!/^\d+$/.test(value) || !Number.isSafeInteger(parsed)) {
+      throw transportError("transport.invalid_request", { reason: key });
+    }
+    result[key] = parsed;
+  }
+  return result;
+}
+
+function stringQuery(ctx: HttpContext, keys?: readonly string[]) {
+  const result: Record<string, string> = {};
+  if (!keys) return result;
+  for (const key of keys) {
+    const value = ctx.req.query(key);
+    if (value !== undefined) result[key] = value;
+  }
+  return result;
+}
 
 function mediaType(header: string | undefined): string {
   if (!header) return "application/octet-stream";
@@ -241,4 +67,101 @@ function mediaType(header: string | undefined): string {
   } catch (cause) {
     throw transportError("transport.unsupported_media_type", undefined, cause);
   }
+}
+
+export interface CompiledRoute<App = any> {
+  readonly method: "GET" | "POST";
+  readonly path: string;
+  readonly operation: AnyOperation<App>;
+  readonly status?: number;
+  readonly binaryInput?: HttpRouteSpec["binaryInput"];
+  extractInput(ctx: HttpContext): unknown | Promise<unknown>;
+}
+
+function routeFields(ctx: HttpContext, spec: HttpRouteSpec) {
+  return {
+    ...mappedParams(ctx, spec.paramMap),
+    ...stringQuery(ctx, spec.queryStrings),
+    ...numericQuery(ctx, spec.queryNumbers),
+  };
+}
+
+function objectBody(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw transportError("transport.invalid_request", {
+      reason: "object_body_required",
+    });
+  }
+  return value as Record<string, unknown>;
+}
+
+async function readRoute(
+  ctx: HttpContext,
+  spec: HttpRouteSpec,
+): Promise<unknown> {
+  const fields = routeFields(ctx, spec);
+  if (spec.binaryInput) {
+    const { body } = ctx.req.raw;
+    if (!body)
+      throw transportError("transport.invalid_request", {
+        reason: "body_required",
+      });
+    return {
+      ...fields,
+      body,
+      mediaType: mediaType(ctx.req.header("content-type")),
+    };
+  }
+  if (spec.method === "GET") return fields;
+  const value = await jsonBody(ctx);
+  if (!spec.mergeParamsIntoBody && !Object.keys(fields).length) return value;
+  const data = objectBody(value);
+  if (spec.mergeParamsIntoBody)
+    for (const target of Object.values(spec.paramMap ?? {})) {
+      if (Object.hasOwn(data, target)) {
+        throw transportError("transport.invalid_request", {
+          reason: `${target}_path_identity`,
+        });
+      }
+    }
+  return { ...data, ...fields };
+}
+
+function fromSpec<App>(
+  operation: AnyOperation<App>,
+  spec: HttpRouteSpec,
+): CompiledRoute<App> {
+  return {
+    method: spec.method,
+    path: spec.path,
+    operation,
+    ...(spec.binaryInput ? { binaryInput: spec.binaryInput } : {}),
+    ...(spec.status === undefined ? {} : { status: spec.status }),
+    extractInput: (ctx) => readRoute(ctx, spec),
+  };
+}
+
+export function compileHttpRoutes<App>(
+  operations: Iterable<AnyOperation<App>>,
+): CompiledRoute<App>[] {
+  const compiled: CompiledRoute<App>[] = [];
+  for (const operation of operations) {
+    if (operation.http === false) continue;
+    if (!operation.http) {
+      compiled.push(
+        fromSpec(operation, {
+          method: "POST",
+          path: `/operations/${operation.id}`,
+        }),
+      );
+      continue;
+    }
+    const specs = Array.isArray(operation.http)
+      ? operation.http
+      : [operation.http];
+    for (const spec of specs) {
+      compiled.push(fromSpec(operation, spec));
+    }
+  }
+  return compiled;
 }

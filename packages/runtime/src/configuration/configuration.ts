@@ -5,7 +5,7 @@ import type {
   Configuration,
   ConfigurationChange,
   SettingExplanation,
-} from "../settings-contract.js";
+} from "../settings.js";
 import { errno, failure } from "../failure.js";
 import {
   type Candidate,

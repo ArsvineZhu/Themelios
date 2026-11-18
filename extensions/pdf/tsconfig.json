@@ -11,7 +11,7 @@
       "path": "../../packages/core"
     },
     {
-      "path": "../../packages/application"
+      "path": "../../packages/models"
     }
   ]
 }

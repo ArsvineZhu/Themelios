@@ -6,7 +6,6 @@
   "files": [
     "dist",
     "resources",
-    "native",
     "README.md",
     "LICENSE"
   ],
@@ -14,6 +13,10 @@
     ".": {
       "types": "./dist/types/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./operations": {
+      "types": "./dist/types/operations.d.ts",
+      "import": "./dist/operations.js"
     },
     "./settings": {
       "types": "./dist/types/settings.d.ts",
@@ -38,11 +41,6 @@
   },
   "dependencies": {
     "@themelios/core": "workspace:*",
-    "@opentelemetry/api": "1.10.0",
-    "@opentelemetry/sdk-trace": "3.1.1",
-    "@opentelemetry/sdk-metrics": "3.1.1",
-    "@opentelemetry/exporter-trace-otlp-http": "0.301.2",
-    "@opentelemetry/exporter-metrics-otlp-http": "0.301.2",
     "i18next": "27.1.5",
     "pino": "10.4.0",
     "rotating-file-stream": "4.0.0",

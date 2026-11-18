@@ -107,14 +107,6 @@ const schema = z.strictObject({
           allowedOrigins: z.array(z.url({ protocol: /^https?$/ })).default([]),
         })
         .prefault({}),
-      grpc: z
-        .strictObject({
-          listen: listen.optional(),
-          tls: z
-            .strictObject({ key: fileCredential, cert: fileCredential })
-            .optional(),
-        })
-        .prefault({}),
       mcp: z
         .strictObject({ mode: z.enum(["stdio", "http"]).optional() })
         .prefault({}),
@@ -167,9 +159,6 @@ const entries: readonly [string, SettingEffect, Partial<SettingMeta>?][] = [
   ["/transports/http/listen", "restart"],
   ["/transports/http/allowedHosts", "reload"],
   ["/transports/http/allowedOrigins", "reload"],
-  ["/transports/grpc/listen", "restart"],
-  ["/transports/grpc/tls/key", "restart", { format: "credential" }],
-  ["/transports/grpc/tls/cert", "restart", { format: "credential" }],
   ["/transports/mcp/mode", "restart"],
   ["/transports/authTokens/*", "reload"],
   ["/transports/authTokens/*/secret", "reload", { format: "credential" }],
@@ -271,14 +260,12 @@ function isLoopback(host: string): boolean {
 function listenerIssues(transports: Configured["transports"]): SettingIssue[] {
   const issues: SettingIssue[] = [];
   if (!Object.keys(transports.authTokens).length) {
-    for (const kind of ["http", "grpc"] as const) {
-      const listen = transports[kind].listen;
-      if (listen && !isLoopback(listen.host)) {
-        issues.push({
-          path: "/transports/" + kind + "/listen/host",
-          messageKey: "config.listener_requires_auth",
-        });
-      }
+    const listen = transports.http.listen;
+    if (listen && !isLoopback(listen.host)) {
+      issues.push({
+        path: "/transports/http/listen/host",
+        messageKey: "config.listener_requires_auth",
+      });
     }
   }
   if (transports.mcp.mode === "http" && !transports.http.listen) {

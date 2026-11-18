@@ -2,8 +2,14 @@ import { Database as SQLite } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
 import { existsSync, linkSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
-import type { CommitPoint, Instant } from "@themelios/core";
-import { toInstant } from "@themelios/core/time";
+import {
+  timeDomainSchema,
+  toInstant,
+  UTC_TIME_DOMAIN,
+  type CommitPoint,
+  type Instant,
+  type TimeDomain,
+} from "@themelios/core";
 import { fileErrorCode, storageError } from "./errors.js";
 import { storageSchemaSql } from "./schema.js";
 import {
@@ -45,7 +51,6 @@ export class Database {
       .get()!.version;
   }
 
-  // fallow-ignore-next-line unused-class-member -- Application provisioning and the inventory consumer initialize databases here.
   static init(options: DatabaseOptions & { schemaSql: string }): Database {
     const { path, formatId } = options;
     if (existsSync(path))
@@ -62,7 +67,7 @@ export class Database {
         connection
           .transaction(() => {
             connection.exec(storageSchemaSql);
-            connection.exec(options.schemaSql);
+            if (options.schemaSql.trim()) connection.exec(options.schemaSql);
             connection
               .query<unknown, [string]>(
                 "INSERT INTO store_meta (singleton, format_id) VALUES (1, ?)",
@@ -189,9 +194,101 @@ export class Database {
     );
   }
 
-  // fallow-ignore-next-line unused-class-member -- Workbench maintenance and SDK clients read the current cut.
   cut(): CommitPoint {
     return this.read((tx) => tx.cut.toString());
+  }
+
+  defineTimeDomain(raw: TimeDomain): TimeDomain {
+    const parsed = timeDomainSchema.safeParse(raw);
+    if (!parsed.success) {
+      throw storageError("time.invalid", {
+        issues: parsed.error.issues.map((i) => ({
+          path: i.path.map(String),
+          reason: i.message,
+        })),
+      });
+    }
+    const domain = parsed.data;
+    if (domain.kind === "utc") {
+      if (domain.label !== UTC_TIME_DOMAIN.label) {
+        throw storageError("time.domain_conflict", { id: domain.id });
+      }
+      return UTC_TIME_DOMAIN;
+    }
+    const num =
+      domain.kind === "linear" ? (domain.tickSeconds?.numerator ?? null) : null;
+    const den =
+      domain.kind === "linear"
+        ? (domain.tickSeconds?.denominator ?? null)
+        : null;
+    return this.write((tx) => {
+      const inserted = tx.sql.run(
+        `INSERT INTO time_domains (id, kind, label, tick_numerator, tick_denominator, created_seq)
+         VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`,
+        domain.id,
+        domain.kind,
+        domain.label,
+        num,
+        den,
+        tx.seq,
+      ).changes;
+      if (inserted > 0) return domain;
+      const existing = tx.sql
+        .query<{
+          id: string;
+          kind: string;
+          label: string;
+          tick_numerator: string | null;
+          tick_denominator: string | null;
+        }>(
+          "SELECT id, kind, label, tick_numerator, tick_denominator FROM time_domains WHERE id = ?",
+        )
+        .get(domain.id)!;
+      if (
+        existing.kind !== domain.kind ||
+        existing.label !== domain.label ||
+        existing.tick_numerator !== num ||
+        existing.tick_denominator !== den
+      ) {
+        throw storageError("time.domain_conflict", { id: domain.id });
+      }
+      return domain;
+    });
+  }
+
+  getTimeDomain(id: string): TimeDomain | undefined {
+    if (id === "utc") return UTC_TIME_DOMAIN;
+    return this.read((tx) => {
+      const row = tx.sql
+        .query<{
+          id: string;
+          kind: "linear" | "opaque";
+          label: string;
+          tick_numerator: string | null;
+          tick_denominator: string | null;
+        }>(
+          "SELECT id, kind, label, tick_numerator, tick_denominator FROM time_domains WHERE id = ?",
+        )
+        .get(id);
+      return row ? decodeTimeDomainRow(row) : undefined;
+    });
+  }
+
+  listTimeDomains(): TimeDomain[] {
+    return this.read((tx) => {
+      const rows = tx.sql
+        .query<{
+          id: string;
+          kind: "linear" | "opaque";
+          label: string;
+          tick_numerator: string | null;
+          tick_denominator: string | null;
+        }>(
+          "SELECT id, kind, label, tick_numerator, tick_denominator FROM time_domains ORDER BY id",
+        )
+        .all();
+      return [UTC_TIME_DOMAIN, ...rows.map(decodeTimeDomainRow)];
+    });
   }
 
   /** Rejects write preparation before an external participant publishes bytes. */
@@ -201,7 +298,6 @@ export class Database {
   }
 
   /** Allows a participant to verify the exact transaction it is joining. */
-  // fallow-ignore-next-line unused-class-member -- Content adoption uses this check to reject foreign transactions.
   owns(tx: WriteTransaction): boolean {
     return this.#active === tx;
   }
@@ -269,4 +365,29 @@ export class Database {
       ? transaction.immediate()
       : transaction.deferred();
   }
+}
+
+function decodeTimeDomainRow(row: {
+  id: string;
+  kind: "linear" | "opaque";
+  label: string;
+  tick_numerator: string | null;
+  tick_denominator: string | null;
+}): TimeDomain {
+  if (row.kind === "opaque") {
+    return { id: row.id, kind: "opaque", label: row.label };
+  }
+  return {
+    id: row.id,
+    kind: "linear",
+    label: row.label,
+    ...(row.tick_numerator !== null && row.tick_denominator !== null
+      ? {
+          tickSeconds: {
+            numerator: row.tick_numerator,
+            denominator: row.tick_denominator,
+          },
+        }
+      : {}),
+  };
 }

@@ -73,7 +73,6 @@
 
 - sections 数量不超过本次 maxSections。
 - 每个 sourceKeys 值都存在于本次来源目录。
-- 同一节的 sourceKeys 不重复。
 
 ## 编辑和预览
 

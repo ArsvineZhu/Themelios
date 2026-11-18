@@ -5,7 +5,8 @@ export const artifactRefSchema = z
   .string()
   .regex(
     /^art_[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/,
-  );
+  )
+  .meta({ "x-themelios-ref": true });
 export const blobRefSchema = z.string().regex(/^sha256:[a-f0-9]{64}$/);
 export const commitPointSchema = z
   .string()

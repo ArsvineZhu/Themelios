@@ -1,68 +1,72 @@
 import {
   callOperation,
-  createOperations,
-  type ApplicationApi,
-} from "@themelios/application";
-import type { MaterialRead } from "@themelios/content";
+  type BinaryReadResult,
+} from "@themelios/runtime/operations";
 import type { Flow, FlowEvent } from "@themelios/core";
 import { Hono } from "hono";
-import {
-  errorLocale,
-  httpStatus,
-  localizedError,
-  transportError,
-} from "../errors.js";
+import { resolveDirectory } from "../directory.js";
+import { localizedError, transportError } from "../errors.js";
 import { checkJsonSize, jsonText } from "../json.js";
-import {
-  authenticateRequest,
-  callOptions,
-  cors,
-  RequestTracker,
-  retainResponse,
-  validateWebOrigin,
-} from "../request.js";
+import { createMcpHandlerFor } from "../mcp/handler.js";
+import { RequestTracker, runProtectedHttp } from "../request.js";
 import type {
   HttpEndpoint,
   RemoteTransportOptions,
   Translate,
 } from "../types.js";
-import { routes, type HttpEnvironment } from "./routes.js";
+import { compileHttpRoutes, type HttpEnvironment } from "./routes.js";
 
 const encoder = new TextEncoder();
 
-export function createHttpHandler<S>(
-  api: ApplicationApi<S>,
-  options: RemoteTransportOptions,
+export function createHttpHandler<App>(
+  app: App,
+  options: RemoteTransportOptions<App>,
 ): HttpEndpoint {
-  const directory = createOperations(api);
+  const directory = resolveDirectory(
+    options.operations,
+    options.allowOperations,
+  );
   const tracker = new RequestTracker();
-  const app = new Hono<HttpEnvironment>();
-  const allow = options.operations && new Set(options.operations);
-  app.notFound(() => {
+  const router = new Hono<HttpEnvironment>();
+  const mcpHandler = options.enableMcp
+    ? createMcpHandlerFor(app, directory, tracker, {
+        ...(options.name ? { name: options.name } : {}),
+        ...(options.resource ? { resource: options.resource } : {}),
+        ...(options.translate ? { translate: options.translate } : {}),
+        ...(options.agentRefs ? { agentRefs: options.agentRefs } : {}),
+      })
+    : undefined;
+
+  router.notFound(() => {
     throw transportError("transport.not_found");
   });
-  app.onError((error) => {
+  router.onError((error) => {
     throw error;
   });
-  for (const route of routes) {
-    if (allow && !allow.has(route.id)) continue;
-    app.on(route.method, route.path, async (ctx) => {
+
+  for (const route of compileHttpRoutes(directory.values())) {
+    router.on(route.method, route.path, async (ctx) => {
       const call = ctx.env.operation;
       const result = callOperation(
+        app,
         directory,
-        route.id,
-        await route.input(ctx),
+        route.operation.id,
+        await route.extractInput(ctx),
         call,
+        route.binaryInput,
       );
-      if (route.kind === "stream")
+      if (route.operation.kind === "stream") {
         return eventStream(
           result as Flow<unknown>,
           call.maxJsonBytes,
           call.locale,
           options.translate,
         );
+      }
       const output = await result;
-      if (route.kind === "binary") return download(output as MaterialRead);
+      if (route.operation.kind === "binary-read") {
+        return download(output as BinaryReadResult);
+      }
       if (route.status === 204) return new Response(null, { status: 204 });
       return new Response(jsonText(output, call.maxJsonBytes), {
         status: route.status ?? 200,
@@ -70,75 +74,52 @@ export function createHttpHandler<S>(
       });
     });
   }
+
   return {
-    async fetch(request) {
-      let lease: ReturnType<RequestTracker["take"]> | undefined;
-      let origin: string | null = null;
-      const settings = api.configuration.snapshot() as {
-        locale?: string;
-      } | null;
-      const locale = errorLocale(
-        request.headers.get("accept-language"),
-        settings?.locale,
-      );
-      try {
-        lease = tracker.take(request.signal);
-        const policy = options.policy();
-        origin = validateWebOrigin(request, policy);
-        if (request.method === "OPTIONS")
-          return retainResponse(
-            new Response(null, { status: 204 }),
-            lease,
-            cors(origin),
+    fetch(request) {
+      const defaultLocale = options.locale?.();
+      return runProtectedHttp(
+        request,
+        tracker,
+        options,
+        defaultLocale,
+        (ctx) => {
+          if (mcpHandler && new URL(request.url).pathname === "/mcp") {
+            return mcpHandler(request, ctx);
+          }
+          return Promise.resolve(
+            router.fetch(request, {
+              operation: {
+                principal: ctx.principal,
+                locale: ctx.locale,
+                options: ctx.call,
+                maxJsonBytes: ctx.maxJsonBytes,
+              },
+            }),
           );
-        const principal = await authenticateRequest(
-          request.headers,
-          options,
-          policy,
-          lease.signal,
-        );
-        const context = {
-          principal,
-          locale,
-          options: callOptions(request.headers, lease.signal),
-          maxJsonBytes: policy.maxJsonBytes,
-        };
-        const response = await app.fetch(request, { operation: context });
-        return retainResponse(response, lease, cors(origin));
-      } catch (error) {
-        lease?.close();
-        const failure = localizedError(error, locale, options.translate);
-        const headers = cors(origin);
-        if (failure.code === "transport.auth_required")
-          headers.set("www-authenticate", "Bearer");
-        return Response.json(
-          { error: failure },
-          { status: httpStatus(failure.code), headers },
-        );
-      }
+        },
+      );
     },
     close: () => tracker.close(),
   };
+}
 
-  function download({ info, body }: MaterialRead) {
-    const headers = new Headers({
-      "content-type": info.mediaType,
-      "x-content-type-options": "nosniff",
-    });
-    if (Number.isSafeInteger(info.sizeBytes))
-      headers.set("content-length", String(info.sizeBytes));
-    if (info.name) {
-      const name = encodeURIComponent(info.name.toWellFormed()).replace(
-        /['()*]/g,
-        (symbol) => "%" + symbol.charCodeAt(0).toString(16).toUpperCase(),
-      );
-      headers.set(
-        "content-disposition",
-        "attachment; filename*=UTF-8''" + name,
-      );
-    }
-    return new Response(body, { headers });
+function download({ info, body }: BinaryReadResult) {
+  const headers = new Headers({
+    "content-type": info.mediaType,
+    "x-content-type-options": "nosniff",
+  });
+  if (Number.isSafeInteger(info.sizeBytes)) {
+    headers.set("content-length", String(info.sizeBytes));
   }
+  if (info.name) {
+    const name = encodeURIComponent(info.name.toWellFormed()).replace(
+      /['()*]/g,
+      (symbol) => "%" + symbol.charCodeAt(0).toString(16).toUpperCase(),
+    );
+    headers.set("content-disposition", "attachment; filename*=UTF-8''" + name);
+  }
+  return new Response(body, { headers });
 }
 
 async function eventStream(
@@ -147,8 +128,9 @@ async function eventStream(
   locale: string,
   translate?: Translate,
 ): Promise<Response> {
-  if (!(Symbol.asyncIterator in flow))
+  if (!(Symbol.asyncIterator in flow)) {
     throw transportError("internal.unexpected");
+  }
   const iterator = flow[Symbol.asyncIterator]();
   let ended = false;
   async function stop(cancel: boolean) {

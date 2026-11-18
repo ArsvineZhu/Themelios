@@ -4,12 +4,6 @@
   "version": "0.1.0",
   "type": "module",
   "dependencies": {
-    "@themelios/application": "0.1.0",
-    "@themelios/content": "0.1.0",
-    "@themelios/core": "0.1.0",
-    "@themelios/models": "0.1.0",
-    "@themelios/runtime": "0.1.0",
-    "@themelios/storage": "0.1.0",
-    "zod": "4.6.7"
+    "@themelios/models": "0.1.0"
   }
 }

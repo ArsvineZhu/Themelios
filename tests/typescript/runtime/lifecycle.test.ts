@@ -16,7 +16,7 @@ test("a reloaded session leaves captured calls on their original settings and cl
   const closed: (string | number)[] = [];
   const installation = Installation.at(root, {
     id: "test.generations",
-    formatId: "test.generations/1",
+    formatId: "test.generations",
     settings: runtimeSettings,
     async provision() {},
     async open(env: OpenEnvironment<RuntimeSettings>) {

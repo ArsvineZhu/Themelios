@@ -1,0 +1,16 @@
+输出语言：{{ language }}
+最多分节数：{{ maxSections }}
+{% if focus %}
+本次重点：{{ focus }}
+{% endif %}
+
+本次材料：
+{% for source in sources %}
+## {{ source.key }}{% if source.name %} · {{ source.name }}{% endif %}
+角色：{{ source.role }}
+媒体类型：{{ source.mediaType }}
+原件范围：{{ source.originalExtent }}
+实际交付范围：{{ source.deliveredExtent | join: '；' }}
+{% endfor %}
+
+各来源的实际内容由程序按同一顺序附加在本消息之后。

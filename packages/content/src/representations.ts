@@ -1,12 +1,42 @@
-import { artifactRefSchema, selectionSchema } from "@themelios/core";
+import {
+  activeRepresentation,
+  registerRepresentation,
+} from "./representation-index.js";
+import {
+  artifactRefSchema,
+  selectionSchema,
+  type ArtifactRef,
+  type Selection,
+} from "@themelios/core";
 import type { Cas, Database } from "@themelios/storage";
 import { z } from "zod";
 import { storedArtifact } from "./artifacts.js";
-import type { Representation, Representations } from "./contracts.js";
 import { selectOutput } from "./result-graph.js";
 import { parseManifest } from "./results.js";
 import { checkExtent, rangeKey, utf8Text } from "./selections.js";
 import { validated } from "./validation.js";
+
+export interface Representation {
+  source: Selection;
+  purpose: "model-input" | "retrieval-text";
+  recipe: string;
+  result: ArtifactRef;
+  outputs: readonly string[];
+}
+
+export interface Representations {
+  find(
+    source: Selection,
+    purpose: Representation["purpose"],
+    recipe: string,
+  ): Representation | undefined;
+  set(representation: Representation): void;
+  remove(
+    source: Selection,
+    purpose: Representation["purpose"],
+    recipe: string,
+  ): void;
+}
 
 const purposeSchema = z.enum(["model-input", "retrieval-text"]);
 const recipeSchema = z.string().min(1);
@@ -15,11 +45,8 @@ const representationSchema = z.strictObject({
   purpose: purposeSchema,
   recipe: recipeSchema,
   result: artifactRefSchema,
-  output: z.string().min(1),
+  outputs: z.array(z.string().min(1)).min(1),
 });
-
-const active =
-  "WHERE source_ref = ? AND range_key = ? AND purpose = ? AND recipe = ? AND retired_seq IS NULL";
 
 export function createRepresentations(
   database: Database,
@@ -42,8 +69,8 @@ export function createRepresentations(
       return database.read((tx) => {
         checkExtent(storedArtifact(tx.sql, source.ref), source);
         const row = tx.sql
-          .query<{ result_ref: string; output: string }>(
-            `SELECT result_ref, output FROM representations ${active}`,
+          .query<{ result_ref: ArtifactRef; outputs_json: string }>(
+            `SELECT result_ref, outputs_json FROM representations ${activeRepresentation}`,
           )
           .get(source.ref, key, purpose, recipe);
         return row
@@ -52,17 +79,18 @@ export function createRepresentations(
               purpose,
               recipe,
               result: row.result_ref,
-              output: row.output,
+              outputs: validated(
+                representationSchema.shape.outputs,
+                JSON.parse(row.outputs_json),
+                ["outputs"],
+              ),
             }
           : undefined;
       });
     },
     set(representation) {
-      const { source, purpose, recipe, result, output } = validated(
-        representationSchema,
-        representation,
-      );
-      const key = rangeKey(source.range);
+      const parsed = validated(representationSchema, representation);
+      const { source, result, outputs } = parsed;
       const stored = database.read((tx) =>
         storedArtifact(tx.sql, result, "result"),
       );
@@ -70,30 +98,14 @@ export function createRepresentations(
         result,
         utf8Text(cas.readBytesSync(stored.blob), stored),
       );
-      const selected = selectOutput(result, saved.files, output);
+      const selections = outputs.map((output) =>
+        selectOutput(result, saved.files, output),
+      );
       database.write((tx) => {
         checkExtent(storedArtifact(tx.sql, source.ref), source);
         storedArtifact(tx.sql, result, "result");
-        storedArtifact(tx.sql, selected.ref);
-        tx.sql.run(
-          `UPDATE representations SET retired_seq = ? ${active}`,
-          tx.seq,
-          source.ref,
-          key,
-          purpose,
-          recipe,
-        );
-        tx.sql.run(
-          `INSERT INTO representations (source_ref, range_key, purpose, recipe, result_ref, output, created_seq)
-          VALUES (?, ?, ?, ?, ?, ?, ?)`,
-          source.ref,
-          key,
-          purpose,
-          recipe,
-          result,
-          output,
-          tx.seq,
-        );
+        for (const selected of selections) storedArtifact(tx.sql, selected.ref);
+        registerRepresentation(tx, parsed);
       });
     },
     remove(rawSource, purpose, recipe) {
@@ -101,7 +113,7 @@ export function createRepresentations(
       database.write((tx) => {
         checkExtent(storedArtifact(tx.sql, source.ref), source);
         tx.sql.run(
-          `UPDATE representations SET retired_seq = ? ${active}`,
+          `UPDATE representations SET retired_seq = ? ${activeRepresentation}`,
           tx.seq,
           source.ref,
           key,

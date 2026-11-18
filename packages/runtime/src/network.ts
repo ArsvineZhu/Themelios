@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { getCACertificates } from "node:tls";
 import { AppError, type CallScope } from "@themelios/core";
-import type { Closable } from "./contracts.js";
+import type { Closable } from "./execution.js";
 import type { Diagnostics } from "./diagnostics.js";
 import { errno, failure } from "./failure.js";
 import { createSecrets, type CredentialRef, type Secrets } from "./secrets.js";

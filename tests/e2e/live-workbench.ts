@@ -120,9 +120,15 @@ const app =
         join(portable, "app", "launch.mjs"),
       ];
 
-async function command(args: string[]) {
+async function command(args: string[], json = true) {
   const child = Bun.spawn(
-    [...app, "--installation", installationRoot, "--json", ...args],
+    [
+      ...app,
+      "--installation",
+      installationRoot,
+      ...(json ? ["--json"] : []),
+      ...args,
+    ],
     {
       cwd: sandbox,
       stdin: "ignore",
@@ -144,31 +150,31 @@ async function cli(...args: string[]): Promise<string> {
   return out;
 }
 
-async function runMedia() {
-  const importFile = async (name: string) =>
-    JSON.parse(await cli("material", "import", "--file", name)) as {
-      ref: string;
-    };
-  async function input(
-    name: string,
-    task: string,
-    variables: unknown,
-    selection: unknown,
-  ) {
-    await Bun.write(
-      join(sandbox, name),
-      JSON.stringify({ task, variables, materials: [{ source: selection }] }),
-    );
-  }
-  const delivered = (raw: string) =>
-    JSON.parse(raw) as {
-      ref: string;
-      value: unknown;
-      inputs: {
-        source: { ref: string; range?: unknown };
-        delivered: { ref: string }[];
-      }[];
-    };
+const importFile = async (name: string) =>
+  JSON.parse(await cli("material", "import", "--file", name)) as {
+    ref: string;
+  };
+async function input(
+  name: string,
+  task: string,
+  variables: unknown,
+  selection: unknown,
+) {
+  await Bun.write(
+    join(sandbox, name),
+    JSON.stringify({ task, variables, materials: [{ source: selection }] }),
+  );
+}
+const delivered = (raw: string) =>
+  JSON.parse(raw) as {
+    ref: string;
+    value: unknown;
+    inputs: {
+      source: { ref: string; range?: unknown };
+      delivered: { ref: string }[];
+    }[];
+  };
+async function runPdf() {
   const pdf = await PDFDocument.create();
   const font = await pdf.embedFont(StandardFonts.Helvetica);
   pdf
@@ -181,6 +187,19 @@ async function runMedia() {
   await Bun.write(join(sandbox, "two notes.pdf"), await pdf.save());
   const document = await importFile("two notes.pdf");
   const page = { ...document, range: { kind: "pages", start: 2, end: 3 } };
+  await Bun.write(
+    join(sandbox, "pdf-prompt.liquid"),
+    'Summarize the attached PDF text in English. Return a title, one short Markdown sentence in sections, sourceKeys ["S1"], and an empty notes string. Keep the title and sentence under twelve words each.\n',
+  );
+  await cli(
+    "prompt",
+    "edit",
+    "document.summary",
+    "--part",
+    "user",
+    "--file",
+    "pdf-prompt.liquid",
+  );
   await input(
     "pdf.json",
     "document.summary",
@@ -207,6 +226,22 @@ async function runMedia() {
   };
   if (!text.includes("PAGE TWO") || text.includes("PAGE ONE"))
     throw new Error("Model input did not contain only the requested PDF page.");
+  const reopenedPreview = JSON.parse(
+    await cli("task", "preview", "--input", "pdf.json"),
+  );
+  if (reopenedPreview.pending.length)
+    throw new Error("Saved PDF representation is unavailable after reopen.");
+  const repeated = delivered(
+    await cli("task", "run", "--input", "pdf.json", "--save"),
+  );
+  if (repeated.inputs[0]?.delivered[0]?.ref !== textRef)
+    throw new Error(
+      "Repeated execution did not reuse the exact delivered material.",
+    );
+  const rendered = await command(["task", "run", "--input", "pdf.json"], false);
+  if (rendered.code || !rendered.out.includes("[S1](")) {
+    throw new Error("Expected Markdown with a source link: " + rendered.error);
+  }
   await input(
     "empty.json",
     "document.summary",
@@ -220,8 +255,12 @@ async function runMedia() {
   ) {
     throw new Error("Expected the blank page to fail before a model request.");
   }
+  await cli("prompt", "reset", "document.summary", "--part", "user");
 
-  if (!visionURL || !visionId) return { pdf: selected.ref };
+  return selected.ref;
+}
+
+async function runVision() {
   const panel = (width: number, color: string) =>
     sharp({
       create: {
@@ -293,7 +332,12 @@ async function runMedia() {
       "Auxiliary model result did not become an actual summary input.",
     );
   }
-  return { pdf: selected.ref, vision: description.ref, assisted: assisted.ref };
+  return { vision: description.ref, assisted: assisted.ref };
+}
+
+async function runMedia() {
+  const pdf = await runPdf();
+  return visionURL && visionId ? { pdf, ...(await runVision()) } : { pdf };
 }
 
 const exact =

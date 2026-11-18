@@ -19,7 +19,7 @@ import {
   type CallWarning,
 } from "ai";
 import { z } from "zod";
-import type { Generated, GenerateRequest, ModelIdentity } from "./contracts.js";
+import type { Generated, GenerateRequest, ModelIdentity } from "./types.js";
 import {
   modelNotices,
   modelUsage,

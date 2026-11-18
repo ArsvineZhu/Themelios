@@ -11,6 +11,7 @@
     "@themelios/runtime": "0.1.0",
     "@themelios/storage": "0.1.0",
     "@themelios/content": "0.1.0",
+    "@themelios/transports": "0.1.0",
     "csv-parse": "7.0.3",
     "zod": "4.6.7"
   }

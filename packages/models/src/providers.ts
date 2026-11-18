@@ -21,7 +21,7 @@ import type {
   ModelParameters,
   ModelPart,
   ModelsOptions,
-} from "./contracts.js";
+} from "./types.js";
 import { matchesMime } from "./schema.js";
 import type { ModelTelemetry } from "./model-telemetry.js";
 

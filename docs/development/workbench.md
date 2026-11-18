@@ -19,8 +19,8 @@ themelios task describe document.summary --json
 ```json
 {
   "task": "document.summary",
-  "variables": {"language": "zh-CN", "maxSections": 3},
-  "materials": [{"source": {"ref": "替换为导入返回的 art_ 引用"}}]
+  "variables": { "language": "zh-CN", "maxSections": 3 },
+  "materials": [{ "source": { "ref": "替换为导入返回的 art_ 引用" } }]
 }
 ```
 
@@ -37,6 +37,8 @@ themelios task run --input ./request.json --save --stream --json
 ```
 
 编辑 `edited.liquid` 后再运行 `prompt edit`。预览通过 `sources` 显示来源与实际交付范围，通过 `pending` 显示尚未执行的转换或辅助模型请求。模型运行后，`--save` 返回正式成果引用。流式机器输出每行一个事件，最后一行为完整结果。要将结果送给下一步后再保存，可省略 `--save`。
+
+保存后再次运行相同选区及配方时，工作台会重用已交付的派生材料。预览会直接显示已复用的内容。去掉 `--stream --json` 可在终端阅读带来源链接的 Markdown。
 
 用 `themelios result read ARTIFACT_REF --json` 重读结果，用 `themelios material sources ARTIFACT_REF` 追溯到材料，再用 `themelios material export MATERIAL_REF ./original.txt` 导出精确原件。模型服务关闭后这些操作仍然可用。`task run --output PATH` 和原件导出的目标路径必须事先不存在。
 
@@ -56,7 +58,7 @@ secret = "env:THEMELIOS_OPERATOR_TOKEN"
 permissions = ["read", "write", "admin"]
 ```
 
-HTTP 可调用 `GET /v1/instance`、`POST /v1/materials` 和 `POST /v1/tasks/document.summary/stream`。MCP HTTP 地址为 `/mcp`，stdio 客户端可显式启动 `themelios mcp`。用 `[transports.grpc.listen]` 配置 gRPC，服务定义见 [application.proto](../../proto/themelios/v1/application.proto)。停止监听器后，CLI 可以直接打开同一实例。
+HTTP 可调用 `GET /instance`、`POST /materials` 和 `POST /tasks/document.summary/stream`。MCP HTTP 地址为 `/mcp`（自动为 Agent 压缩为 24 字母 `art_…` 短引用），stdio 客户端可显式启动 `themelios mcp`。停止监听器后，CLI 可以直接打开同一实例。
 
 ## 离线维护
 

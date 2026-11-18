@@ -19,7 +19,7 @@ bun run build:portable -- --target windows-x64-msvc
 bun run build:portable -- --target linux-x64-gnu
 ```
 
-产物位于 `artifacts/portable/`，Windows 为 ZIP，Ubuntu 为 tar.gz。发行目录带有 Bun、应用依赖、目标架构的原生锁、Sharp、PDF 资源、清单和许可证。解压运行相应启动器即可。搬迁时一并移动 `config/` 与 `instances/`，应用数据和引用保留原值。
+产物位于 `artifacts/portable/`，Windows 为 ZIP，Ubuntu 为 tar.gz。发行目录带有 Bun、应用依赖、Sharp、PDF 资源、清单（`format: "themelios.portable"`）和许可证。解压运行相应启动器即可。搬迁时一并移动 `config/` 与 `instances/`，应用数据和引用保留原值。
 
 ## 运行验证
 
@@ -28,7 +28,7 @@ bun run test:distribution -- --portable /ABS/UNPACKED/PORTABLE
 bun run test:live
 ```
 
-`test:distribution` 在仓库之外安装 tarball，运行库存导入、历史查询和原件导出。提供 `--portable` 时也验证搬迁后的实例和成果。添加 `--live` 可以运行库消费示例的实际模型请求。
+`test:distribution` 在仓库之外安装 tarball，从 CLI 和 HTTP/SSE 导入库存，使用 MCP 查询同一实例的历史，再下载原件。提供 `--portable` 时也运行实例搬迁。添加 `--live` 可用独立模型示例分别运行内联和文件 Prompt。
 
 `test:live` 使用明确提供的 `THEMELIOS_MODEL_URL`、`THEMELIOS_MODEL_ID` 和按需提供的 `THEMELIOS_MODEL_KEY`。它运行工作台的材料、提示词、模型、保存、断开模型后回读和备份恢复。可给脚本传入 Portable 目录，使实际调用走发行包内的 Bun 和应用。
 

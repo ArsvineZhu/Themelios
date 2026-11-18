@@ -7,7 +7,7 @@ import type {
   RankRequest,
   Transcript,
   TranscribeRequest,
-} from "./contracts.js";
+} from "./types.js";
 import { modelNotices, modelUsage, retryModel } from "./model-call.js";
 import type { ModelTelemetry } from "./model-telemetry.js";
 import {
@@ -207,7 +207,7 @@ export async function transcript(
   ) {
     requireCapability(bound, "transcribe:" + granularity);
   }
-  checkParts(bound, "transcribe", [request.audio]);
+  checkParts(bound, "transcribe", [{ kind: "media", ...request.audio }]);
   const { providerOptions } = requestParameters(bound);
   if (request.language)
     providerOptions.openai = {

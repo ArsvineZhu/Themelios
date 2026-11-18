@@ -3,7 +3,7 @@ import type {
   PreparedRepresentation,
   RecipeDescription,
   RepresentationAdapter,
-} from "@themelios/application/inputs";
+} from "@themelios/models/tasks";
 import { appError, type Json, type ProducedFile } from "@themelios/core";
 import { z } from "zod";
 import {
@@ -92,6 +92,18 @@ export function createPdfAdapters({
   return [
     {
       description: recipe("pdf.text", ["text"], ["text/plain"], empty, 10),
+      validateForModel(representation, input) {
+        const value = representation.result.value as { emptyPages: number[] };
+        if (value.emptyPages.length) {
+          throw appError("input.capability_missing", {
+            details: {
+              mediaType: input.info.mediaType,
+              required: "text on every selected PDF page; use a visual route",
+              emptyPages: value.emptyPages,
+            },
+          });
+        }
+      },
       probe,
       available,
       prepare(input, raw, options) {

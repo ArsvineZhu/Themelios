@@ -1,9 +1,8 @@
-import { copyFile, mkdir, readdir, unlink } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { readdir, unlink } from "node:fs/promises";
+import { basename, join } from "node:path";
 import {
   exportSources,
   orderedWorkspaces,
-  repoRoot,
   run,
   workspaces,
   type Workspace,
@@ -11,18 +10,11 @@ import {
 
 export async function buildPackages(
   selection: string[] = [],
-  native = true,
   quiet = false,
 ): Promise<void> {
   const ordered = orderedWorkspaces(await workspaces(), selection);
   if (!ordered.length) throw new Error("No workspace packages found.");
   const bun = process.execPath;
-  if (
-    native &&
-    ordered.some((pkg) => pkg.manifest.name === "@themelios/runtime")
-  ) {
-    await run([bun, "native/build.ts"], { quiet });
-  }
   await run(
     [bun, "x", "--no-install", "tsc", "-b", ...ordered.map((pkg) => pkg.root)],
     { quiet },
@@ -57,12 +49,6 @@ async function bundlePackage(pkg: Workspace): Promise<void> {
     if (/^chunk-[a-zA-Z0-9]+\.js(?:\.map)?$/.test(file) && !emitted.has(file))
       await unlink(join(dist, file));
   }
-  if (pkg.manifest.name === "@themelios/transports") {
-    const proto = "proto/themelios/v1/application.proto";
-    const destination = join(pkg.root, "resources", proto);
-    await mkdir(dirname(destination), { recursive: true });
-    await copyFile(join(repoRoot, proto), destination);
-  }
   for (const contract of Object.values(pkg.manifest.exports ?? {})) {
     const path = join(pkg.root, contract.types);
     if (!(await Bun.file(path).exists()))
@@ -73,10 +59,7 @@ async function bundlePackage(pkg: Workspace): Promise<void> {
 if (import.meta.main) {
   const args = process.argv.slice(2).filter((arg) => arg !== "--");
   try {
-    await buildPackages(
-      args.filter((arg) => arg !== "--no-native"),
-      !args.includes("--no-native"),
-    );
+    await buildPackages(args);
     console.log("Built Themelios package exports.");
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));

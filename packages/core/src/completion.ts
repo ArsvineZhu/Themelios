@@ -1,10 +1,10 @@
 import { z } from "zod";
 import { jsonSchema, type Json } from "./json.js";
+import type { ErrorInfo } from "./errors.js";
 import {
   artifactRefSchema,
   inlineMaterialSchema,
   selectionSchema,
-  textRangeSchema,
   type ArtifactRef,
   type InlineMaterial,
   type Selection,
@@ -36,18 +36,21 @@ export interface ProducedFile {
   sourceIndices: readonly number[];
 }
 
-export interface CopyMap {
-  output: string;
-  range: { start: number; end: number };
-  source: Selection;
-}
+export const preparedRepresentationSchema = z.strictObject({
+  source: selectionSchema,
+  recipe: z.string().min(1),
+  outputs: z.array(z.string().min(1)).min(1),
+});
+export type PreparedRepresentationIndex = z.infer<
+  typeof preparedRepresentationSchema
+>;
 
 export interface Completed<T extends Json = Json> {
   value: T;
   inputs: readonly InputUse[];
   files: readonly ProducedFile[];
+  representation?: PreparedRepresentationIndex | undefined;
   producer: Producer;
-  mappings?: readonly CopyMap[];
 }
 
 export interface SavedFile {
@@ -61,7 +64,6 @@ export interface SavedResult<T extends Json = Json> {
   inputs: readonly InputUse<Selection>[];
   files: Readonly<Record<string, SavedFile>>;
   producer: Producer;
-  mappings?: readonly CopyMap[];
 }
 
 const fileName = z
@@ -76,7 +78,7 @@ const fileName = z
   );
 const sourceIndices = z.array(z.int().nonnegative());
 
-export const producerSchema = z
+export const producerSchema: z.ZodType<Producer> = z
   .strictObject({
     kind: z.enum(["model", "transform", "application"]),
     name: z.string().min(1),
@@ -98,7 +100,7 @@ const resultHandle = z.custom<ResultOutput["result"]>(
     Object.hasOwn(value, "files"),
 );
 
-export const resultOutputSchema = z
+export const resultOutputSchema: z.ZodType<ResultOutput> = z
   .strictObject({
     result: resultHandle,
     output: z.union([z.literal("$value"), fileName]).optional(),
@@ -107,7 +109,7 @@ export const resultOutputSchema = z
     output === undefined ? { result } : { result, output },
   );
 
-export const materialSchema = z.union([
+export const materialSchema: z.ZodType<Material> = z.union([
   selectionSchema,
   inlineMaterialSchema,
   resultOutputSchema,
@@ -121,19 +123,9 @@ function inputUseSchema<S>(schema: z.ZodType<S>) {
   });
 }
 
-export const copyMapSchema = z.strictObject({
-  output: fileName,
-  range: textRangeSchema,
-  source: selectionSchema.refine(
-    (selection) => selection.range?.kind === "text",
-    "Expected a text selection",
-  ),
-});
-
 const manifest = {
   value: jsonSchema,
   producer: producerSchema,
-  mappings: z.array(copyMapSchema).optional(),
 };
 const producedFileSchema = z.strictObject({
   name: fileName,
@@ -179,7 +171,6 @@ const savedFilesSchema = z
 function checkFiles(
   files: Iterable<readonly [string, { sourceIndices: readonly number[] }]>,
   inputCount: number,
-  outputNames: Iterable<string>,
   ctx: z.RefinementCtx,
 ): void {
   const seen = new Set<string>();
@@ -199,18 +190,11 @@ function checkFiles(
       });
     }
   }
-  for (const name of outputNames) {
-    if (!seen.has(name))
-      ctx.addIssue({
-        code: "custom",
-        path: ["mappings"],
-        message: "Unknown output: " + name,
-      });
-  }
 }
 
 export const completedSchema: z.ZodType<Completed> = z
   .strictObject({
+    representation: preparedRepresentationSchema.optional(),
     ...manifest,
     inputs: z.array(inputUseSchema(materialSchema)),
     files: z.array(producedFileSchema),
@@ -219,13 +203,9 @@ export const completedSchema: z.ZodType<Completed> = z
     checkFiles(
       data.files.map((file) => [file.name, file]),
       data.inputs.length,
-      data.mappings?.map((mapping) => mapping.output) ?? [],
       ctx,
     );
-  })
-  .transform(({ mappings, ...data }): Completed =>
-    mappings === undefined ? data : { ...data, mappings },
-  );
+  });
 
 export const savedResultSchema: z.ZodType<SavedResult> = z
   .strictObject({
@@ -235,21 +215,19 @@ export const savedResultSchema: z.ZodType<SavedResult> = z
     files: savedFilesSchema,
   })
   .superRefine((data, ctx) => {
-    checkFiles(
-      Object.entries(data.files),
-      data.inputs.length,
-      data.mappings?.map((mapping) => mapping.output) ?? [],
-      ctx,
-    );
-  })
-  .transform(({ mappings, ...data }): SavedResult =>
-    mappings === undefined ? data : { ...data, mappings },
-  );
+    checkFiles(Object.entries(data.files), data.inputs.length, ctx);
+  });
 
-export const errorInfoSchema = z.strictObject({
-  code: z.string(),
-  message: z.string(),
-  retryable: z.boolean(),
-  details: jsonSchema.optional(),
-  traceId: z.string().optional(),
-});
+export const errorInfoSchema: z.ZodType<ErrorInfo> = z
+  .strictObject({
+    code: z.string(),
+    message: z.string(),
+    retryable: z.boolean(),
+    details: jsonSchema.optional(),
+    traceId: z.string().optional(),
+  })
+  .transform(({ details, traceId, ...rest }): ErrorInfo => ({
+    ...rest,
+    ...(details === undefined ? {} : { details }),
+    ...(traceId === undefined ? {} : { traceId }),
+  }));

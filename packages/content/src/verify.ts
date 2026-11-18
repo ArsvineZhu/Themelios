@@ -1,7 +1,6 @@
 import { openCall, type ArtifactRef, type CallOptions } from "@themelios/core";
 import type { Cas, Database } from "@themelios/storage";
-import { indexEdges, storedArtifact } from "./artifacts.js";
-import type { SourceLink } from "./contracts.js";
+import { indexEdges, storedArtifact, type SourceLink } from "./artifacts.js";
 import { resultLinks } from "./result-graph.js";
 import { parseManifest } from "./results.js";
 import { rawBytes, utf8Text } from "./selections.js";

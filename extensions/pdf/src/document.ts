@@ -1,4 +1,4 @@
-import { readMediaBytes, type MediaInput } from "@themelios/application/inputs";
+import { readMediaBytes, type MediaInput } from "@themelios/models/tasks";
 import {
   AppError,
   appError,

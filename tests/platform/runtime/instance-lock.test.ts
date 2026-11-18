@@ -9,7 +9,7 @@ test("an OS-held instance conflicts across processes and opens after the holder 
   const root = await mkdtemp(join(work, "runtime-native-"));
   const app = {
     id: "test.platform",
-    formatId: "test.platform/1",
+    formatId: "test.platform",
     settings: runtimeSettings,
     async provision() {},
     async open() {},

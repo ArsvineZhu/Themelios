@@ -20,7 +20,7 @@ test("real bytes, upstream results, and business rows share durable storage sema
   const root = join(directory, "current");
   const state = join(root, "state");
   const configuration = join(root, "config");
-  const formatId = "test.content/1";
+  const formatId = "test.content";
   const applicationId = "test.content";
   const instanceId = crypto.randomUUID();
   await mkdir(state, { recursive: true });
@@ -73,6 +73,10 @@ test("real bytes, upstream results, and business rows share durable storage sema
     await prepared.close();
     const duplicate = await materials.accept({ file: inputPath });
     expect(duplicate.ref).not.toBe(source.ref);
+    const agentShort = materials.agentRef(source.ref);
+    expect(agentShort).toMatch(/^art_[a-z]{24}$/);
+    expect(materials.resolve(agentShort)).toBe(source.ref);
+    expect(materials.resolve(source.ref)).toBe(source.ref);
     expect((await verifyStorage(database, cas)).blobs).toBe(1);
     const blocks = await materials.structure(duplicate.ref);
     expect(blocks.map((block) => block.kind)).toEqual([
@@ -102,16 +106,6 @@ test("real bytes, upstream results, and business rows share durable storage sema
       files: [
         { name: "summary.txt", material: generated, sourceIndices: [0] },
         { name: "__proto__", material: generated, sourceIndices: [0] },
-      ],
-      mappings: [
-        {
-          output: "summary.txt",
-          range: { start: 0, end: 6 },
-          source: {
-            ref: duplicate.ref,
-            range: { kind: "text", start: 5, end: 11 },
-          },
-        },
       ],
     };
     const output = { result: upstream, output: "summary.txt" };
@@ -158,12 +152,12 @@ test("real bytes, upstream results, and business rows share durable storage sema
     representations.set({
       source: duplicate,
       purpose: "model-input",
-      recipe: "test/1",
+      recipe: "test.recipe",
       result: original.ref,
-      output: "summary.txt",
+      outputs: ["summary.txt"],
     });
     expect(
-      representations.find(duplicate, "model-input", "test/1")?.result,
+      representations.find(duplicate, "model-input", "test.recipe")?.result,
     ).toBe(original.ref);
     materials.release(duplicate.ref);
     await collectStorage(database, cas, { retainSince: database.cut() });
@@ -207,12 +201,13 @@ test("real bytes, upstream results, and business rows share durable storage sema
     const restoredCas = await Cas.open(join(target, "objects"));
     try {
       expect(restoredDatabase.cut()).toBe(manifest.cut);
-      expect(
-        await createContent({
-          database: restoredDatabase,
-          cas: restoredCas,
-        }).results.read(saved.ref),
-      ).toEqual(saved);
+      const restoredContent = createContent({
+        database: restoredDatabase,
+        cas: restoredCas,
+      });
+      expect(await restoredContent.results.read(saved.ref)).toEqual(saved);
+      expect(restoredContent.materials.agentRef(source.ref)).toBe(agentShort);
+      expect(restoredContent.materials.resolve(agentShort)).toBe(source.ref);
     } finally {
       await restoredCas.close();
       restoredDatabase.close();

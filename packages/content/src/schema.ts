@@ -1,6 +1,7 @@
 export const contentSchemaSql = `
 CREATE TABLE artifacts (
   ref TEXT PRIMARY KEY,
+  agent_code TEXT NOT NULL UNIQUE,
   kind TEXT NOT NULL CHECK (kind IN ('material', 'result')),
   media_type TEXT NOT NULL,
   blob_ref TEXT NOT NULL CHECK (
@@ -19,7 +20,7 @@ CREATE INDEX artifacts_blob ON artifacts(blob_ref);
 
 CREATE TABLE artifact_edges (
   owner_ref TEXT NOT NULL REFERENCES artifacts(ref),
-  relation TEXT NOT NULL CHECK (relation IN ('input', 'file', 'copy', 'representation-source')),
+  relation TEXT NOT NULL CHECK (relation IN ('input', 'file', 'representation-source')),
   ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
   target_ref TEXT NOT NULL REFERENCES artifacts(ref),
   selection_json TEXT NOT NULL CHECK (json_valid(selection_json)),
@@ -43,7 +44,7 @@ CREATE TABLE representations (
   purpose TEXT NOT NULL CHECK (purpose IN ('model-input', 'retrieval-text')),
   recipe TEXT NOT NULL,
   result_ref TEXT NOT NULL REFERENCES artifacts(ref),
-  output TEXT NOT NULL,
+  outputs_json TEXT NOT NULL CHECK (json_valid(outputs_json)),
   created_seq INTEGER NOT NULL REFERENCES commits(seq),
   retired_seq INTEGER REFERENCES commits(seq),
   CHECK (retired_seq IS NULL OR retired_seq > created_seq),

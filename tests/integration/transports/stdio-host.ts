@@ -1,3 +1,4 @@
+import { standardOperations } from "@themelios/application";
 import { createApplicationModule } from "@themelios/application";
 import { Installation } from "@themelios/runtime";
 import { serveMcpStdio } from "@themelios/transports";
@@ -8,7 +9,7 @@ const installation = Installation.at(
   root,
   createApplicationModule({
     id: "test.protocols",
-    formatId: "test.protocols/1",
+    formatId: "test.protocols",
     resourceRoot: root,
     tasks: [],
   }),
@@ -18,6 +19,11 @@ const session = await installation
   .open({ mode: "read-only" });
 try {
   const endpoint = await serveMcpStdio(session.api, {
+    operations: standardOperations(),
+    agentRefs: (app) => ({
+      resolveRef: app.materials.resolve,
+      formatRef: app.materials.agentRef,
+    }),
     principal: { id: "test-reader", permissions: ["read"] },
   });
   await endpoint.closed;

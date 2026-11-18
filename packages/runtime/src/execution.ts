@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
   AppError,
+  attachTraceId,
   createFlow,
   openCall,
   toAppError,
@@ -8,20 +9,67 @@ import {
   type CallScope,
   type Flow,
   type FlowEvent,
+  type Json,
 } from "@themelios/core";
-import type { Execution, ResourceContext, TaskHandle } from "./contracts.js";
-import { diagnoseError, type RuntimeDiagnostics } from "./diagnostics.js";
+import {
+  newSpanId,
+  newTraceId,
+  type RuntimeDiagnostics,
+  type TraceFrame,
+} from "./diagnostics.js";
 import { failure } from "./failure.js";
+import type { Network } from "./network.js";
+import type { Secrets } from "./secrets.js";
+import type { RuntimeSettings } from "./settings.js";
+
+export interface Closable {
+  close(): void | Promise<void>;
+}
+
+export interface TaskHandle<T> {
+  readonly result: Promise<T>;
+  cancel(reason?: string): void;
+}
+
+export interface Execution {
+  run<T>(
+    name: string,
+    work: (signal: AbortSignal) => Promise<T>,
+    options?: CallOptions,
+  ): Promise<T>;
+  start<T>(
+    name: string,
+    work: (signal: AbortSignal) => Promise<T>,
+    options?: CallOptions,
+  ): TaskHandle<T>;
+  flow<T>(
+    name: string,
+    create: (signal: AbortSignal) => Flow<T>,
+    options?: CallOptions,
+  ): Flow<T>;
+}
+
+export interface ResourceSlot<T extends Closable> {
+  get(): T;
+}
+
+export interface ResourceContext<S> {
+  readonly settings: Readonly<S>;
+  readonly runtime: Readonly<RuntimeSettings>;
+  readonly network: Network;
+  readonly secrets: Secrets;
+  readonly diagnostics: RuntimeDiagnostics;
+}
 
 export interface OperationResources<S> extends ResourceContext<S> {
-  readonly diagnostics: RuntimeDiagnostics;
   hold(): () => void;
 }
 
-type Context<S> = {
-  call: CallScope;
-  resources: OperationResources<S>;
-  active: boolean;
+type FrameStore<S> = {
+  call?: CallScope;
+  resources?: OperationResources<S>;
+  active?: boolean;
+  trace: TraceFrame;
 };
 
 interface ActiveOperation {
@@ -37,17 +85,43 @@ interface OperationLease {
   failure(error: unknown): AppError;
 }
 
-/** Captures resources and budget at operation admission and retains them until real work exits. */
+/** Captures resources, budget, and trace context in a single AsyncLocalStorage across async calls and streams. */
 export class SessionExecution<S> implements Execution {
-  readonly #local = new AsyncLocalStorage<Context<S>>();
+  readonly #local = new AsyncLocalStorage<FrameStore<S>>();
   readonly #operations = new Set<ActiveOperation>();
   #closing = false;
 
   constructor(readonly getResources: () => OperationResources<S>) {}
 
-  current(): Context<S> | undefined {
+  current():
+    | {
+        call: CallScope;
+        resources: OperationResources<S>;
+        active: boolean;
+        trace: TraceFrame;
+      }
+    | undefined {
     const context = this.#local.getStore();
-    return context?.active ? context : undefined;
+    return context?.active && context.call && context.resources
+      ? {
+          call: context.call,
+          resources: context.resources,
+          active: true,
+          trace: context.trace,
+        }
+      : undefined;
+  }
+
+  currentTrace(): TraceFrame | undefined {
+    return this.#local.getStore()?.trace;
+  }
+
+  enterTrace<T>(frame: TraceFrame, work: () => Promise<T>): Promise<T> {
+    const store = this.#local.getStore();
+    return this.#local.run(
+      store ? { ...store, trace: frame } : { trace: frame },
+      work,
+    );
   }
 
   run<T>(
@@ -227,47 +301,63 @@ export class SessionExecution<S> implements Execution {
           operation: name,
         }),
     );
-    const context: Context<S> = { call, resources, active: true };
+    const parentTrace = parent?.trace ?? this.currentTrace();
+    const trace: TraceFrame = {
+      traceId: parentTrace?.traceId ?? newTraceId(),
+      spanId: newSpanId(),
+      ...(parentTrace ? { parentSpanId: parentTrace.spanId } : {}),
+      operation: parentTrace?.operation ?? name,
+    };
+    const isRoot = !parentTrace;
+    const startedAt = performance.now();
+    const context: FrameStore<S> = {
+      call,
+      resources,
+      active: true,
+      trace,
+    };
     const release = resources.hold();
     const workDone = Promise.withResolvers<void>();
-    const diagnosticDone = Promise.withResolvers<void>();
-    const item = { name, call, done: workDone.promise };
+    const item: ActiveOperation = { name, call, done: workDone.promise };
     this.#operations.add(item);
-    let inside = <T>(work: () => T) => this.#local.run(context, work);
-    let complete = () => {
-      call.close();
-      context.active = false;
-      release();
-      this.#operations.delete(item);
-      workDone.resolve();
-    };
-    if (!parent) {
-      const span = resources.diagnostics.operation(name, () => {
-        const runWithSpan = AsyncLocalStorage.snapshot();
-        inside = (work) => runWithSpan(() => this.#local.run(context, work));
-        return diagnosticDone.promise;
-      });
-      const finish = complete;
-      complete = () => {
-        void span.catch(() => undefined).finally(finish);
-      };
-    }
+
     return {
       call,
-      withContext(work) {
-        return inside(work);
-      },
-      end(error) {
-        if (!parent) {
-          if (error === undefined) diagnosticDone.resolve();
-          else diagnosticDone.reject(error);
+      withContext: <T>(work: () => T) => this.#local.run(context, work),
+      end: (error) => {
+        try {
+          if (isRoot) {
+            const durationMs = Math.round(performance.now() - startedAt);
+            const outcome: Json = error === undefined ? "success" : "failure";
+            const code =
+              error instanceof AppError
+                ? error.code
+                : error !== undefined
+                  ? "internal.unexpected"
+                  : undefined;
+            resources.diagnostics.log(
+              error === undefined ? "info" : "warn",
+              "operation.completed",
+              {
+                stage: name,
+                durationMs,
+                outcome,
+                ...(code ? { code } : {}),
+              },
+              trace,
+            );
+          }
+        } finally {
+          call.close();
+          context.active = false;
+          release();
+          this.#operations.delete(item);
+          workDone.resolve();
         }
-        complete();
       },
-      failure(error) {
+      failure: (error) => {
         const mapped = toAppError(error);
-        const traceId = inside(() => resources.diagnostics.correlate().traceId);
-        diagnoseError(mapped, traceId);
+        attachTraceId(mapped, trace.traceId);
         return mapped;
       },
     };

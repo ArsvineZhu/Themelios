@@ -51,7 +51,7 @@ const installationConfigSchema = z.discriminatedUnion("present", [
   }),
 ]);
 const manifestSchema = z.strictObject({
-  format: z.literal("themelios.backup/1"),
+  format: z.literal("themelios.backup"),
   applicationId: z.string().min(1),
   instanceId: z.string().min(1),
   formatId: z.string().min(1),
@@ -256,7 +256,7 @@ export async function backupStorage(
       });
     const manifest: BackupManifest = {
       ...stats,
-      format: "themelios.backup/1",
+      format: "themelios.backup",
       applicationId: options.applicationId,
       instanceId: options.instanceId,
       installationConfig: installation
@@ -355,11 +355,10 @@ async function installationConfig(
     });
 
   await mkdir(dirname(destination), { recursive: true });
-  const created = await stageFile(
+  await stageFile(
     dirname(destination),
     async (file) => {
       await writeChunk(file, archived);
-      return file.stat({ bigint: true });
     },
     async (path) => {
       try {
@@ -376,13 +375,7 @@ async function installationConfig(
     },
   );
   return async () => {
-    const latest = await existing(destination);
-    if (
-      latest &&
-      BigInt(latest.dev) === created.dev &&
-      BigInt(latest.ino) === created.ino &&
-      (await readRegular(destination))?.equals(archived)
-    ) {
+    if ((await readRegular(destination))?.equals(archived)) {
       await unlink(destination);
     }
   };

@@ -1,0 +1,16 @@
+{
+  "task": "document.summary",
+  "variables": {
+    "maxSections": 3
+  },
+  "materials": [
+    {
+      "source": {
+        "bytesBase64": "5pys5ZGo5a6M5oiQ6LWE5paZ55uu5b2V6L+B56e744CC5bey5L+d5a2Y55qE5paH5pys5p2Q5paZ5Y+v5Lul56a757q/6K+75Y+W44CC5LiL5LiA5q2l5o6l5YWl55yf5a6e5qih5Z6L44CCCg==",
+        "mediaType": "text/plain",
+        "name": "progress.txt"
+      },
+      "role": "primary"
+    }
+  ]
+}

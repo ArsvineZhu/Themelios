@@ -43,7 +43,7 @@ try {
         ? "linux-x64-gnu"
         : undefined;
   if (
-    manifest.schemaVersion !== 1 ||
+    manifest.format !== "themelios.portable" ||
     !target ||
     process.arch !== "x64" ||
     manifest.target !== target

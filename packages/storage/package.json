@@ -14,10 +14,6 @@
       "types": "./dist/types/index.d.ts",
       "import": "./dist/index.js"
     },
-    "./time": {
-      "types": "./dist/types/time.d.ts",
-      "import": "./dist/time.js"
-    },
     "./locales": {
       "types": "./dist/types/locales.d.ts",
       "import": "./dist/locales.js"

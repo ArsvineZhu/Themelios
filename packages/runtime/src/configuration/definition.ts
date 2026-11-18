@@ -5,7 +5,7 @@ import type {
   SettingIssue,
   SettingMeta,
   SettingsDefinition,
-} from "../settings-contract.js";
+} from "../settings.js";
 import { failure } from "../failure.js";
 import { isObject, matches, pathParts, pointer } from "./path.js";
 

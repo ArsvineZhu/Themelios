@@ -4,17 +4,12 @@ import {
   parseValue,
   type CallOptions,
   type CallScope,
+  type Completed,
   type Json,
 } from "@themelios/core";
 import { createNetwork, type Network } from "@themelios/runtime/network";
 import { createSecrets } from "@themelios/runtime/secrets";
 import { z } from "zod";
-import type {
-  FetchFunction,
-  GenerateRequest,
-  Models,
-  ModelsOptions,
-} from "./contracts.js";
 import {
   generate,
   prepareGeneration,
@@ -24,6 +19,8 @@ import {
 import { ModelCalls, queuedStream } from "./model-call.js";
 import { ModelTelemetry } from "./model-telemetry.js";
 import { embed, rank, transcript } from "./other-model-operations.js";
+import { createPreparation, readMediaBytes } from "./preparation.js";
+import { createPrompts } from "./prompts.js";
 import {
   type BoundModel,
   captureParts,
@@ -36,33 +33,26 @@ import {
   modelBindingSchema,
   modelDefaultsSchema,
   modelNameSchema,
+  matchesMime,
+  mimePatternSchema,
+  modelParametersSchema,
 } from "./schema.js";
-
-export type {
-  Connection,
-  EmbedRequest,
-  Embedded,
-  EmbeddingSpace,
+import {
+  createTasks,
+  defineTask,
+  describeTask,
+  mediaDescription,
+} from "./tasks.js";
+import type {
   FetchFunction,
   GenerateRequest,
-  Generated,
-  ModalityNeed,
-  ModelBinding,
-  ModelCapabilities,
-  ModelIdentity,
-  ModelMessage,
-  ModelNotice,
-  ModelOperation,
-  ModelParameters,
-  ModelPart,
   Models,
   ModelsOptions,
-  RankRequest,
-  Ranked,
-  Transcript,
-  TranscribeRequest,
-  Usage,
-} from "./contracts.js";
+  TaskDefinition,
+  TaskRequest,
+} from "./types.js";
+
+export * from "./types.js";
 export {
   connectionSchema,
   modelBindingSchema,
@@ -71,8 +61,15 @@ export {
   modelParametersSchema,
   matchesMime,
   mimePatternSchema,
-} from "./schema.js";
-export { providerOutputSchema };
+  providerOutputSchema,
+  createPreparation,
+  createPrompts,
+  createTasks,
+  defineTask,
+  describeTask,
+  mediaDescription,
+  readMediaBytes,
+};
 
 export function createModels(options: ModelsOptions): Models {
   const bound = bindModels(options);
@@ -117,28 +114,39 @@ export function createModels(options: ModelsOptions): Models {
   const observe = (model: BoundModel) =>
     new ModelTelemetry(model.identity, options.diagnostics);
   let closing: Promise<void> | undefined;
-  return {
+  let defaultPrompts = options.prompts;
+  let defaultPreparation = options.preparation;
+
+  const models: Models = {
     describe,
     async generate<O extends Json>(
       request: GenerateRequest<O>,
-      options?: CallOptions,
+      callOptions?: CallOptions,
     ) {
       calls.assertOpen();
       const model = binding(request.model);
       const prepared = prepareGeneration(model, request);
-      return calls.run("models.generate", model.identity, options, (call) => {
-        const telemetry = observe(model);
-        return generate(
-          prepared,
-          call,
-          model.identity,
-          calls.attempts,
-          telemetry,
-          () => language(model, call, telemetry, prepared.openaiApi),
-        );
-      });
+      return calls.run(
+        "models.generate",
+        model.identity,
+        callOptions,
+        (call) => {
+          const telemetry = observe(model);
+          return generate(
+            prepared,
+            call,
+            model.identity,
+            calls.attempts,
+            telemetry,
+            () => language(model, call, telemetry, prepared.openaiApi),
+          );
+        },
+      );
     },
-    stream<O extends Json>(request: GenerateRequest<O>, options?: CallOptions) {
+    stream<O extends Json>(
+      request: GenerateRequest<O>,
+      callOptions?: CallOptions,
+    ) {
       const captured = (() => {
         try {
           const model = binding(request.model);
@@ -164,10 +172,10 @@ export function createModels(options: ModelsOptions): Models {
             ),
           );
         },
-        calls.options(options),
+        calls.options(callOptions),
       );
     },
-    async embed(request, options) {
+    async embed(request, callOptions) {
       const model = binding(request.model);
       checkOperation(model, "embed");
       const map = new WeakMap<Uint8Array, Uint8Array>();
@@ -175,37 +183,84 @@ export function createModels(options: ModelsOptions): Models {
         ...request,
         inputs: request.inputs.map((input) => captureParts(input, map)),
       };
-      return calls.run("models.embed", model.identity, options, (call) => {
+      return calls.run("models.embed", model.identity, callOptions, (call) => {
         const telemetry = observe(model);
         return embed(model, fixed, call, calls.attempts, telemetry, () =>
           client(model, call, telemetry),
         );
       });
     },
-    async rank(request, options) {
+    async rank(request, callOptions) {
       const model = binding(request.model);
       checkOperation(model, "rank");
       const fixed = { ...request, documents: [...request.documents] };
-      return calls.run("models.rank", model.identity, options, (call) => {
+      return calls.run("models.rank", model.identity, callOptions, (call) => {
         const telemetry = observe(model);
         return rank(model, fixed, call, calls.attempts, telemetry, () =>
           client(model, call, telemetry),
         );
       });
     },
-    async transcribe(request, options) {
+    async transcribe(request, callOptions) {
       const model = binding(request.model);
       checkOperation(model, "transcribe");
       const fixed = {
         ...request,
         audio: { ...request.audio, bytes: new Uint8Array(request.audio.bytes) },
       };
-      return calls.run("models.transcribe", model.identity, options, (call) => {
-        const telemetry = observe(model);
-        return transcript(model, fixed, call, calls.attempts, telemetry, () =>
-          client(model, call, telemetry),
-        );
+      return calls.run(
+        "models.transcribe",
+        model.identity,
+        callOptions,
+        (call) => {
+          const telemetry = observe(model);
+          return transcript(model, fixed, call, calls.attempts, telemetry, () =>
+            client(model, call, telemetry),
+          );
+        },
+      );
+    },
+    runTask<I extends Json, O extends Json, RawI>(
+      task: TaskDefinition<I, O, RawI>,
+      request: TaskRequest<RawI>,
+      callOptions?: CallOptions,
+    ): Promise<Completed<O>> {
+      const prompts = (defaultPrompts ??= createPrompts(
+        options.resourceRoot === undefined
+          ? {}
+          : { resourceRoot: options.resourceRoot },
+      ));
+      const preparation = (defaultPreparation ??= createPreparation({
+        models,
+        prompts,
+        ...(options.adapters === undefined
+          ? {}
+          : { adapters: options.adapters }),
+      }));
+      const defaultModel =
+        request.model ??
+        options.routes?.[task.id]?.model ??
+        (bound.size === 1 ? bound.keys().next().value : undefined);
+      const tasks = createTasks({
+        models,
+        prompts,
+        preparation,
+        routes: {
+          ...(options.routes ?? {}),
+          ...(defaultModel === undefined
+            ? {}
+            : {
+                [task.id]: {
+                  ...options.routes?.[task.id],
+                  model: defaultModel,
+                },
+              }),
+        },
+        ...(options.diagnostics === undefined
+          ? {}
+          : { diagnostics: options.diagnostics }),
       });
+      return tasks.run(task, request, callOptions);
     },
     close() {
       return (closing ??= (async () => {
@@ -214,6 +269,7 @@ export function createModels(options: ModelsOptions): Models {
       })());
     },
   };
+  return models;
 }
 
 function bindModels({
@@ -269,3 +325,4 @@ function bindModels({
   }
   return bound;
 }
+export { z } from "zod";

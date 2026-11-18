@@ -14,12 +14,15 @@ export const locales = {
     "storage.history_unavailable": "The requested history was collected.",
     "storage.cut_invalid": "The requested commit position is invalid.",
     "storage.limit_exceeded": "The material exceeds the byte limit.",
+    "time.invalid": "The time value is invalid.",
+    "time.precision_unsupported":
+      "Timestamps with finer than millisecond precision are not supported.",
     "time.domain_conflict":
       "The time domain already has a different definition.",
     "time.domain_not_found": "The time domain does not exist.",
-    "time.overflow":
-      "The time coordinate is outside the supported integer range.",
-    "time.unmapped": "No mapping covers the requested instant at that commit.",
+    "time.domain_mismatch": "The time values belong to different domains.",
+    "time.order_undefined":
+      "An opaque time domain does not define ordering between distinct points.",
   },
   "zh-CN": {
     "storage.already_exists": "目标已存在。",
@@ -34,9 +37,11 @@ export const locales = {
     "storage.history_unavailable": "请求的历史已回收。",
     "storage.cut_invalid": "请求的提交位置无效。",
     "storage.limit_exceeded": "材料超出字节数上限。",
+    "time.invalid": "时间值无效。",
+    "time.precision_unsupported": "不支持亚毫秒级精度的时间戳。",
     "time.domain_conflict": "时间域已有不同的定义。",
     "time.domain_not_found": "时间域不存在。",
-    "time.overflow": "时间坐标超出支持的整数范围。",
-    "time.unmapped": "该提交下没有覆盖此时刻的映射。",
+    "time.domain_mismatch": "时间值属于不同的时间域。",
+    "time.order_undefined": "不透明时间域未定义不同点之间的顺序。",
   },
 } as const;

@@ -4,7 +4,7 @@ const root = Bun.argv[2];
 if (!root) throw new Error("Missing installation root");
 const app = {
   id: "test.platform",
-  formatId: "test.platform/1",
+  formatId: "test.platform",
   settings: runtimeSettings,
   async provision() {},
   async open() {},

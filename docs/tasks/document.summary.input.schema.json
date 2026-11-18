@@ -4,6 +4,7 @@
   "properties": {
     "language": {
       "default": "zh-CN",
+      "descriptionKey": "tasks.summary.fields.language",
       "type": "string",
       "enum": [
         "zh-CN",
@@ -13,6 +14,7 @@
     },
     "maxSections": {
       "default": 6,
+      "descriptionKey": "tasks.summary.fields.maxSections",
       "type": "integer",
       "minimum": 1,
       "maximum": 12,
@@ -20,6 +22,7 @@
     },
     "focus": {
       "default": null,
+      "descriptionKey": "tasks.summary.fields.focus",
       "anyOf": [
         {
           "type": "string",

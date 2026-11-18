@@ -6,18 +6,23 @@
     "examples/embedded/embedded-summary.ts",
     "examples/inventory/install-release.ts",
     "examples/inventory/main.ts",
-    "native/build.ts",
-    "packages/transports/generate-proto.ts",
     "tests/integration/transports/stdio-host.ts",
     "tests/platform/runtime/held-instance.ts"
   ],
-  "ignoreFindings": ["packages/transports/src/grpc/generated/**"],
-  "health": {
-    "ignore": ["packages/transports/src/grpc/generated/**"]
-  },
   "typeAware": {
     "enabled": true
   },
+  "ignorePatterns": ["docs/plans/**"],
+  "publicPackages": [
+    "@themelios/application",
+    "@themelios/content",
+    "@themelios/core",
+    "@themelios/models",
+    "@themelios/pdf",
+    "@themelios/runtime",
+    "@themelios/storage",
+    "@themelios/transports"
+  ],
   "ignoreDependencies": ["@ast-grep/cli"],
   "cache": {
     "dir": "temp/cache/fallow"

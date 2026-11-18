@@ -1,12 +1,15 @@
 import { createHash, timingSafeEqual } from "node:crypto";
-import type { Principal } from "@themelios/application";
+import type { Principal } from "@themelios/runtime/operations";
 import { appError, throwIfAborted, type CallOptions } from "@themelios/core";
-import { transportError } from "./errors.js";
+import {
+  errorLocale,
+  httpStatus,
+  localizedError,
+  transportError,
+} from "./errors.js";
 import type { RemoteTransportOptions, TransportPolicy } from "./types.js";
 
-export const loopbackHosts = ["localhost", "127.0.0.1", "[::1]"] as const;
-
-export async function authenticateRequest(
+async function authenticateRequest(
   headers: Headers,
   options: RemoteTransportOptions,
   policy: Readonly<TransportPolicy>,
@@ -42,7 +45,7 @@ function digest(value: string): Buffer {
   return createHash("sha256").update(value).digest();
 }
 
-export function validateWebOrigin(
+function validateWebOrigin(
   request: Request,
   policy: Readonly<TransportPolicy>,
 ): string | null {
@@ -74,10 +77,7 @@ export function validateWebOrigin(
   return origin;
 }
 
-export function callOptions(
-  headers: Headers,
-  signal: AbortSignal,
-): CallOptions {
+function callOptions(headers: Headers, signal: AbortSignal): CallOptions {
   const value = headers.get("x-themelios-timeout-ms");
   if (value === null) return { signal };
   const timeoutMs = Number(value);
@@ -93,7 +93,7 @@ export function callOptions(
   return { signal, timeoutMs };
 }
 
-type RequestLease = {
+export type RequestLease = {
   readonly signal: AbortSignal;
   readonly done: Promise<void>;
   close(): void;
@@ -136,7 +136,7 @@ export class RequestTracker {
 }
 
 /** A returned response keeps the request lease until its source finishes or is cancelled. */
-export function retainResponse(
+function retainResponse(
   response: Response,
   lease: RequestLease,
   extra?: Headers,
@@ -206,7 +206,7 @@ export function retainResponse(
   });
 }
 
-export function cors(origin: string | null): Headers {
+function cors(origin: string | null): Headers {
   return new Headers(
     origin
       ? {
@@ -220,4 +220,64 @@ export function cors(origin: string | null): Headers {
         }
       : {},
   );
+}
+
+export interface ProtectedHttpContext {
+  readonly principal: Principal;
+  readonly locale: string;
+  readonly maxJsonBytes: number;
+  readonly call: CallOptions;
+  readonly lease: RequestLease;
+}
+
+export async function runProtectedHttp(
+  request: Request,
+  tracker: RequestTracker,
+  options: RemoteTransportOptions<any>,
+  defaultLocale: string | undefined,
+  handle: (ctx: ProtectedHttpContext) => Promise<Response>,
+): Promise<Response> {
+  let lease: RequestLease | undefined;
+  let origin: string | null = null;
+  const locale = errorLocale(
+    request.headers.get("accept-language"),
+    defaultLocale,
+  );
+  try {
+    lease = tracker.take(request.signal);
+    const policy = options.policy();
+    origin = validateWebOrigin(request, policy);
+    if (request.method === "OPTIONS") {
+      return retainResponse(
+        new Response(null, { status: 204 }),
+        lease,
+        cors(origin),
+      );
+    }
+    const principal = await authenticateRequest(
+      request.headers,
+      options,
+      policy,
+      lease.signal,
+    );
+    const response = await handle({
+      principal,
+      locale,
+      maxJsonBytes: policy.maxJsonBytes,
+      call: callOptions(request.headers, lease.signal),
+      lease,
+    });
+    return retainResponse(response, lease, cors(origin));
+  } catch (error) {
+    lease?.close();
+    const info = localizedError(error, locale, options.translate);
+    const headers = cors(origin);
+    if (info.code === "transport.auth_required") {
+      headers.set("www-authenticate", "Bearer");
+    }
+    return Response.json(
+      { error: info },
+      { status: httpStatus(info.code), headers },
+    );
+  }
 }

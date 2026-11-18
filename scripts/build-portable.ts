@@ -11,7 +11,6 @@ import {
 } from "./portable/files.js";
 import {
   buildInStaging,
-  rustNotices,
   stageApplication,
   workbenchMetadata,
   writeNotices,
@@ -20,7 +19,6 @@ import {
 const platforms = {
   win32: {
     name: "windows-x64-msvc",
-    triple: "x86_64-pc-windows-msvc",
     runtime: "bun.exe",
     launcher: "themelios.cmd",
     source: "launch.cmd",
@@ -28,7 +26,6 @@ const platforms = {
   },
   linux: {
     name: "linux-x64-gnu",
-    triple: "x86_64-unknown-linux-gnu",
     runtime: "bun",
     launcher: "themelios",
     source: "launch.sh",
@@ -147,7 +144,7 @@ export async function buildPortable(
   const localArchive = join(staging, `archive${target.extension}`);
   try {
     await buildInStaging(build, all, closure, name);
-    await stageApplication(build, app, all, closure, name, target.name);
+    await stageApplication(build, app, all, closure, name);
     await mkdir(candidate, { recursive: true });
     await materialize(app, join(candidate, "app"));
     await copyLauncher(candidate, target);
@@ -164,7 +161,7 @@ export async function buildPortable(
       join(candidate, entry),
     );
     const manifest = {
-      schemaVersion: 1,
+      format: "themelios.portable",
       ...metadata,
       version,
       target: target.name,
@@ -183,7 +180,6 @@ export async function buildPortable(
       join(candidate, "app", "release.json"),
       `${JSON.stringify(manifest, null, 2)}\n`,
     );
-    await rustNotices(build, candidate, target.triple);
     await writeNotices(candidate, name);
 
     const bundled = join(candidate, "runtime", target.runtime);

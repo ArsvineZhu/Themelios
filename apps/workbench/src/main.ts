@@ -1,7 +1,9 @@
 #!/usr/bin/env bun
+import { mountStandardCli } from "./commands.js";
 import { resolve } from "node:path";
 import { Installation } from "@themelios/runtime";
-import { runCli } from "@themelios/transports";
+import { standardOperations } from "@themelios/application";
+import { runApplicationCli } from "@themelios/transports";
 import { workbenchApplication } from "./definition.js";
 import { maintain } from "./maintenance.js";
 import { localPrincipal, serve } from "./serve.js";
@@ -24,10 +26,17 @@ export async function runWorkbench(options: {
   try {
     const useInstallation = (root: string) =>
       Installation.at(root, workbenchApplication);
-    return await runCli(
+    return await runApplicationCli(
       useInstallation(options.installationRoot),
       options.argv,
       {
+        name: "themelios",
+        operations: standardOperations().map((operation) =>
+          operation.id === "instance.info"
+            ? operation
+            : { ...operation, cli: false },
+        ),
+        configure: mountStandardCli,
         cwd: options.cwd,
         principal: localPrincipal,
         signal: signal.signal,

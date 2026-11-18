@@ -2,41 +2,83 @@ import { randomUUID } from "node:crypto";
 import {
   artifactRefSchema,
   blobRefSchema,
+  formatAgentArtifactRef,
+  generateReadable60,
+  instantSchema,
   jsonSchema,
+  parseAgentArtifactCode,
   selectionSchema,
+  type AgentArtifactRef,
   type ArtifactRef,
+  type BlobRef,
+  type CommitPoint,
+  type Instant,
+  type Json,
   type Selection,
 } from "@themelios/core";
-import { instantSchema } from "@themelios/core/time";
 import type {
   Database,
   ReadTransaction,
   WriteTransaction,
 } from "@themelios/storage";
 import { z } from "zod";
-import type { ArtifactInfo, ArtifactRow, SourceLink } from "./contracts.js";
 import { contentError, jsonValue, validated } from "./validation.js";
+
+export interface Origin {
+  kind: "file" | "url" | "application";
+  locator?: string;
+  capturedAt: Instant;
+  metadata?: Json;
+}
+
+export type Extent =
+  | { kind: "text"; bytes: number }
+  | { kind: "image"; width: number; height: number; frames: number }
+  | { kind: "pages"; pages: number }
+  | { kind: "time"; durationMs: number }
+  | { kind: "unknown" };
+
+export interface ArtifactInfo {
+  ref: ArtifactRef;
+  kind: "material" | "result";
+  mediaType: string;
+  sizeBytes: number;
+  name?: string;
+  extent: Extent;
+  origin?: Origin;
+  createdAt: Instant;
+  createdAtCut: CommitPoint;
+}
+
+export interface ArtifactRow extends ArtifactInfo {
+  blob: BlobRef;
+}
+
+export interface SourceLink {
+  relation: "input" | "file" | "representation-source";
+  selection: Selection;
+}
 
 const size = z.int().nonnegative();
 export const mediaTypeSchema = z
   .string()
   .regex(/^[\w!#$&^.+-]+\/[\w!#$&^.+-]+$/)
   .transform((mime) => mime.toLowerCase());
-export const originSchema = z
+export const originSchema: z.ZodType<Origin> = z
   .strictObject({
     kind: z.enum(["file", "url", "application"]),
     locator: z.string().min(1).optional(),
     capturedAt: instantSchema,
     metadata: jsonSchema.optional(),
   })
-  .transform(({ kind, capturedAt, locator, metadata }) => ({
+  .transform(({ kind, capturedAt, locator, metadata }): Origin => ({
     kind,
     capturedAt,
     ...(locator === undefined ? {} : { locator }),
     ...(metadata === undefined ? {} : { metadata }),
   }));
 
-const extentSchema = z.discriminatedUnion("kind", [
+export const extentSchema: z.ZodType<Extent> = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("text"), bytes: size }),
   z.strictObject({
     kind: z.literal("image"),
@@ -54,6 +96,7 @@ const extentSchema = z.discriminatedUnion("kind", [
 
 interface StoredArtifact {
   ref: string;
+  agent_code: string;
   kind: ArtifactInfo["kind"];
   media_type: string;
   blob_ref: string;
@@ -113,8 +156,49 @@ export function storedArtifact(
   return storedInfo(row);
 }
 
+export function resolveArtifactRef(
+  sql: Query,
+  refOrAgentRef: string,
+): ArtifactRef {
+  if (artifactRefSchema.safeParse(refOrAgentRef).success) {
+    return storedArtifact(sql, refOrAgentRef as ArtifactRef).ref;
+  }
+  const code = parseAgentArtifactCode(refOrAgentRef);
+  if (!code) {
+    throw contentError("content.schema_invalid", {
+      issues: [{ path: "/ref", constraint: "Expected an artifact reference" }],
+    });
+  }
+  const row = sql
+    .query<{ ref: string }, [string]>(
+      "SELECT ref FROM artifacts WHERE agent_code = ?",
+    )
+    .get(code);
+  if (!row) throw contentError("content.not_found", { ref: refOrAgentRef });
+  return validated(artifactRefSchema, row.ref);
+}
+
+export function agentRefFor(sql: Query, ref: ArtifactRef): AgentArtifactRef {
+  validated(artifactRefSchema, ref);
+  const row = sql
+    .query<{ agent_code: string }, [ArtifactRef]>(
+      "SELECT agent_code FROM artifacts WHERE ref = ?",
+    )
+    .get(ref);
+  if (!row) throw contentError("content.not_found", { ref });
+  return formatAgentArtifactRef(row.agent_code);
+}
+
 export function decodeSelection(value: string, ref: ArtifactRef): Selection {
   return validated(selectionSchema, jsonValue(value, ref));
+}
+
+function isAgentCodeUniqueError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    error.message.includes("UNIQUE constraint failed") &&
+    error.message.includes("agent_code")
+  );
 }
 
 export function addArtifact(
@@ -124,23 +208,33 @@ export function addArtifact(
   const origin =
     artifact.origin === undefined ? null : JSON.stringify(artifact.origin);
   const extent = JSON.stringify(artifact.extent);
-  const changes = tx.sql.run(
-    `
-    INSERT INTO artifacts (ref, kind, media_type, blob_ref, size_bytes, name, extent_json, origin_json, created_seq, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(ref) DO NOTHING
-  `,
-    artifact.ref,
-    artifact.kind,
-    artifact.mediaType,
-    artifact.blob,
-    artifact.sizeBytes,
-    artifact.name ?? null,
-    extent,
-    origin,
-    tx.seq,
-    tx.recordedAt,
-  ).changes;
-  if (changes > 0) return true;
+  for (let attempt = 0; ; attempt += 1) {
+    const agentCode = generateReadable60();
+    try {
+      const changes = tx.sql.run(
+        `
+        INSERT INTO artifacts (ref, agent_code, kind, media_type, blob_ref, size_bytes, name, extent_json, origin_json, created_seq, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(ref) DO NOTHING
+      `,
+        artifact.ref,
+        agentCode,
+        artifact.kind,
+        artifact.mediaType,
+        artifact.blob,
+        artifact.sizeBytes,
+        artifact.name ?? null,
+        extent,
+        origin,
+        tx.seq,
+        tx.recordedAt,
+      ).changes;
+      if (changes > 0) return true;
+      break;
+    } catch (error) {
+      if (attempt < 7 && isAgentCodeUniqueError(error)) continue;
+      throw error;
+    }
+  }
   const row = tx.sql
     .query<StoredArtifact>("SELECT * FROM artifacts WHERE ref = ?")
     .get(artifact.ref)!;

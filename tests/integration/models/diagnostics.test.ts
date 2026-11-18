@@ -74,7 +74,7 @@ test("model diagnostics follow real attempts and keep secrets and media bytes ou
   );
   const instance = Installation.at(root, {
     id: "test.model-diagnostics",
-    formatId: "test.model-diagnostics/1",
+    formatId: "test.model-diagnostics",
     settings: runtimeSettings,
     async provision() {},
     async open(env: OpenEnvironment<RuntimeSettings>) {
@@ -142,7 +142,7 @@ test("model diagnostics follow real attempts and keep secrets and media bytes ou
     try {
       expect((await session.api(false)).value).toBe("done");
       expect(existsSync(attachmentRoot)).toBe(false);
-      await session.configuration.set("telemetry.captureModelContent", true);
+      await session.configuration.set("logging.captureModelContent", true);
       expect((await session.api(true)).usage).toMatchObject({
         inputTokens: 12,
         outputTokens: 3,

@@ -1,0 +1,12 @@
+{
+  "tasks": {
+    "mediaDescription": {
+      "title": "Material description",
+      "purpose": "Describe the material actually supplied as readable text for later reading, retrieval or structured tasks.",
+      "fields": {
+        "language": "Output language: zh-CN or en, default zh-CN.",
+        "instructions": "Focus for this description, at most 4000 characters; null or omitted requests a complete material description."
+      }
+    }
+  }
+}

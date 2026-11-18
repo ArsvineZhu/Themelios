@@ -8,10 +8,30 @@ import {
   mediaTypeSchema,
   originSchema,
   type ArtifactDraft,
+  type Origin,
 } from "./artifacts.js";
-import type { AcceptInput, Origin } from "./contracts.js";
 import { detectMetadata } from "./media-metadata.js";
 import { contentError, validated } from "./validation.js";
+
+export type AcceptInput =
+  | {
+      bytes: Uint8Array;
+      mediaType: string;
+      name?: string;
+      origin?: Origin;
+    }
+  | {
+      file: string;
+      mediaType?: string;
+      name?: string;
+      origin?: Origin;
+    }
+  | {
+      body: ReadableStream<Uint8Array>;
+      mediaType: string;
+      name?: string;
+      origin?: Origin;
+    };
 
 const importFields = {
   mediaType: mediaTypeSchema,

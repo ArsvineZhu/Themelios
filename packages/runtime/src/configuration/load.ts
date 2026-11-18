@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import type { Json } from "@themelios/core";
 import { errno, failure } from "../failure.js";
-import type { SettingContribution } from "../settings-contract.js";
+import type { SettingContribution } from "../settings.js";
 import { invalid, type SettingFields } from "./definition.js";
 import {
   assertValues,

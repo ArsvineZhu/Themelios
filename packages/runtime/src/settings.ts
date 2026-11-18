@@ -1,21 +1,71 @@
 import { z } from "zod";
+import type { Json } from "@themelios/core";
 import { failure } from "./failure.js";
 import { credentialSchema } from "./secrets.js";
-import type { SettingMeta, SettingsDefinition } from "./settings-contract.js";
 
-export type {
-  Configuration,
-  ConfigurationChange,
-  SettingContribution,
-  SettingDescription,
-  SettingEffect,
-  SettingExplanation,
-  SettingIssue,
-  SettingMeta,
-  SettingPath,
-  SettingScope,
-  SettingsDefinition,
-} from "./settings-contract.js";
+export type SettingScope = "installation" | "instance" | "task" | "call";
+export type SettingEffect = "next-call" | "reload" | "restart";
+export type SettingPath = string;
+
+export interface SettingMeta {
+  titleKey: string;
+  descriptionKey: string;
+  impactKey: string;
+  scopes: readonly SettingScope[];
+  effect: SettingEffect;
+  unit?: string;
+  format?: "path" | "credential";
+  sensitive?: boolean;
+  examples?: readonly Json[];
+  dependsOn?: readonly SettingPath[];
+}
+
+export interface SettingIssue {
+  path: SettingPath;
+  messageKey: string;
+  params?: Readonly<Record<string, string | number | boolean>>;
+}
+
+export interface SettingsDefinition<S> {
+  schema: z.ZodType<S>;
+  fields: Readonly<Record<SettingPath, SettingMeta>>;
+  validateEffective?(value: Readonly<S>): readonly SettingIssue[];
+}
+
+export interface SettingDescription {
+  path: SettingPath;
+  schema: Json;
+  metadata: SettingMeta;
+}
+
+export interface SettingContribution {
+  layer: "default" | "installation" | "instance" | "managed" | "task" | "call";
+  value: Json;
+  file?: string;
+}
+
+export interface SettingExplanation {
+  field: SettingDescription;
+  contributions: readonly SettingContribution[];
+  desired?: Json;
+  effective?: Json;
+  state: "active" | "restart-required";
+}
+
+export interface ConfigurationChange {
+  changed: readonly SettingPath[];
+  applied: readonly SettingPath[];
+  restartRequired: readonly SettingPath[];
+}
+
+export interface Configuration<S> {
+  snapshot(): Readonly<S>;
+  describe(path?: SettingPath): readonly SettingDescription[];
+  explain(path: SettingPath): SettingExplanation;
+  set(path: SettingPath, value: Json): Promise<ConfigurationChange>;
+  unset(path: SettingPath): Promise<ConfigurationChange>;
+  reload(): Promise<ConfigurationChange>;
+}
 
 export const httpUrlSchema = z.url({ protocol: /^https?$/ }).refine(
   (value) => {
@@ -39,12 +89,6 @@ const schema = z.strictObject({
       file: z.boolean().default(true),
       rotateBytes: z.int().min(65536).max(1073741824).default(10485760),
       maxFiles: z.int().min(1).max(100).default(5),
-    })
-    .prefault({}),
-  telemetry: z
-    .strictObject({
-      endpoint: httpUrlSchema.optional(),
-      credential: credentialSchema.optional(),
       captureModelContent: z.boolean().default(false),
     })
     .prefault({}),
@@ -94,13 +138,8 @@ export const runtimeSettings: SettingsDefinition<RuntimeSettings> = {
       unit: "bytes",
     }),
     "/logging/maxFiles": field("logging/maxFiles", "reload"),
-    "/telemetry/endpoint": field("telemetry/endpoint", "reload"),
-    "/telemetry/credential": field("telemetry/credential", "reload", {
-      format: "credential",
-      dependsOn: ["/telemetry/endpoint"],
-    }),
-    "/telemetry/captureModelContent": field(
-      "telemetry/captureModelContent",
+    "/logging/captureModelContent": field(
+      "logging/captureModelContent",
       "next-call",
     ),
     "/network/timeoutMs": field("network/timeoutMs", "next-call", {
@@ -115,22 +154,25 @@ export const runtimeSettings: SettingsDefinition<RuntimeSettings> = {
     "/network/caFile": field("network/caFile", "reload", { format: "path" }),
   },
   validateEffective(settings) {
-    const issues = [];
+    const issues: SettingIssue[] = [];
     if (!settings.network.proxy && settings.network.proxyAuthorization) {
       issues.push({
         path: "/network/proxyAuthorization",
         messageKey: "config.requires_proxy",
       });
     }
-    if (!settings.telemetry.endpoint && settings.telemetry.credential) {
-      issues.push({
-        path: "/telemetry/credential",
-        messageKey: "config.requires_telemetry_endpoint",
-      });
-    }
     return issues;
   },
 };
+
+export function extractRuntimeSettings<S>(value: Readonly<S>): RuntimeSettings {
+  const record = value as Record<string, unknown>;
+  const picked: Record<string, unknown> = {};
+  for (const key of ["locale", "runtime", "logging", "network"]) {
+    if (Object.hasOwn(record, key)) picked[key] = record[key];
+  }
+  return runtimeSettings.schema.parse(picked);
+}
 
 export function combineSettings<A, B>(
   a: SettingsDefinition<A>,

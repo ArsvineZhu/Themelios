@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
 import { mkdtemp, mkdir, readdir } from "node:fs/promises";
 import { join } from "node:path";
+import { UTC_TIME_DOMAIN } from "@themelios/core";
 import { Cas, Database } from "@themelios/storage";
-import { createTimeDomains, timeSchemaSql } from "@themelios/storage/time";
 
 test("a rollback keeps the previous cut and invalidates escaped SQL handles", async () => {
   const workspace = join("temp", "work");
@@ -11,7 +11,7 @@ test("a rollback keeps the previous cut and invalidates escaped SQL handles", as
   const path = join(directory, "main.sqlite");
   const database = Database.init({
     path,
-    formatId: "test.storage/1",
+    formatId: "test.storage",
     schemaSql: "CREATE TABLE ledger (id INTEGER PRIMARY KEY)",
   });
   try {
@@ -57,7 +57,7 @@ test("a rollback keeps the previous cut and invalidates escaped SQL handles", as
 
   const reopened = Database.open({
     path,
-    formatId: "test.storage/1",
+    formatId: "test.storage",
     readonly: true,
   });
   try {
@@ -73,67 +73,70 @@ test("a rollback keeps the previous cut and invalidates escaped SQL handles", as
   }
 });
 
-test("mapping replacement retains historical interpretation and inverse intervals", async () => {
+test("time domains register idempotently, persist across reopens, and reject conflicts", async () => {
   const workspace = join("temp", "work");
   await mkdir(workspace, { recursive: true });
   const directory = await mkdtemp(join(workspace, "time-domains-"));
+  const path = join(directory, "main.sqlite");
   const database = Database.init({
-    path: join(directory, "main.sqlite"),
-    formatId: "test.time/1",
-    schemaSql: timeSchemaSql,
+    path,
+    formatId: "test.time",
+    schemaSql: "",
   });
   try {
-    const time = createTimeDomains(database);
-    const domain = "world.school";
-    const utc = (ms: number) =>
-      new Date(Date.parse("2026-01-01T00:00:00.000Z") + ms).toISOString();
-    time.define({ id: domain, label: "School", ticksPerSecond: 1000 });
-    time.setMapping({
-      domain,
-      from: utc(-1000),
-      originUtc: utc(0),
-      originTicks: "0",
-      rate: { numerator: "4", denominator: "2" },
-    });
-    const original = database.cut();
-    expect(time.toDomain(domain, utc(-1))).toEqual({ domain, ticks: "-2" });
-    expect(time.toDomain(domain, utc(1000))).toEqual({ domain, ticks: "2000" });
-    expect(time.toUtc({ domain, ticks: "1" })).toEqual([]);
+    expect(database.listTimeDomains()).toEqual([UTC_TIME_DOMAIN]);
+    expect(database.getTimeDomain("utc")).toEqual(UTC_TIME_DOMAIN);
 
-    const paused = time.setMapping({
-      domain,
-      from: utc(200),
-      until: utc(400),
-      originUtc: utc(200),
-      originTicks: "400",
-      rate: { numerator: "0", denominator: "3" },
+    const story = database.defineTimeDomain({
+      id: "story.timeline",
+      kind: "linear",
+      label: "Story Timeline",
+      tickSeconds: { numerator: "1", denominator: "1000" },
     });
-    expect(time.toDomain(domain, utc(300), { at: original }).ticks).toBe("600");
-    expect(time.toDomain(domain, utc(300)).ticks).toBe("400");
-    expect(time.toDomain(domain, utc(400)).ticks).toBe("800");
-    expect(time.toUtc({ domain, ticks: "400" })).toEqual([
-      { start: utc(200), end: utc(400) },
-    ]);
-    expect(time.mappings(domain, { at: original })).toHaveLength(1);
-
-    time.removeMapping(paused.ref);
-    expect(() => time.toDomain(domain, utc(300))).toThrow(
-      expect.objectContaining({ code: "time.unmapped" }),
-    );
-    time.setMapping({
-      domain,
-      from: utc(200),
-      until: utc(400),
-      originUtc: utc(300),
-      originTicks: "0",
-      rate: { numerator: "1", denominator: "3" },
+    expect(database.defineTimeDomain(story)).toEqual(story);
+    const opaque = database.defineTimeDomain({
+      id: "dream.ordinal",
+      kind: "opaque",
+      label: "Dream Order",
     });
-    expect(time.toDomain(domain, utc(299)).ticks).toBe("-1");
-    expect(time.toUtc({ domain, ticks: "-1" })).toEqual([
-      { start: utc(297), end: utc(300) },
+    expect(database.listTimeDomains()).toEqual([
+      UTC_TIME_DOMAIN,
+      opaque,
+      story,
     ]);
+    expect(() =>
+      database.defineTimeDomain({
+        id: "story.timeline",
+        kind: "linear",
+        label: "Changed Label",
+      }),
+    ).toThrow(expect.objectContaining({ code: "time.domain_conflict" }));
+    expect(() =>
+      database.defineTimeDomain({ id: "utc", kind: "utc", label: "Custom" }),
+    ).toThrow(expect.objectContaining({ code: "time.domain_conflict" }));
   } finally {
     database.close();
+  }
+
+  const reopened = Database.open({
+    path,
+    formatId: "test.time",
+    readonly: true,
+  });
+  try {
+    expect(reopened.getTimeDomain("story.timeline")).toEqual({
+      id: "story.timeline",
+      kind: "linear",
+      label: "Story Timeline",
+      tickSeconds: { numerator: "1", denominator: "1000" },
+    });
+    expect(reopened.getTimeDomain("dream.ordinal")).toEqual({
+      id: "dream.ordinal",
+      kind: "opaque",
+      label: "Dream Order",
+    });
+  } finally {
+    reopened.close();
   }
 });
 

@@ -1,7 +1,10 @@
 import { fileURLToPath } from "node:url";
-import { createApplicationModule, describeTask } from "@themelios/application";
-import { createImageAdapter } from "@themelios/application/inputs";
-import { mediaDescription } from "@themelios/application/tasks";
+import {
+  createApplicationModule,
+  describeTask,
+  mediaDescription,
+} from "@themelios/application";
+import { createImageAdapter } from "@themelios/content";
 import { locales as contentLocales } from "@themelios/content/locales";
 import { createPrompts } from "@themelios/models/prompts";
 import { createPdfAdapters } from "@themelios/pdf";
@@ -47,7 +50,7 @@ export const releaseRecipes = [createImageAdapter(), ...adapters].map(
 
 export const workbenchApplication = createApplicationModule({
   id: "themelios.workbench",
-  formatId: "themelios.workbench/1",
+  formatId: "themelios.workbench",
   resourceRoot: taskResources,
   tasks,
   adapters,

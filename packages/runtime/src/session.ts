@@ -1,13 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { AppError, throwIfAborted, toAppError } from "@themelios/core";
-import type {
-  ApplicationModule,
-  Closable,
-  InstanceInfo,
-  OpenEnvironment,
-  OpenOptions,
-  Session,
-} from "./contracts.js";
+import {
+  AppError,
+  systemClock,
+  throwIfAborted,
+  toAppError,
+  type Clock,
+  type Json,
+  type MessageParams,
+} from "@themelios/core";
 import { ActiveConfiguration } from "./configuration/configuration.js";
 import { SettingFields } from "./configuration/definition.js";
 import {
@@ -18,36 +18,72 @@ import {
 import {
   bootstrapDiagnostics,
   createRuntimeDiagnostics,
+  type Diagnostics,
   type RuntimeDiagnostics,
 } from "./diagnostics.js";
-import { SessionExecution } from "./execution.js";
+import {
+  SessionExecution,
+  type Closable,
+  type Execution,
+  type ResourceContext,
+  type ResourceSlot,
+} from "./execution.js";
 import { failure } from "./failure.js";
-import { createLocalizer } from "./locales.js";
+import { createLocalizer, type Dictionaries } from "./locales.js";
 import { openInstanceLock, type Endpoints, type OwnedLock } from "./lock.js";
-import { createSessionNetwork } from "./network.js";
+import { createSessionNetwork, type Network } from "./network.js";
+import type { InstanceInfo, InstancePaths } from "./paths.js";
 import { SessionResources } from "./resources.js";
-import { createSecrets } from "./secrets.js";
-import { runtimeSettings } from "./settings.js";
+import { createSecrets, type Secrets } from "./secrets.js";
+import type { Configuration, SettingsDefinition } from "./settings.js";
 
-const endpointUpdates = new WeakMap<
-  object,
-  (value: Endpoints) => Promise<void>
->();
-
-export function updateSessionEndpoints<Api, S>(
-  session: Session<Api, S>,
-  endpoints: Endpoints,
-): Promise<void> {
-  const update = endpointUpdates.get(session);
-  return update
-    ? update(endpoints)
-    : Promise.reject(failure("runtime.closed", { state: "closed" }));
+export interface ProvisionEnvironment<S> {
+  readonly paths: InstancePaths;
+  readonly instance: Omit<InstanceInfo, "paths">;
+  readonly settings: Readonly<S>;
+  readonly clock: Clock;
+  readonly diagnostics: Diagnostics;
 }
 
-export const clock = {
-  now: () => new Date().toISOString(),
-  monotonicMs: () => performance.now(),
-};
+export interface OpenEnvironment<S> extends ProvisionEnvironment<S> {
+  readonly mode: "read-write" | "read-only";
+  readonly configuration: Configuration<S>;
+  readonly execution: Execution;
+  readonly network: Network;
+  readonly secrets: Secrets;
+  localize(key: string, params?: MessageParams, locale?: string): string;
+  own<T extends Closable>(resource: T): T;
+  bindResource<T extends Closable>(
+    select: (settings: Readonly<S>) => Json,
+    create: (context: ResourceContext<S>) => Promise<T>,
+  ): Promise<ResourceSlot<T>>;
+}
+
+export interface ApplicationModule<Api, S> {
+  readonly id: string;
+  readonly formatId: string;
+  readonly settings: SettingsDefinition<S>;
+  /** Maps locale -> full messageKey -> i18next template. */
+  readonly locales?: Dictionaries;
+  provision(env: ProvisionEnvironment<S>): Promise<void>;
+  open(env: OpenEnvironment<S>): Promise<Api>;
+}
+
+export interface OpenOptions {
+  mode?: "read-write" | "read-only";
+  signal?: AbortSignal;
+}
+
+export interface Session<Api, S> {
+  readonly api: Api;
+  readonly instance: InstanceInfo;
+  readonly configuration: Configuration<S>;
+  localize(key: string, params?: MessageParams, locale?: string): string;
+  setEndpoints(endpoints: Endpoints): Promise<void>;
+  close(options?: { graceMs?: number }): Promise<void>;
+}
+
+export const clock = systemClock;
 
 export async function openSession<Api, S>(
   application: ApplicationModule<Api, S>,
@@ -103,40 +139,41 @@ export async function openSession<Api, S>(
     const files = filesFor(instance);
     const initial = loadCandidate(fields, files, await readLayers(files));
     throwIfAborted(options.signal);
-    // Small custom apps may use only their own settings; the runtime's own defaults still apply.
-    const getRuntime = (value: Readonly<S>) =>
-      runtimeSettings.schema.parse(
-        Object.fromEntries(
-          Object.entries(value as Record<string, unknown>).filter(([key]) =>
-            ["locale", "runtime", "logging", "telemetry", "network"].includes(
-              key,
-            ),
-          ),
-        ),
-      );
     stage = "runtime.resources";
     const localize = await createLocalizer(application.locales);
     const secrets = createSecrets({ baseDir: paths.root });
-    const ownedResources = new SessionResources<S>(
+    let capturedExecution!: SessionExecution<S>;
+    const ownedResources: SessionResources<S> = new SessionResources<S>(
       secrets,
-      getRuntime,
       (settings) =>
         createRuntimeDiagnostics({
           settings,
-          secrets,
           logs: paths.logs,
           correlationId,
           level: () => {
-            const captured =
-              execution?.current()?.resources.settings ??
-              configuration?.snapshot();
-            return captured ? getRuntime(captured).logging.level : undefined;
+            try {
+              return (
+                capturedExecution.current()?.resources.runtime.logging.level ??
+                ownedResources.active.runtime.logging.level
+              );
+            } catch {
+              return undefined;
+            }
           },
           capture: () => {
-            const captured = execution?.current()?.resources.settings;
-            return captured
-              ? getRuntime(captured).telemetry.captureModelContent
-              : undefined;
+            try {
+              return (
+                capturedExecution.current()?.resources.runtime.logging
+                  .captureModelContent ??
+                ownedResources.active.runtime.logging.captureModelContent
+              );
+            } catch {
+              return undefined;
+            }
+          },
+          traceScope: {
+            current: () => capturedExecution.currentTrace(),
+            enter: (frame, work) => capturedExecution.enterTrace(frame, work),
           },
         }),
       (settings, candidateDiagnostics) =>
@@ -156,22 +193,23 @@ export async function openSession<Api, S>(
             diagnostics: candidateDiagnostics,
           },
           () => {
-            const capture = execution?.current();
-            const snapshot =
-              capture?.resources.settings ?? configuration?.snapshot();
-            return snapshot
-              ? {
-                  call: capture?.call,
-                  diagnostics: capture?.resources.diagnostics ?? diagnostics,
-                  timeoutMs: getRuntime(snapshot).network.timeoutMs,
-                }
-              : undefined;
+            const capture = capturedExecution.current();
+            try {
+              const active = capture?.resources ?? ownedResources.active;
+              return {
+                call: capture?.call,
+                diagnostics: active.diagnostics,
+                timeoutMs: active.runtime.network.timeoutMs,
+              };
+            } catch {
+              return undefined;
+            }
           },
         ),
       closeFailure,
     );
     resources = ownedResources;
-    const capturedExecution = new SessionExecution(() => ownedResources.active);
+    capturedExecution = new SessionExecution(() => ownedResources.active);
     execution = capturedExecution;
     const current = () => capturedExecution.current()?.resources;
     (await ownedResources.prepare(initial.value)).activate();
@@ -213,6 +251,13 @@ export async function openSession<Api, S>(
       get network() {
         return (current() ?? ownedResources.active).network;
       },
+      localize(key, params, locale) {
+        return localize(
+          locale ?? (current() ?? ownedResources.active).runtime.locale,
+          key,
+          params,
+        );
+      },
       own<T extends Closable>(resource: T) {
         owners.add(resource);
         return resource;
@@ -223,20 +268,26 @@ export async function openSession<Api, S>(
     const api = await application.open(env);
     throwIfAborted(options.signal);
     stage = "ready";
-    diagnostics.log("info", "runtime.session_opened", {
+    diagnostics!.log("info", "runtime.session_opened", {
       instanceId: identity.id,
       mode,
-      locale: getRuntime(initial.value).locale,
+      locale: ownedResources.active.runtime.locale,
     });
     const session: Session<Api, S> = {
       api,
       instance,
       configuration: settings,
+      localize: env.localize,
+      setEndpoints(endpoints) {
+        if (closing || !lock)
+          return Promise.reject(failure("runtime.closed", { state: "closed" }));
+        return lock.endpoints(endpoints);
+      },
       close(options) {
         if (closing) return closing;
         const graceMs =
           options?.graceMs ??
-          getRuntime(settings.snapshot()).runtime.shutdownGraceMs;
+          ownedResources.active.runtime.runtime.shutdownGraceMs;
         if (!Number.isSafeInteger(graceMs) || graceMs < 0 || graceMs > 300000) {
           return Promise.reject(
             failure("input.invalid", {
@@ -245,7 +296,6 @@ export async function openSession<Api, S>(
           );
         }
         capturedExecution.stop();
-        endpointUpdates.delete(session);
         const updates = settings.stop();
         closing = (async () => {
           await capturedExecution.drain(graceMs);
@@ -261,11 +311,6 @@ export async function openSession<Api, S>(
         return closing;
       },
     };
-    endpointUpdates.set(session, (endpoints) => lock!.endpoints(endpoints));
-    sessionPresentation.set(session, {
-      format: (key, params, locale) =>
-        localize(locale ?? getRuntime(settings.snapshot()).locale, key, params),
-    });
     return session;
   } catch (error) {
     execution?.stop();
@@ -285,22 +330,4 @@ export async function openSession<Api, S>(
     await closeLock();
     throw mapped;
   }
-}
-
-type Presentation = {
-  format: (
-    key: string,
-    params?: Readonly<Record<string, string | number | boolean>>,
-    locale?: string,
-  ) => string;
-};
-const sessionPresentation = new WeakMap<object, Presentation>();
-
-export function sessionMessage<Api, S>(
-  session: Session<Api, S>,
-  key: string,
-  params?: Readonly<Record<string, string | number | boolean>>,
-  locale?: string,
-): string {
-  return sessionPresentation.get(session)?.format(key, params, locale) ?? key;
 }

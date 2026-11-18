@@ -11,22 +11,36 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
-import { AppError, throwIfAborted } from "@themelios/core";
-import { instantSchema } from "@themelios/core/time";
+import { AppError, instantSchema, throwIfAborted } from "@themelios/core";
 import { z } from "zod";
-import type {
-  ApplicationModule,
-  InstallationOptions,
-  Instance,
-  InstanceInfo,
-} from "./contracts.js";
 import { SettingFields } from "./configuration/definition.js";
 import { loadCandidate, readLayers } from "./configuration/load.js";
 import { bootstrapDiagnostics } from "./diagnostics.js";
 import { errno, failure } from "./failure.js";
 import { openInstanceLock } from "./lock.js";
-import { configurationFiles, instancePaths } from "./paths.js";
-import { clock, openSession } from "./session.js";
+import {
+  configurationFiles,
+  instancePaths,
+  type InstanceInfo,
+} from "./paths.js";
+import {
+  clock,
+  openSession,
+  type ApplicationModule,
+  type OpenOptions,
+  type Session,
+} from "./session.js";
+
+export interface InstallationOptions {
+  configRoot?: string;
+  dataRoot?: string;
+}
+
+export interface Instance<Api, S> {
+  init(): Promise<InstanceInfo>;
+  locate(): Promise<InstanceInfo>;
+  open(options?: OpenOptions): Promise<Session<Api, S>>;
+}
 
 const namePattern = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
 const manifestSchema = z.strictObject({
@@ -37,7 +51,6 @@ const manifestSchema = z.strictObject({
   createdAt: instantSchema,
 });
 type Manifest = z.infer<typeof manifestSchema>;
-const locations = new WeakMap<object, () => Promise<InstanceInfo>>();
 
 export class Installation<Api, S> {
   private constructor(
@@ -46,7 +59,6 @@ export class Installation<Api, S> {
     private readonly dataRoot: string,
   ) {}
 
-  // fallow-ignore-next-line unused-class-member -- Workbench and independent consumers open installations through this export.
   static at<Api, S>(
     root: string,
     application: ApplicationModule<Api, S>,
@@ -60,14 +72,12 @@ export class Installation<Api, S> {
     );
   }
 
-  // fallow-ignore-next-line unused-class-member -- Workbench and external SDK consumers select named instances here.
   instance(name: string): Instance<Api, S> {
     if (!namePattern.test(name))
       throw failure("runtime.instance_name_invalid", { name });
     return this.#at(join(this.dataRoot, name), name);
   }
 
-  // fallow-ignore-next-line unused-class-member -- Public SDK entry for callers using an external instance path.
   external(root: string): Instance<Api, S> {
     const absolute = resolve(root);
     return this.#at(absolute, basename(absolute));
@@ -94,13 +104,12 @@ export class Installation<Api, S> {
       }
       return { ...manifest, paths };
     };
-    const instance: Instance<Api, S> = {
+    return {
       init: () => initialize(application, this.configRoot, root, name),
+      locate,
       open: (options = {}) =>
         openSession(application, locate, filesFor, options),
     };
-    locations.set(instance, locate);
-    return instance;
   }
 }
 
@@ -110,9 +119,7 @@ export async function withOfflineInstance<Api, S, T>(
   options: { signal?: AbortSignal } = {},
 ): Promise<T> {
   throwIfAborted(options.signal);
-  const locate = locations.get(instance);
-  if (!locate) throw failure("runtime.instance_not_found");
-  const info = await locate();
+  const info = await instance.locate();
   const lock = await openInstanceLock(info.paths, info.id, options.signal);
   try {
     return await work(info);
@@ -220,7 +227,6 @@ async function initialize<Api, S>(
       clock,
       diagnostics,
     });
-    // The private manifest becomes visible atomically with the whole instance directory.
     await writeFile(
       join(staging, "instance.json"),
       JSON.stringify(instance, null, 2) + "\n",
@@ -260,7 +266,6 @@ async function publishInstance(staging: string, target: string): Promise<void> {
       await rename(staging, target);
       return;
     } catch (error) {
-      // Recheck ownership before a retry. A concurrent publisher must win.
       const state = await targetState(target);
       if (
         state !== "missing" ||
@@ -268,7 +273,6 @@ async function publishInstance(staging: string, target: string): Promise<void> {
         errno(error) !== "EPERM"
       )
         throw error;
-      // Windows can deny a move while another process briefly holds a file without delete sharing.
       firstSharingError ??= error;
     }
   }

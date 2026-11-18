@@ -1,11 +1,11 @@
+import { Database as SQLite } from "bun:sqlite";
 import { readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import writeAtomic from "write-file-atomic";
 import { throwIfAborted, type Json } from "@themelios/core";
 import { z } from "zod";
-import type { InstancePaths } from "./contracts.js";
 import { failure } from "./failure.js";
-import { acquireLock } from "./native.js";
+import type { InstancePaths } from "./paths.js";
 
 export type Endpoints = Readonly<Record<string, string>>;
 const ownerSchema = z.object({
@@ -19,6 +19,36 @@ export interface OwnedLock {
   close(): Promise<void>;
 }
 
+function isBusyError(error: unknown): boolean {
+  const code =
+    typeof error === "object" && error !== null && "code" in error
+      ? String(error.code)
+      : "";
+  return (
+    code === "SQLITE_BUSY" ||
+    /SQLITE_BUSY|database is locked/i.test(String(error))
+  );
+}
+
+function acquireSqliteExclusive(path: string): SQLite | undefined {
+  let db: SQLite | undefined;
+  try {
+    db = new SQLite(path, { create: true });
+    db.exec(
+      "PRAGMA journal_mode = DELETE; PRAGMA locking_mode = EXCLUSIVE; PRAGMA busy_timeout = 0; BEGIN EXCLUSIVE; CREATE TABLE IF NOT EXISTS lock_holder (id INTEGER PRIMARY KEY); REPLACE INTO lock_holder (id) VALUES (1);",
+    );
+    return db;
+  } catch (error) {
+    try {
+      db?.close(true);
+    } catch {
+      /* Ignore cleanup errors after lock rejection. */
+    }
+    if (isBusyError(error)) return undefined;
+    throw failure("runtime.lock_failed", { path }, error);
+  }
+}
+
 export async function openInstanceLock(
   paths: InstancePaths,
   instanceId?: string,
@@ -27,7 +57,7 @@ export async function openInstanceLock(
   throwIfAborted(signal);
   const path = join(paths.run, "instance.lock");
   const ownerPath = join(paths.run, "owner.json");
-  const handle = acquireLock(path);
+  const handle = acquireSqliteExclusive(path);
   if (!handle) {
     let owner: z.infer<typeof ownerSchema> | undefined;
     try {
@@ -61,6 +91,15 @@ export async function openInstanceLock(
       throw failure("runtime.owner_failed", { path: ownerPath }, error);
     }
   };
+  const releaseHandle = () => {
+    try {
+      handle.exec("ROLLBACK; PRAGMA locking_mode = NORMAL;");
+    } catch {
+      /* Connection may already be outside a transaction on early abort. */
+    } finally {
+      handle.close(true);
+    }
+  };
   try {
     throwIfAborted(signal);
     await writeOwner();
@@ -69,7 +108,7 @@ export async function openInstanceLock(
     try {
       await rm(ownerPath, { force: true });
     } finally {
-      handle.close();
+      releaseHandle();
     }
     throw error;
   }
@@ -86,7 +125,7 @@ export async function openInstanceLock(
         try {
           await rm(ownerPath, { force: true });
         } finally {
-          handle.close();
+          releaseHandle();
         }
       });
       return closing;

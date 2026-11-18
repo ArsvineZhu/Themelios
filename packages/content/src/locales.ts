@@ -7,8 +7,6 @@ export const locales = {
     "content.text_unavailable": "This material has no directly readable text.",
     "content.range_invalid":
       "The selection is outside the material or uses an invalid boundary.",
-    "content.mapping_invalid":
-      "The output and source intervals do not contain the same bytes.",
     "content.result_cycle": "The results depend on each other in a cycle.",
     "content.result_corrupt":
       "The stored result and its source records disagree.",
@@ -25,7 +23,6 @@ export const locales = {
     "content.not_found": "未找到材料或成果。",
     "content.text_unavailable": "此材料没有可直接读取的文本。",
     "content.range_invalid": "选区超出材料范围或边界无效。",
-    "content.mapping_invalid": "输出区间与来源区间的实际字节不同。",
     "content.result_cycle": "成果之间存在循环依赖。",
     "content.result_corrupt": "已保存成果与其来源记录不一致。",
     "content.schema_invalid": "内容不符合要求的结构。",

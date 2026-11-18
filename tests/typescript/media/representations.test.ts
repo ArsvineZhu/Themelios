@@ -1,7 +1,17 @@
 import { expect, test } from "bun:test";
-import type { MediaInput } from "@themelios/application/inputs";
-import { createImageAdapter } from "@themelios/application/inputs";
+import { mkdtemp, mkdir } from "node:fs/promises";
+import { join } from "node:path";
+import { createContent, createImageAdapter } from "@themelios/content";
+import { contentSchemaSql } from "@themelios/content/schema";
+import { parseJson } from "@themelios/core";
+import {
+  createPreparation,
+  type MediaInput,
+  type ModelCapabilities,
+  type RepresentationAdapter,
+} from "@themelios/models";
 import { createPdfAdapters } from "@themelios/pdf";
+import { Cas, Database } from "@themelios/storage";
 import { PDFDocument, rgb } from "pdf-lib";
 import sharp from "sharp";
 
@@ -123,4 +133,126 @@ test("PDF text, selected PDF bytes, and PNG rendering agree on original page num
     .raw()
     .toBuffer();
   expect(pixels.some((value) => value < 128)).toBe(true);
+});
+
+test("Preparation reuses stored representations without re-running the adapter", async () => {
+  const work = join("temp", "work");
+  await mkdir(work, { recursive: true });
+  const dir = await mkdtemp(join(work, "prep-reuse-"));
+  const database = Database.init({
+    path: join(dir, "main.sqlite"),
+    formatId: "test.reuse",
+    schemaSql: contentSchemaSql,
+  });
+  const cas = await Cas.open(join(dir, "objects"));
+  try {
+    const content = createContent({ database, cas });
+    const sourceSelection = await content.materials.accept({
+      bytes: new TextEncoder().encode("raw binary fixture"),
+      mediaType: "application/x-custom",
+      name: "item.bin",
+    });
+
+    let prepareCalls = 0;
+    const baseAdapter = createPdfAdapters()[0]!;
+    const adapter: RepresentationAdapter = {
+      description: {
+        ...baseAdapter.description,
+        id: "custom.extract",
+        inputMimeTypes: ["application/x-custom"],
+        outputMimeTypes: ["text/plain"],
+        supplies: ["text"],
+        priority: 10,
+      },
+      available: async () => ({ available: true, missing: [] }),
+      probe: async () => ({ kind: "unknown" }),
+      async prepare(input) {
+        prepareCalls += 1;
+        return {
+          outputs: ["extracted.txt"],
+          result: {
+            value: parseJson({ prepared: true }),
+            inputs: [
+              {
+                source: input.source,
+                delivered: [input.source],
+                role: "primary",
+              },
+            ],
+            files: [
+              {
+                name: "extracted.txt",
+                material: {
+                  bytes: new TextEncoder().encode("cached extracted text"),
+                  mediaType: "text/plain",
+                  name: "extracted.txt",
+                },
+                sourceIndices: [0],
+              },
+            ],
+            producer: {
+              kind: "transform",
+              name: "custom.extract",
+              version: "1",
+            },
+          },
+        };
+      },
+    };
+
+    const preparation = createPreparation({
+      store: {
+        inspect: (ref) => content.materials.inspect(ref),
+        read: (ref, call) => content.materials.read(ref, call),
+        text: (sel, call) => content.materials.text(sel, call),
+        readResult: (ref, call) => content.results.read(ref, call),
+        findRepresentation: (src, purpose, recipe) =>
+          content.representations.find(src, purpose, recipe),
+      },
+      adapters: [adapter],
+    });
+    const textOnlyModel: ModelCapabilities = {
+      operations: ["generate"],
+      inputMimeTypes: ["text/plain"],
+      needs: ["text"],
+      structuredOutput: false,
+      streaming: false,
+    };
+    const requirements = {
+      minMaterials: 1,
+      inputs: [{ mediaType: "application/x-custom", needs: ["text" as const] }],
+    };
+
+    const first = await preparation.forModel(
+      [{ source: sourceSelection }],
+      requirements,
+      textOnlyModel,
+    );
+    expect(prepareCalls).toBe(1);
+    expect(first.parts[1]).toEqual({
+      kind: "text",
+      text: "cached extracted text",
+    });
+
+    await content.results.save({
+      value: parseJson({ stored: true }),
+      inputs: first.uses,
+      files: [],
+      producer: { kind: "application", name: "summary" },
+    });
+
+    const second = await preparation.forModel(
+      [{ source: sourceSelection }],
+      requirements,
+      textOnlyModel,
+    );
+    expect(prepareCalls).toBe(1);
+    expect(second.parts[1]).toEqual({
+      kind: "text",
+      text: "cached extracted text",
+    });
+  } finally {
+    await cas.close();
+    database.close();
+  }
 });

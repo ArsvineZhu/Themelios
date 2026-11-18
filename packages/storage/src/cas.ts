@@ -59,7 +59,6 @@ export class Cas {
     }
   }
 
-  // fallow-ignore-next-line unused-class-member -- Content publishes bytes through this Storage export.
   put(
     input: Uint8Array | ReadableStream<Uint8Array>,
     options?: CallOptions & { maxBytes?: number },
@@ -122,10 +121,6 @@ export class Cas {
               });
             }
           }
-          await syncParent(destination);
-          // Also persist a newly created shard directory's entry in its parent.
-          await syncParent(dirname(destination));
-          await syncParent(dirname(dirname(destination)));
         },
       );
     } catch (error) {
@@ -160,7 +155,6 @@ export class Cas {
   }
 
   /** Reads a complete object for a synchronous metadata operation. */
-  // fallow-ignore-next-line unused-class-member -- Content verifies a representation inside its synchronous transaction.
   readBytesSync(ref: BlobRef): Uint8Array {
     if (this.#stopping.signal.aborted) throw this.#stopping.signal.reason;
     const path = objectPath(this.root, ref);
@@ -284,7 +278,6 @@ export class Cas {
     }
   }
 
-  // fallow-ignore-next-line unused-class-member -- Content delegates original-file export to CAS.
   export(
     ref: BlobRef,
     destination: string,

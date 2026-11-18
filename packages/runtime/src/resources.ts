@@ -1,12 +1,16 @@
 import { isDeepStrictEqual } from "node:util";
 import type { Json } from "@themelios/core";
-import type { Closable, ResourceContext, ResourceSlot } from "./contracts.js";
 import type { RuntimeDiagnostics } from "./diagnostics.js";
-import type { OperationResources } from "./execution.js";
+import type {
+  Closable,
+  OperationResources,
+  ResourceContext,
+  ResourceSlot,
+} from "./execution.js";
 import { failure } from "./failure.js";
 import type { Network } from "./network.js";
 import type { Secrets } from "./secrets.js";
-import type { RuntimeSettings } from "./settings.js";
+import { extractRuntimeSettings, type RuntimeSettings } from "./settings.js";
 
 class Shared<T extends Closable> {
   #references = 0;
@@ -23,12 +27,13 @@ class Shared<T extends Closable> {
 }
 
 class Resources<S> implements OperationResources<S> {
-  #users = 1; // The active pointer holds one lease.
+  #users = 1;
   readonly #completed = Promise.withResolvers<void>();
   app: Shared<Closable> | undefined;
 
   constructor(
     readonly settings: Readonly<S>,
+    readonly runtime: Readonly<RuntimeSettings>,
     readonly diary: Shared<RuntimeDiagnostics>,
     readonly transport: Shared<Network>,
     readonly secrets: Secrets,
@@ -82,7 +87,6 @@ export class SessionResources<S> {
 
   constructor(
     readonly secrets: Secrets,
-    readonly selectRuntime: (settings: Readonly<S>) => RuntimeSettings,
     readonly diagnostics: (
       settings: RuntimeSettings,
     ) => Promise<RuntimeDiagnostics>,
@@ -123,24 +127,23 @@ export class SessionResources<S> {
     };
   }
 
-  /** Create the complete candidate before returning a synchronous adoption callback. */
+  /** Creates a complete resource generation before adopting it synchronously. */
   async prepare(
     settings: Readonly<S>,
   ): Promise<{ activate(): void; discard(): Promise<void> }> {
     const old = this.#active;
-    const previous = old && this.selectRuntime(old.settings);
-    const next = this.selectRuntime(settings);
+    const next = extractRuntimeSettings(settings);
     const makeDiagnostics =
-      !old || !isDeepStrictEqual(diagSettings(previous!), diagSettings(next));
+      !old || !isDeepStrictEqual(diagSettings(old.runtime), diagSettings(next));
     const makeNetwork =
       !old ||
-      !isDeepStrictEqual(networkSettings(previous!), networkSettings(next));
+      !isDeepStrictEqual(networkSettings(old.runtime), networkSettings(next));
     const diary = makeDiagnostics
       ? new Shared("diagnostics", await this.diagnostics(next))
       : old.diary;
-    const transport = await (async () => {
+    const transport = await (async (): Promise<Shared<Network>> => {
       try {
-        return makeNetwork
+        return makeNetwork || !old
           ? new Shared("network", await this.network(next, diary.value))
           : old.transport;
       } catch (error) {
@@ -153,6 +156,7 @@ export class SessionResources<S> {
     })();
     const candidate = new Resources(
       settings,
+      next,
       diary,
       transport,
       this.secrets,
@@ -163,15 +167,16 @@ export class SessionResources<S> {
     try {
       if (this.#slot) {
         const { select, create } = this.#slot;
+        const previousApp = old?.app;
         const recreate =
-          !old?.app ||
+          !previousApp ||
           makeNetwork ||
           makeDiagnostics ||
           !isDeepStrictEqual(select(old.settings), select(settings));
         candidate.useApplication(
           recreate
             ? new Shared("application", await create(candidate))
-            : old.app!,
+            : previousApp,
         );
       }
     } catch (error) {
@@ -193,7 +198,6 @@ export class SessionResources<S> {
 
   async close(closeOwned: () => Promise<void>): Promise<void> {
     const active = this.#active;
-    // The active log destination stays available through persistent resource teardown.
     active?.diary.hold();
     this.#active = undefined;
     active?.release();
@@ -221,8 +225,7 @@ function networkSettings({ network }: RuntimeSettings) {
   return { proxy, proxyAuthorization, caFile };
 }
 
-function diagSettings(settings: RuntimeSettings) {
-  const { file, rotateBytes, maxFiles } = settings.logging;
-  const { endpoint, credential } = settings.telemetry;
-  return { file, rotateBytes, maxFiles, endpoint, credential };
+function diagSettings({ logging }: RuntimeSettings) {
+  const { file, rotateBytes, maxFiles } = logging;
+  return { file, rotateBytes, maxFiles };
 }

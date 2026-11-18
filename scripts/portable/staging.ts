@@ -1,9 +1,7 @@
-import { copyFile, mkdir, readFile } from "node:fs/promises";
-import { basename, dirname, join, relative } from "node:path";
+import { copyFile, mkdir } from "node:fs/promises";
+import { join, relative } from "node:path";
 import { repoRoot, run, type Workspace } from "../workspaces.js";
 import { copyEntry, exists } from "./files.js";
-
-const runtimePackage = "@themelios/runtime";
 
 function workspacePath(root: string, workspace: Workspace): string {
   return join(root, relative(repoRoot, workspace.root));
@@ -42,11 +40,6 @@ export async function buildInStaging(
     "tsconfig.base.json",
     "tsconfig.package.json",
     "tsconfig.json",
-    "Cargo.toml",
-    "Cargo.lock",
-    "rust-toolchain.toml",
-    "native",
-    "proto",
     "scripts/build-packages.ts",
     "scripts/workspaces.ts",
   ]);
@@ -79,7 +72,6 @@ export async function stageApplication(
   all: readonly Workspace[],
   closure: readonly Workspace[],
   appName: string,
-  target: string,
 ): Promise<void> {
   await copyParts(build, app, ["package.json", "bun.lock"]);
   await Bun.write(
@@ -93,7 +85,7 @@ export async function stageApplication(
       ["package.json"],
     );
   for (const workspace of closure)
-    await stageWorkspaceOutput(build, app, workspace, target);
+    await stageWorkspaceOutput(build, app, workspace);
   await run(
     [
       process.execPath,
@@ -120,16 +112,11 @@ async function stageWorkspaceOutput(
   build: string,
   app: string,
   workspace: Workspace,
-  target: string,
 ): Promise<void> {
   const source = workspacePath(build, workspace);
   const destination = workspacePath(app, workspace);
   await copyParts(source, destination, ["dist"]);
   await copyOptional(source, destination, ["resources"]);
-  if (workspace.manifest.name === runtimePackage)
-    await copyParts(source, destination, [
-      `native/${target}/themelios_runtime.node`,
-    ]);
   for (const contract of Object.values(workspace.manifest.exports ?? {})) {
     for (const entry of [contract.types, contract.import]) {
       const path = join(destination, entry);
@@ -193,74 +180,16 @@ export async function writeNotices(
     join(candidate, "app"),
   );
   const bunLicense = join(import.meta.dir, "BUN-LICENSE.md");
-  const native =
-    "Themelios Runtime native module and linked Rust crate license notices are in licenses/rust/.\n";
   await mkdir(join(candidate, "licenses"), { recursive: true });
   await copyFile(bunLicense, join(candidate, "licenses", "Bun.md"));
   await Bun.write(
     join(candidate, "THIRD-PARTY-NOTICES"),
     [
       "Bun license and linked libraries: licenses/Bun.md",
-      native.trim(),
       "JavaScript package terms accompany their packages under app/node_modules/.",
       "",
       licenses.trimEnd(),
       "",
     ].join("\n"),
   );
-}
-
-interface Crate {
-  manifest_path: string;
-  name: string;
-  version: string;
-  license_file: string | null;
-  license: string | null;
-  source: string | null;
-}
-
-export async function rustNotices(
-  build: string,
-  candidate: string,
-  triple: string,
-): Promise<void> {
-  const metadata = await captured(
-    [
-      "cargo",
-      "metadata",
-      "--locked",
-      "--format-version",
-      "1",
-      "--filter-platform",
-      triple,
-    ],
-    build,
-  );
-  const { packages } = JSON.parse(metadata) as { packages: Crate[] };
-  const notices = join(candidate, "licenses", "rust");
-  await mkdir(notices, { recursive: true });
-  const summary: string[] = [];
-  for (const crate of packages) {
-    if (!crate.source) continue;
-    summary.push(
-      `${crate.name} ${crate.version} (${crate.license ?? "see license file"})`,
-    );
-    const root = dirname(crate.manifest_path);
-    const paths = Array.from(
-      new Bun.Glob("{LICENSE*,COPYING*,NOTICE*}").scanSync({
-        cwd: root,
-        onlyFiles: true,
-      }),
-    );
-    if (crate.license_file && !paths.includes(crate.license_file))
-      paths.push(crate.license_file);
-    for (const file of paths) {
-      const text = await readFile(join(root, file));
-      await Bun.write(
-        join(notices, `${crate.name}-${crate.version}`, basename(file)),
-        text,
-      );
-    }
-  }
-  await Bun.write(join(notices, "INDEX"), `${summary.sort().join("\n")}\n`);
 }

@@ -86,7 +86,6 @@ export const documentSummary = defineTask<
   outputRuleKeys: [
     "tasks.summary.rules.sectionCount",
     "tasks.summary.rules.sourceKeys",
-    "tasks.summary.rules.uniqueKeys",
   ],
   examples: [
     {
@@ -128,7 +127,6 @@ export const documentSummary = defineTask<
       });
     }
     value.sections.forEach((item, sectionIndex) => {
-      const used = new Set<string>();
       item.sourceKeys.forEach((key, keyIndex) => {
         if (!sources.has(key)) {
           issues.push({
@@ -138,17 +136,13 @@ export const documentSummary = defineTask<
             params: { key },
           });
         }
-        if (used.has(key)) {
-          issues.push({
-            path: ["sections", sectionIndex, "sourceKeys", keyIndex],
-            code: "duplicate_source",
-            messageKey: "tasks.summary.errors.duplicateSource",
-            params: { key },
-          });
-        }
-        used.add(key);
       });
     });
+    if (issues.length === 0) {
+      for (const item of value.sections) {
+        item.sourceKeys = [...new Set(item.sourceKeys)];
+      }
+    }
     return issues;
   },
   present(value, sources) {
@@ -158,7 +152,7 @@ export const documentSummary = defineTask<
         ...value.sections.flatMap((item) => [
           `## ${item.heading}`,
           item.markdown,
-          item.sourceKeys
+          [...new Set(item.sourceKeys)]
             .map((key) => `[${key}](${sources.link(key)})`)
             .join(" "),
         ]),

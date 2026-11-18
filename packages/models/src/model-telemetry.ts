@@ -4,7 +4,7 @@ import type {
   ModelAttemptDiagnostic,
 } from "@themelios/runtime/diagnostics";
 import type { LanguageModelUsage } from "ai";
-import type { FetchFunction, ModelIdentity } from "./contracts.js";
+import type { FetchFunction, ModelIdentity } from "./types.js";
 
 type Tokens = Pick<
   ModelAttemptDiagnostic,

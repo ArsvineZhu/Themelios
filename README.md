@@ -14,7 +14,7 @@ themelios material import --file notes.txt --json
 themelios task describe document.summary --json
 ```
 
-配置实际模型后，可预览、执行、保存和追溯结果。完整命令和配置在[工作台指南](docs/development/workbench.md)，配置样例在 [themelios.toml](docs/examples/themelios.toml)。
+配置实际模型后，可预览、执行、保存和追溯结果。完整命令和配置在[工作台指南](docs/development/workbench.md)，配置样例在 [themelios.toml](docs/examples/themelios.toml)。当前能力与生效决策见 [CURRENT.md](CURRENT.md)，架构设计见[设计文档](docs/design/README.md)。
 
 ## 嵌入应用
 
