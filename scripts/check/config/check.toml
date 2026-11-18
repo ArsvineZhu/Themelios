@@ -1,5 +1,5 @@
-roots = ["apps", "packages", "crates", "scripts", "src", "tests"]
-exclude_dirs = [".git", "node_modules", "temp", "dist", "target", "__pycache__"]
+roots = ["apps", "packages", "extensions", "crates", "native", "scripts", "src", "tests", "examples"]
+exclude_dirs = [".git", "node_modules", "temp", "dist", "target", "generated", "__pycache__"]
 ruff_version = "0.17.1"
 
 [limits.python]

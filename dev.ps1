@@ -7,7 +7,7 @@ $themeliosEnvPaths = @{
     UV_CACHE_DIR = 'cache/uv'; PIP_CACHE_DIR = 'cache/pip'
     UV_PROJECT_ENVIRONMENT = 'venvs/themelios'; UV_PYTHON_INSTALL_DIR = 'tools/python'
     CARGO_HOME = 'tools/cargo-home'; CARGO_TARGET_DIR = 'build/native'
-    BUN_INSTALL_CACHE_DIR = 'cache/bun'; FALLOW_CACHE_DIR = 'cache/fallow'
+    BUN_INSTALL_CACHE_DIR = 'cache/bun'
     npm_config_cache = 'cache/npm'; XDG_CACHE_HOME = 'cache/xdg'
     RUFF_CACHE_DIR = 'cache/ruff'; PYTHONPYCACHEPREFIX = 'cache/python-bytecode'
 }

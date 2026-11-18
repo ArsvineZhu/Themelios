@@ -1,0 +1,36 @@
+{
+  "name": "@themelios/content",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "MIT",
+  "files": [
+    "dist",
+    "resources",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/types/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./schema": {
+      "types": "./dist/types/schema.d.ts",
+      "import": "./dist/schema.js"
+    },
+    "./locales": {
+      "types": "./dist/types/locales.d.ts",
+      "import": "./dist/locales.js"
+    }
+  },
+  "dependencies": {
+    "@themelios/core": "workspace:*",
+    "@themelios/storage": "workspace:*",
+    "file-type": "22.3.0",
+    "remark-gfm": "4.0.1",
+    "remark-parse": "11.0.0",
+    "sharp": "0.35.5",
+    "unified": "11.0.5",
+    "zod": "catalog:"
+  }
+}

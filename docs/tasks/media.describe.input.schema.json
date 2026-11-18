@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "language": {
+      "default": "zh-CN",
+      "type": "string",
+      "enum": [
+        "zh-CN",
+        "en"
+      ],
+      "description": "输出语言，zh-CN 或 en，默认 zh-CN。"
+    },
+    "instructions": {
+      "default": null,
+      "anyOf": [
+        {
+          "type": "string",
+          "maxLength": 4000
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "本次描述重点，最多 4000 字符；null 或省略时采用完整材料描述。"
+    }
+  },
+  "additionalProperties": false
+}

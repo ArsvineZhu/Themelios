@@ -1,0 +1,17 @@
+[package]
+name = "themelios-runtime-native"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+publish = false
+
+[lib]
+name = "themelios_runtime"
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "=3.16.2", default-features = false, features = ["napi6", "dyn-symbols"] }
+napi-derive = "=3.7.1"
+
+[build-dependencies]
+napi-build = "=2.6.0"

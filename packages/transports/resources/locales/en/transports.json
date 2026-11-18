@@ -1,0 +1,10 @@
+{
+  "transport.invalid_request": "The request is invalid.",
+  "transport.auth_required": "A valid bearer token is required.",
+  "transport.access_denied": "This request is not allowed.",
+  "transport.not_found": "The operation was not found.",
+  "transport.request_too_large": "The request exceeds the JSON limit.",
+  "transport.result_too_large": "The result exceeds the JSON limit.",
+  "transport.unsupported_media_type": "This content type is unsupported.",
+  "transport.delivery_failed": "Could not deliver the result."
+}

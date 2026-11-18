@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.package.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist/types",
+    "tsBuildInfoFile": "dist/types/.tsbuildinfo"
+  },
+  "references": [
+    { "path": "../application" },
+    { "path": "../content" },
+    { "path": "../core" },
+    { "path": "../runtime" }
+  ],
+  "include": ["src/**/*.ts"]
+}

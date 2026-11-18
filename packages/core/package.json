@@ -1,0 +1,25 @@
+{
+  "name": "@themelios/core",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "MIT",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/types/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./time": {
+      "types": "./dist/types/time.d.ts",
+      "import": "./dist/time.js"
+    }
+  },
+  "dependencies": {
+    "@js-temporal/polyfill": "0.5.1",
+    "zod": "catalog:"
+  }
+}

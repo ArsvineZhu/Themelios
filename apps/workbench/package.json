@@ -1,0 +1,26 @@
+{
+  "name": "@themelios/workbench",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "exports": {
+    ".": {
+      "types": "./dist/types/main.d.ts",
+      "import": "./dist/main.js"
+    }
+  },
+  "bin": {
+    "themelios": "./dist/main.js"
+  },
+  "dependencies": {
+    "@themelios/application": "workspace:*",
+    "@themelios/content": "workspace:*",
+    "@themelios/core": "workspace:*",
+    "@themelios/models": "workspace:*",
+    "@themelios/pdf": "workspace:*",
+    "@themelios/runtime": "workspace:*",
+    "@themelios/storage": "workspace:*",
+    "@themelios/transports": "workspace:*",
+    "zod": "catalog:"
+  }
+}

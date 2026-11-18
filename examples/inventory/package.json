@@ -1,0 +1,17 @@
+{
+  "name": "themelios-inventory-example",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "inventory": "bun run main.ts"
+  },
+  "dependencies": {
+    "@themelios/core": "0.1.0",
+    "@themelios/runtime": "0.1.0",
+    "@themelios/storage": "0.1.0",
+    "@themelios/content": "0.1.0",
+    "csv-parse": "7.0.3",
+    "zod": "4.6.7"
+  }
+}

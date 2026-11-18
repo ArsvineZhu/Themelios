@@ -1,0 +1,338 @@
+syntax = "proto3";
+
+package themelios.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/struct.proto";
+
+// 本文件的固定字段对应 contracts/core.ts、content.ts、runtime.ts、wire.ts。
+// 动态任务的 variables/value/schema 继续由任务 Zod 定义约束。
+
+message TextRange { uint64 start = 1; uint64 end = 2; }
+message PageRange { uint32 start = 1; uint32 end = 2; }
+message TimeRange { double start_ms = 1; double end_ms = 2; }
+message ImageRange { uint32 x = 1; uint32 y = 2; uint32 width = 3; uint32 height = 4; }
+message JsonRange { string pointer = 1; }
+message Range {
+  oneof selection {
+    TextRange text = 1;
+    PageRange pages = 2;
+    TimeRange time = 3;
+    ImageRange image = 4;
+    JsonRange json = 5;
+  }
+}
+message Selection { string ref = 1; Range range = 2; }
+message ArtifactRef { string ref = 1; }
+message InlineMaterial { bytes bytes = 1; string media_type = 2; optional string name = 3; }
+
+message ResultOutput {
+  oneof result {
+    Completed completed = 1;
+    ArtifactRef saved = 2;
+  }
+  optional string output = 3;
+}
+message Material {
+  oneof source {
+    Selection selection = 1;
+    InlineMaterial inline = 2;
+    ResultOutput result_output = 3;
+  }
+}
+enum InputRole { INPUT_ROLE_UNSPECIFIED = 0; INPUT_ROLE_PRIMARY = 1; INPUT_ROLE_CONTEXT = 2; }
+message TaskMaterial { Material source = 1; optional InputRole role = 2; }
+message InputUse { Material source = 1; repeated Material delivered = 2; InputRole role = 3; }
+message SavedInputUse { Selection source = 1; repeated Selection delivered = 2; InputRole role = 3; }
+enum ProducerKind { PRODUCER_KIND_UNSPECIFIED = 0; PRODUCER_KIND_MODEL = 1; PRODUCER_KIND_TRANSFORM = 2; PRODUCER_KIND_APPLICATION = 3; }
+message Producer { ProducerKind kind = 1; string name = 2; optional string version = 3; google.protobuf.Value details = 4; }
+message ProducedFile {
+  string name = 1;
+  oneof material {
+    Selection selection = 2;
+    InlineMaterial inline = 3;
+  }
+  repeated uint32 source_indices = 4;
+}
+message SavedFile {
+  Selection material = 1;
+  repeated uint32 source_indices = 2;
+}
+message CopyMap { string output = 1; TextRange range = 2; Selection source = 3; }
+message Completed {
+  google.protobuf.Value value = 1;
+  repeated InputUse inputs = 2;
+  repeated ProducedFile files = 3;
+  Producer producer = 4;
+  repeated CopyMap mappings = 5;
+}
+message SavedResult {
+  string ref = 1;
+  google.protobuf.Value value = 2;
+  repeated SavedInputUse inputs = 3;
+  map<string, SavedFile> files = 4;
+  Producer producer = 5;
+  repeated CopyMap mappings = 6;
+}
+message TaskResult {
+  oneof result {
+    Completed completed = 1;
+    SavedResult saved = 2;
+  }
+}
+
+message Failure {
+  string code = 1;
+  string message = 2;
+  google.protobuf.Value details = 3;
+  bool retryable = 4;
+  optional string trace_id = 5;
+}
+message Progress {
+  string stage = 1;
+  optional double completed = 2;
+  optional double total = 3;
+  optional string unit = 4;
+}
+message FlowEvent {
+  oneof event {
+    Progress progress = 1;
+    string text_delta = 2;
+    TaskResult result = 3;
+  }
+}
+
+message TextExtent { uint64 bytes = 1; }
+message ImageExtent { uint32 width = 1; uint32 height = 2; uint32 frames = 3; }
+message PageExtent { uint32 pages = 1; }
+message TimeExtent { double duration_ms = 1; }
+message Extent {
+  oneof extent {
+    TextExtent text = 1;
+    ImageExtent image = 2;
+    PageExtent pages = 3;
+    TimeExtent time = 4;
+    google.protobuf.Empty unknown = 5;
+  }
+}
+enum OriginKind { ORIGIN_KIND_UNSPECIFIED = 0; ORIGIN_KIND_FILE = 1; ORIGIN_KIND_URL = 2; ORIGIN_KIND_APPLICATION = 3; }
+message Origin { OriginKind kind = 1; optional string locator = 2; string captured_at = 3; google.protobuf.Value metadata = 4; }
+enum ArtifactKind { ARTIFACT_KIND_UNSPECIFIED = 0; ARTIFACT_KIND_MATERIAL = 1; ARTIFACT_KIND_RESULT = 2; }
+message ArtifactInfo {
+  string ref = 1;
+  ArtifactKind kind = 2;
+  string media_type = 3;
+  uint64 size_bytes = 4;
+  optional string name = 5;
+  Extent extent = 6;
+  string created_at = 7;
+  string created_at_cut = 8;
+  Origin origin = 9;
+}
+message AcceptMaterialRequest { InlineMaterial material = 1; Origin origin = 2; }
+message UploadMetadata { string media_type = 1; optional string name = 2; Origin origin = 3; }
+message UploadMaterialRequest {
+  oneof part {
+    UploadMetadata metadata = 1;
+    bytes chunk = 2;
+  }
+}
+message ReadMaterialResponse {
+  oneof part {
+    ArtifactInfo info = 1;
+    bytes chunk = 2;
+  }
+}
+message ReadTextResponse { string text = 1; }
+message TextBlock {
+  string kind = 1;
+  Selection selection = 2;
+  optional uint32 depth = 3;
+  string text = 4;
+}
+message MaterialStructure { repeated TextBlock blocks = 1; }
+message SourcesRequest { string ref = 1; optional uint32 depth = 2; }
+message SourceLink { Selection selection = 1; string relation = 2; }
+message MaterialSources { repeated SourceLink sources = 1; }
+message ListMaterialsRequest { optional string at = 1; optional string after = 2; optional uint32 limit = 3; }
+message MaterialList { repeated ArtifactInfo items = 1; }
+
+message ModelParameters {
+  optional double temperature = 1;
+  optional double top_p = 2;
+  optional uint32 max_output_tokens = 3;
+  optional int64 seed = 4;
+  map<string, google.protobuf.Value> provider_options = 5;
+}
+message RunTaskRequest {
+  string task = 1;
+  google.protobuf.Value variables = 2;
+  repeated TaskMaterial materials = 3;
+  optional string model = 4;
+  ModelParameters parameters = 5;
+  optional bool persist = 6;
+}
+message PreviewTaskRequest {
+  string task = 1;
+  google.protobuf.Value variables = 2;
+  repeated TaskMaterial materials = 3;
+  optional string model = 4;
+  ModelParameters parameters = 5;
+}
+message RunManyRequest { repeated RunTaskRequest inputs = 1; }
+message BatchItemResult {
+  oneof outcome {
+    TaskResult result = 1;
+    Failure error = 2;
+  }
+}
+message BatchResult { repeated BatchItemResult items = 1; }
+message TaskId { string task = 1; }
+message TaskSummary { string id = 1; string title = 2; string purpose = 3; }
+message TaskList { repeated TaskSummary tasks = 1; }
+message SourceEntry {
+  string key = 1;
+  string media_type = 2;
+  optional string name = 3;
+  string original_extent = 4;
+  repeated string delivered_extent = 5;
+  InputRole role = 6;
+}
+message SourceDirectory { repeated SourceEntry entries = 1; }
+message TaskInputRequirement { string media_type = 1; repeated string needs = 2; }
+message TaskRequirements {
+  repeated TaskInputRequirement inputs = 1;
+  uint32 min_materials = 2;
+  optional uint32 max_materials = 3;
+}
+message PromptFileInfo { string role = 1; string path = 2; string source = 3; }
+message ExampleSource { SourceEntry source = 1; optional string text = 2; }
+message TaskExample {
+  string name = 1;
+  google.protobuf.Value variables = 2;
+  repeated ExampleSource sources = 3;
+  google.protobuf.Value output = 4;
+}
+message TaskDescription {
+  string id = 1;
+  string title = 2;
+  string purpose = 3;
+  google.protobuf.Value input_schema = 4;
+  google.protobuf.Value sources_schema = 5;
+  oneof output {
+    google.protobuf.Empty text_output = 6;
+    google.protobuf.Value json_output_schema = 7;
+  }
+  TaskRequirements requirements = 8;
+  repeated PromptFileInfo templates = 9;
+  repeated TaskExample examples = 10;
+  repeated string output_rules = 11;
+}
+message PreviewMedia { string media_type = 1; optional string name = 2; optional uint64 size_bytes = 3; }
+message PreviewPart { oneof part { string text = 1; PreviewMedia media = 2; } }
+message PreviewMessage { string role = 1; repeated PreviewPart parts = 2; }
+message PendingPreparation { string source_key = 1; string action = 2; bool requires_model = 3; }
+message TaskPreview {
+  string model = 1;
+  repeated PreviewMessage messages = 2;
+  SourceDirectory sources = 3;
+  google.protobuf.Value task_schema = 4;
+  google.protobuf.Value sent_schema = 5;
+  repeated PendingPreparation pending = 6;
+}
+
+message PromptTemplates {
+  string system = 1;
+  string user = 2;
+  repeated PromptFileInfo files = 3;
+}
+message PromptDescription {
+  repeated PromptFileInfo files = 1;
+  google.protobuf.Value variables_schema = 2;
+  google.protobuf.Value output_schema = 3;
+  TaskRequirements requirements = 4;
+}
+message PromptDiff { string role = 1; string builtin = 2; optional string override = 3; }
+message PromptDiffs { repeated PromptDiff files = 1; }
+message SetPromptRequest { string task = 1; string role = 2; string template = 3; }
+message ResetPromptRequest { string task = 1; optional string role = 2; }
+
+message SettingMeta {
+  string title_key = 1;
+  string description_key = 2;
+  string impact_key = 3;
+  repeated string scopes = 4;
+  string effect = 5;
+  optional string unit = 6;
+  optional string format = 7;
+  optional bool sensitive = 8;
+  repeated google.protobuf.Value examples = 9;
+  repeated string depends_on = 10;
+}
+message SettingDescription { string path = 1; google.protobuf.Value schema = 2; SettingMeta metadata = 3; }
+message ConfigurationDescription { repeated SettingDescription fields = 1; }
+message DescribeConfigurationRequest { optional string path = 1; }
+message SettingPath { string path = 1; }
+message SetSettingRequest { string path = 1; google.protobuf.Value value = 2; }
+message SettingContribution { string layer = 1; google.protobuf.Value value = 2; optional string file = 3; }
+message SettingExplanation {
+  SettingDescription field = 1;
+  repeated SettingContribution contributions = 2;
+  google.protobuf.Value desired = 3;
+  google.protobuf.Value effective = 4;
+  string state = 5;
+}
+message ConfigurationChange {
+  repeated string changed = 1;
+  repeated string applied = 2;
+  repeated string restart_required = 3;
+}
+message InstancePaths {
+  string root = 1;
+  string config = 2;
+  string state = 3;
+  string objects = 4;
+  string cache = 5;
+  string logs = 6;
+  string run = 7;
+}
+message InstanceInfo {
+  string id = 1;
+  string name = 2;
+  string application_id = 3;
+  string format_id = 4;
+  string created_at = 5;
+  InstancePaths paths = 6;
+}
+
+service ApplicationService {
+  rpc GetInstanceInfo(google.protobuf.Empty) returns (InstanceInfo);
+  rpc AcceptMaterial(AcceptMaterialRequest) returns (Selection);
+  rpc UploadMaterial(stream UploadMaterialRequest) returns (Selection);
+  rpc InspectMaterial(ArtifactRef) returns (ArtifactInfo);
+  rpc ReadMaterial(ArtifactRef) returns (stream ReadMaterialResponse);
+  rpc ReadMaterialText(Selection) returns (ReadTextResponse);
+  rpc GetMaterialStructure(ArtifactRef) returns (MaterialStructure);
+  rpc GetMaterialSources(SourcesRequest) returns (MaterialSources);
+  rpc ListMaterials(ListMaterialsRequest) returns (MaterialList);
+  rpc RetainMaterial(ArtifactRef) returns (google.protobuf.Empty);
+  rpc ReleaseMaterial(ArtifactRef) returns (google.protobuf.Empty);
+  rpc SaveResult(Completed) returns (SavedResult);
+  rpc ReadResult(ArtifactRef) returns (SavedResult);
+  rpc ListTasks(google.protobuf.Empty) returns (TaskList);
+  rpc DescribeTask(TaskId) returns (TaskDescription);
+  rpc PreviewTask(PreviewTaskRequest) returns (TaskPreview);
+  rpc RunTask(RunTaskRequest) returns (TaskResult);
+  rpc StreamTask(RunTaskRequest) returns (stream FlowEvent);
+  rpc RunManyTasks(RunManyRequest) returns (BatchResult);
+  rpc ReadPrompt(TaskId) returns (PromptTemplates);
+  rpc DescribePrompt(TaskId) returns (PromptDescription);
+  rpc DiffPrompt(TaskId) returns (PromptDiffs);
+  rpc SetPromptOverride(SetPromptRequest) returns (PromptDescription);
+  rpc ResetPrompt(ResetPromptRequest) returns (PromptDescription);
+  rpc DescribeConfiguration(DescribeConfigurationRequest) returns (ConfigurationDescription);
+  rpc ExplainSetting(SettingPath) returns (SettingExplanation);
+  rpc SetSetting(SetSettingRequest) returns (ConfigurationChange);
+  rpc UnsetSetting(SettingPath) returns (ConfigurationChange);
+  rpc ReloadConfiguration(google.protobuf.Empty) returns (ConfigurationChange);
+}

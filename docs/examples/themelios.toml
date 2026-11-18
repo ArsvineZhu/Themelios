@@ -1,0 +1,65 @@
+# 文档工作台的模型配置示例。
+# 将内容合并到安装的 config/installation.toml，或某个实例的 config/instance.toml。
+# 替换 REPLACE_WITH_TEXT_MODEL_ID；启动进程前提供 THEMELIOS_MODEL_KEY 环境变量。
+# baseURL 当前指向 OpenAI API；使用其他 OpenAI-compatible 服务时改为其实际 API 根地址。
+# 能力声明必须符合选定模型。此示例要求文字生成、结构化对象和流式输出。
+
+locale = "zh-CN"
+
+[network]
+timeoutMs = 120000
+
+[models]
+timeoutMs = 120000
+maxAttempts = 1
+concurrency = 4
+
+[models.connections.primary]
+protocol = "openai-compatible"
+baseURL = "https://api.openai.com/v1"
+credential = "env:THEMELIOS_MODEL_KEY"
+
+[models.bindings.summary]
+connection = "primary"
+providerModel = "REPLACE_WITH_TEXT_MODEL_ID"
+
+[models.bindings.summary.capabilities]
+operations = ["generate"]
+inputMimeTypes = ["text/plain", "text/markdown"]
+needs = ["text"]
+structuredOutput = true
+streaming = true
+
+# TOML 中带点的任务 ID 必须加引号，保持为一个 map key。
+[models.tasks."document.summary"]
+model = "summary"
+
+[models.tasks."document.summary".parameters]
+maxOutputTokens = 4096
+
+# 以上配置可处理文字；PDF 文字输入由应用装配时注册的 pdf.text 扩展准备。
+# 下方为可选的图像描述路线。需要它时，取消整段注释并填入真实视觉模型 ID。
+# 视觉模型通过 primary 连接访问；若在另一服务上，先增加对应 connection。
+# 这一路线先生成描述，再把描述交给文字摘要模型，会产生两次模型调用。
+
+# [models.bindings.vision]
+# connection = "primary"
+# providerModel = "REPLACE_WITH_VISION_MODEL_ID"
+#
+# [models.bindings.vision.capabilities]
+# operations = ["generate"]
+# inputMimeTypes = ["text/plain", "text/markdown", "image/jpeg", "image/png", "image/webp"]
+# needs = ["text", "visual"]
+# structuredOutput = false
+# streaming = true
+#
+# [models.bindings.vision.parameters]
+# maxOutputTokens = 2048
+#
+# [models.tasks."media.describe"]
+# model = "vision"
+#
+# [[models.tasks."document.summary".preparation.models]]
+# mediaType = "image/*"
+# recipe = "media.describe"
+# model = "vision"

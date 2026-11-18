@@ -1,0 +1,19 @@
+{
+  "tasks.summary.title": "Material summary",
+  "tasks.summary.purpose": "Read the primary materials together, use context materials to aid interpretation, and return sections with material-level sources.",
+  "tasks.summary.fields.language": "Output language. Defaults to Simplified Chinese; en selects English.",
+  "tasks.summary.fields.maxSections": "Maximum section count, from 1 to 12, default 6. Empty source content may produce zero sections.",
+  "tasks.summary.fields.focus": "Focus for this request, at most 2000 characters; null or omitted means organize around the materials.",
+  "tasks.summary.fields.title": "Summary title, from 1 to 200 characters.",
+  "tasks.summary.fields.sections": "Sections in reading order, no more than this request's maxSections.",
+  "tasks.summary.fields.heading": "Section heading, from 1 to 160 characters.",
+  "tasks.summary.fields.markdown": "Section body in Markdown, from 1 to 20000 characters.",
+  "tasks.summary.fields.sourceKeys": "One to 64 source keys supporting this section, selected from this request's S1, S2 and other entries in first-reference order.",
+  "tasks.summary.fields.notes": "Relevant missing material, source disagreement or processing notes; empty when no note is needed, at most 4000 characters.",
+  "tasks.summary.rules.sectionCount": "The section count does not exceed this request's maxSections.",
+  "tasks.summary.rules.sourceKeys": "Every source key exists in this request's source directory.",
+  "tasks.summary.rules.uniqueKeys": "Source keys are unique within each section.",
+  "tasks.summary.errors.sectionCount": "The section count {{actual}} exceeds this request's limit {{max}}.",
+  "tasks.summary.errors.unknownSource": "Source key {{key}} is absent from this request's source directory.",
+  "tasks.summary.errors.duplicateSource": "Source key {{key}} is repeated in the same section."
+}

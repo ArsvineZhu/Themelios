@@ -1,6 +1,10 @@
 # Local workspace and runtime files
 /temp/
 /work/
+/artifacts/
+/packages/*/LICENSE
+/extensions/*/LICENSE
+/packages/transports/resources/proto/
 .env
 .env.*
 !.env.example

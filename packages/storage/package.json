@@ -1,0 +1,30 @@
+{
+  "name": "@themelios/storage",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "MIT",
+  "files": [
+    "dist",
+    "resources",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/types/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./time": {
+      "types": "./dist/types/time.d.ts",
+      "import": "./dist/time.js"
+    },
+    "./locales": {
+      "types": "./dist/types/locales.d.ts",
+      "import": "./dist/locales.js"
+    }
+  },
+  "dependencies": {
+    "@themelios/core": "workspace:*",
+    "zod": "catalog:"
+  }
+}

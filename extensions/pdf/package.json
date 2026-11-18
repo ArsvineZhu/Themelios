@@ -1,0 +1,30 @@
+{
+  "name": "@themelios/pdf",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "MIT",
+  "files": [
+    "dist",
+    "resources",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/types/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./locales": {
+      "types": "./dist/types/locales.d.ts",
+      "import": "./dist/locales.js"
+    }
+  },
+  "dependencies": {
+    "@themelios/application": "workspace:*",
+    "@themelios/core": "workspace:*",
+    "@napi-rs/canvas": "1.1.1",
+    "pdf-lib": "1.17.1",
+    "pdfjs-dist": "6.5.438",
+    "zod": "catalog:"
+  }
+}

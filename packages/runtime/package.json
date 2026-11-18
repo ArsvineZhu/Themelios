@@ -1,0 +1,55 @@
+{
+  "name": "@themelios/runtime",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "MIT",
+  "files": [
+    "dist",
+    "resources",
+    "native",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/types/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./settings": {
+      "types": "./dist/types/settings.d.ts",
+      "import": "./dist/settings.js"
+    },
+    "./network": {
+      "types": "./dist/types/network.d.ts",
+      "import": "./dist/network.js"
+    },
+    "./secrets": {
+      "types": "./dist/types/secrets.d.ts",
+      "import": "./dist/secrets.js"
+    },
+    "./diagnostics": {
+      "types": "./dist/types/diagnostics.d.ts",
+      "import": "./dist/diagnostics.js"
+    },
+    "./locales": {
+      "types": "./dist/types/locales.d.ts",
+      "import": "./dist/locales.js"
+    }
+  },
+  "dependencies": {
+    "@themelios/core": "workspace:*",
+    "@opentelemetry/api": "1.10.0",
+    "@opentelemetry/sdk-trace": "3.1.1",
+    "@opentelemetry/sdk-metrics": "3.1.1",
+    "@opentelemetry/exporter-trace-otlp-http": "0.301.2",
+    "@opentelemetry/exporter-metrics-otlp-http": "0.301.2",
+    "i18next": "27.1.5",
+    "pino": "10.4.0",
+    "rotating-file-stream": "4.0.0",
+    "write-file-atomic": "8.0.0",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@types/write-file-atomic": "4.0.3"
+  }
+}

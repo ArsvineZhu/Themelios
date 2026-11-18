@@ -1,0 +1,10 @@
+{
+  "transport.invalid_request": "请求无效。",
+  "transport.auth_required": "需要有效的 Bearer 令牌。",
+  "transport.access_denied": "此请求未获授权。",
+  "transport.not_found": "找不到该操作。",
+  "transport.request_too_large": "请求超过 JSON 大小上限。",
+  "transport.result_too_large": "结果超过 JSON 大小上限。",
+  "transport.unsupported_media_type": "不支持此内容类型。",
+  "transport.delivery_failed": "无法交付结果。"
+}

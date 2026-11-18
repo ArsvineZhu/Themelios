@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "language": {
+      "default": "zh-CN",
+      "type": "string",
+      "enum": [
+        "zh-CN",
+        "en"
+      ],
+      "description": "输出语言。省略时使用简体中文；en 使用英语。"
+    },
+    "maxSections": {
+      "default": 6,
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 12,
+      "description": "最多分节数，1 至 12，默认 6。材料没有可总结内容时允许零节。"
+    },
+    "focus": {
+      "default": null,
+      "anyOf": [
+        {
+          "type": "string",
+          "maxLength": 2000
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "本次关注重点，最多 2000 个字符；null 或省略表示按材料本身组织。"
+    }
+  },
+  "additionalProperties": false
+}

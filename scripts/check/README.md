@@ -2,6 +2,8 @@
 
 先按[根目录说明](../../README.md)配置开发环境。长度检查支持 TypeScript、JavaScript、Python 和 Rust，扫描目录和阈值在 [config/check.toml](config/check.toml)。
 
+`bun run check:repo` 构建包并运行类型、格式、代码长度、包边界和行为检查。指定一个包名可缩小范围，例如 `bun run check:repo -- storage`。Protobuf 自动生成的绑定保留生成器输出，由类型检查和协议测试验证。
+
 ```powershell
 pwsh -File ./scripts/check/run.ps1 length
 pwsh -File ./scripts/check/run.ps1 length scripts/workspace.py

@@ -1,0 +1,19 @@
+{
+  "tasks.summary.title": "材料摘要",
+  "tasks.summary.purpose": "联合阅读本次主要材料，使用背景材料辅助理解，输出带材料级来源的分节摘要。",
+  "tasks.summary.fields.language": "输出语言。省略时使用简体中文；en 使用英语。",
+  "tasks.summary.fields.maxSections": "最多分节数，1 至 12，默认 6。材料没有可总结内容时允许零节。",
+  "tasks.summary.fields.focus": "本次关注重点，最多 2000 个字符；null 或省略表示按材料本身组织。",
+  "tasks.summary.fields.title": "摘要标题，1 至 200 个字符。",
+  "tasks.summary.fields.sections": "按阅读顺序排列的分节；数量不得超过本次 maxSections。",
+  "tasks.summary.fields.heading": "本节标题，1 至 160 个字符。",
+  "tasks.summary.fields.markdown": "本节自由正文，1 至 20000 个字符，使用 Markdown。",
+  "tasks.summary.fields.sourceKeys": "实际支持本节的来源键，1 至 64 项，使用本次目录中的 S1、S2 等，保持首次引用顺序。",
+  "tasks.summary.fields.notes": "需要读者了解的材料缺失、原始分歧或处理说明；没有说明时为空字符串，最多 4000 个字符。",
+  "tasks.summary.rules.sectionCount": "sections 数量不超过本次 maxSections。",
+  "tasks.summary.rules.sourceKeys": "每个 sourceKeys 值都存在于本次来源目录。",
+  "tasks.summary.rules.uniqueKeys": "同一节的 sourceKeys 不重复。",
+  "tasks.summary.errors.sectionCount": "分节数为 {{actual}}，超过本次上限 {{max}}。",
+  "tasks.summary.errors.unknownSource": "来源键 {{key}} 不在本次材料目录中。",
+  "tasks.summary.errors.duplicateSource": "同一节重复引用来源键 {{key}}。"
+}

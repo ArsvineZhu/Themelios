@@ -1,0 +1,39 @@
+{
+  "name": "@themelios/transports",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "MIT",
+  "files": [
+    "dist",
+    "resources",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/types/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./locales": {
+      "types": "./dist/types/locales.d.ts",
+      "import": "./dist/locales.js"
+    }
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "2.17.0",
+    "@connectrpc/connect": "2.3.0",
+    "@connectrpc/connect-node": "2.3.0",
+    "@modelcontextprotocol/server": "2.4.0",
+    "@themelios/application": "workspace:*",
+    "@themelios/content": "workspace:*",
+    "@themelios/core": "workspace:*",
+    "@themelios/runtime": "workspace:*",
+    "commander": "15.1.0",
+    "hono": "4.13.19",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@bufbuild/buf": "1.75.0",
+    "@bufbuild/protoc-gen-es": "2.17.0"
+  }
+}

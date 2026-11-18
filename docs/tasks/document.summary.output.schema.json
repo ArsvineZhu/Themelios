@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "摘要标题，1 至 200 个字符。"
+    },
+    "sections": {
+      "maxItems": 12,
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "heading": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 160,
+            "description": "本节标题，1 至 160 个字符。"
+          },
+          "markdown": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 20000,
+            "description": "本节自由正文，1 至 20000 个字符，使用 Markdown。"
+          },
+          "sourceKeys": {
+            "minItems": 1,
+            "maxItems": 64,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^S[1-9][0-9]*$"
+            },
+            "description": "实际支持本节的来源键，1 至 64 项，使用本次目录中的 S1、S2 等，保持首次引用顺序。"
+          }
+        },
+        "required": [
+          "heading",
+          "markdown",
+          "sourceKeys"
+        ],
+        "additionalProperties": false
+      },
+      "description": "按阅读顺序排列的分节；数量不得超过本次 maxSections。"
+    },
+    "notes": {
+      "type": "string",
+      "maxLength": 4000,
+      "description": "需要读者了解的材料缺失、原始分歧或处理说明；没有说明时为空字符串，最多 4000 个字符。"
+    }
+  },
+  "required": [
+    "title",
+    "sections",
+    "notes"
+  ],
+  "additionalProperties": false
+}

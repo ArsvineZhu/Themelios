@@ -4,8 +4,19 @@
     "allowJs": true,
     "checkJs": true,
     "noEmit": true,
-    "types": ["node"]
+    "types": ["bun"]
   },
-  "include": ["scripts/**/*.mjs"],
+  "include": ["scripts/**/*.mjs", "scripts/**/*.ts", "tests/**/*.ts"],
+  "references": [
+    { "path": "./packages/core" },
+    { "path": "./packages/runtime" },
+    { "path": "./packages/storage" },
+    { "path": "./packages/content" },
+    { "path": "./packages/models" },
+    { "path": "./packages/application" },
+    { "path": "./extensions/pdf" },
+    { "path": "./packages/transports" },
+    { "path": "./apps/workbench" }
+  ],
   "exclude": ["node_modules", "temp", "legacy", "work"]
 }
