@@ -1,0 +1,11 @@
+# Task
+{{ instructions | default: 'Describe the supplied material.' }}
+Write in {{ language }}.
+
+{% for source in sources -%}
+# Source {{ source.key }}{% if source.name %} · {{ source.name }}{% endif %}
+Media type: {{ source.mediaType }}
+Original extent: {{ source.originalExtent }}
+Requested selection: {{ source.requestedRange }}
+Delivered: {% if source.deliveredExtent.size == 0 %}pending{% else %}{{ source.deliveredExtent | join: '; ' }}{% endif %}
+{% endfor -%}

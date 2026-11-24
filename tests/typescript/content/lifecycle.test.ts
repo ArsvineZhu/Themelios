@@ -5,12 +5,15 @@ import { type Completed, type InlineMaterial } from "@themelios/core";
 import {
   backupStorage,
   Cas,
-  collectStorage,
   Database,
   restoreStorage,
   verifyStorage,
 } from "@themelios/storage";
-import { createContent, verifyContent } from "@themelios/content";
+import {
+  collectContent,
+  createContent,
+  verifyContent,
+} from "@themelios/content";
 import { contentSchemaSql } from "@themelios/content/schema";
 
 test("real bytes, upstream results, and business rows share durable storage semantics", async () => {
@@ -74,7 +77,6 @@ test("real bytes, upstream results, and business rows share durable storage sema
     const duplicate = await materials.accept({ file: inputPath });
     expect(duplicate.ref).not.toBe(source.ref);
     const agentShort = materials.agentRef(source.ref);
-    expect(agentShort).toMatch(/^art_[a-z]{24}$/);
     expect(materials.resolve(agentShort)).toBe(source.ref);
     expect(materials.resolve(source.ref)).toBe(source.ref);
     expect((await verifyStorage(database, cas)).blobs).toBe(1);
@@ -160,7 +162,7 @@ test("real bytes, upstream results, and business rows share durable storage sema
       representations.find(duplicate, "model-input", "test.recipe")?.result,
     ).toBe(original.ref);
     materials.release(duplicate.ref);
-    await collectStorage(database, cas, { retainSince: database.cut() });
+    await collectContent(database, cas, { retainSince: database.cut() });
     expect(() => materials.list({ at: previousCut })).toThrow(
       expect.objectContaining({ code: "storage.history_unavailable" }),
     );
@@ -246,7 +248,7 @@ test("real bytes, upstream results, and business rows share durable storage sema
     await expect(lstat(badTarget)).rejects.toMatchObject({ code: "ENOENT" });
 
     materials.release(saved.ref);
-    const collection = await collectStorage(database, cas, {
+    const collection = await collectContent(database, cas, {
       retainSince: database.cut(),
     });
     expect(collection.removedArtifacts).toBe(4);

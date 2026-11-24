@@ -6,25 +6,35 @@ Themelios 是独立开发和发行的通用软件基础平台，为应用提供�
 
 ## 使用工作台
 
-解压当前平台的 Portable。Windows 使用 `themelios.cmd`，Ubuntu 使用 `./themelios`。工作台默认在解压目录保存实例数据，命令中的相对输入和输出路径按调用目录解析。
+已有 Portable 时，解压后即可运行。Windows 使用 `./themelios.cmd`，Ubuntu 使用 `./themelios`。工作台默认在解压目录保存实例，输入和输出的相对路径按当前终端目录解析。
 
-```sh
-themelios instance init
-themelios material import --file notes.txt --json
-themelios task describe document.summary --json
+从源码开始时，先准备构建环境。需要 Git、Node.js 22 或更新版本及 npm、Python 3.11 或更新版本。
+
+```powershell
+. ./dev.ps1 bootstrap
 ```
 
-配置实际模型后，可预览、执行、保存和追溯结果。完整命令和配置在[工作台指南](docs/development/workbench.md)，配置样例在 [themelios.toml](docs/examples/themelios.toml)。当前能力与生效决策见 [CURRENT.md](CURRENT.md)，架构设计见[设计文档](docs/design/README.md)。
+```bash
+source ./dev.sh bootstrap
+```
+
+在仓库根目录构建并打开工作台：
+
+```bash
+bun run build:packages -- workbench
+bun run workbench -- --installation ./temp/work/notes instance init
+bun run workbench -- --installation ./temp/work/notes material import --text "Tea at 3." --name notes.txt --json
+```
+
+继续[从一份笔记生成并保存摘要](docs/development/workbench.md)，或查阅[工作台命令和协议实例](docs/development/operations.md)。要制作可直接解压运行的 Portable，见[构建与发行](docs/development/distribution.md)。
 
 ## 嵌入应用
 
-正式包位于 `artifacts/packages/`。使用同一批 tarball 安装对应依赖。可以从[独立模型脚本](examples/embedded/README.md)或[库存登记应用](examples/inventory/README.md)开始。包入口、依赖和扩展位置见[平台架构](docs/ARCHITECTURE.md)。
+在已准备好的工作区运行 `bun run pack:packages`，生成 `artifacts/packages/` 下的 SDK tarball。[SDK 实例](docs/development/sdk.md)从本地安装开始，展示独立模型调用、材料和成果、事务与备份、运行时和扩展。两个可单独运行的应用见[模型与模板](examples/embedded/README.md)和[库存登记](examples/inventory/README.md)。
 
 ## 开发环境
 
-需要 Git、Node.js 22 以上与 npm、Python 3.11 以上和 uv。项目使用 Bun 1.4.4、TypeScript 7.0.2；首次初始化会把指定版本的 Bun、工具和下载缓存放在 `temp/`，安装锁定的开发依赖，并准备工作区检索工具。ast-grep MCP 需要 Python 3.13 以上，uv 可以安装所需版本。
-
-在仓库根目录运行：
+需要 Agent 检索和 Harness 集成时，另外安装 uv，在仓库根目录运行完整初始化：
 
 ```powershell
 . ./dev.ps1 init
@@ -36,14 +46,13 @@ Linux 或 macOS：
 source ./dev.sh init
 ```
 
-之后每个新终端先运行 `. ./dev.ps1` 或 `source ./dev.sh`，再使用 `bun`。要重新安装工作区依赖，运行 `bun install --frozen-lockfile`。初始化会检测已安装的 Agent Harness（如 Codex、Antigravity）并配置对应的 CodeGraph、Zvec-grep、Fallow 和 ast-grep MCP 连接；已有的全局或其它连接保持原样。
+之后每个新终端先运行 `. ./dev.ps1` 或 `source ./dev.sh`，再使用 `bun`。完整初始化会为已检测到的 Agent Harness 配置 CodeGraph、Zvec-grep、Fallow 和 ast-grep MCP。详见[开发工具](scripts/README.md)。
 
 开发环境配置后运行：
 
 ```sh
-bun run build:packages
-bun run workbench -- --installation ./temp/work/demo instance init
-bun run check:repo
+bun run check:repo -- workbench
+bun run operations:describe -- tasks.preview
 ```
 
-可用 `bun run check:repo -- application` 缩小检查范围。打包、安装验证和目标平台构建见[发行说明](docs/development/distribution.md)。[文档目录](docs/README.md)链接到当前接口和任务参考。
+从[文档目录](docs/README.md)查看任务、接口和设计。平台当前状态见 [CURRENT.md](CURRENT.md)。

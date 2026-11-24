@@ -67,7 +67,7 @@ export interface RuntimeDiagnostics extends Diagnostics {
   correlate(): { traceId?: string; spanId?: string };
 }
 
-type LogLevel = RuntimeSettings["logging"]["level"];
+export type LogLevel = RuntimeSettings["logging"]["level"];
 const levels: Record<LogLevel, number> = {
   debug: 10,
   info: 20,
@@ -370,7 +370,12 @@ export async function createRuntimeDiagnostics(input: {
       diagnostics.log("debug", "queue.acquired", { stage, queueMs, ...labels });
     },
 
-    recordNetworkBytes() {},
+    recordNetworkBytes(direction, size) {
+      diagnostics.log("debug", "network.body.bytes", {
+        direction,
+        bytes: size,
+      });
+    },
 
     async flush() {
       const stream = file;

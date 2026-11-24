@@ -64,7 +64,7 @@ export function createMcpHandlerFor<App>(
     request: Request,
     ctx: ProtectedHttpContext,
   ): Promise<Response> => {
-    let operation = new Request(request, { signal: ctx.lease.signal });
+    let operation = new Request(request, { signal: ctx.call.signal });
     if (operation.method === "POST") {
       const body = await readRequestBody(operation, ctx.maxJsonBytes);
       if (body.tooLarge) {
@@ -76,7 +76,7 @@ export function createMcpHandlerFor<App>(
         method: operation.method,
         headers: operation.headers,
         body: body.text,
-        signal: ctx.lease.signal,
+        signal: ctx.call.signal,
       });
     }
     return handler.fetch(operation, {

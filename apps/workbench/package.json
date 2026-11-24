@@ -16,6 +16,7 @@
     "@themelios/application": "workspace:*",
     "@themelios/content": "workspace:*",
     "@themelios/core": "workspace:*",
+    "@themelios/media": "workspace:*",
     "@themelios/models": "workspace:*",
     "@themelios/pdf": "workspace:*",
     "@themelios/runtime": "workspace:*",

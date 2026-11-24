@@ -5,18 +5,20 @@ Themelios 提供独立应用可直接使用的运行、存储、内容处理、�
 | 包 | 拥有的能力 |
 | --- | --- |
 | `@themelios/core` | JSON、引用（`art_<uuid>` 与 `readable60`）、选区、错误、完成值、取消、单消费者流和通用多域时间值 |
-| `@themelios/runtime` | 安装、基于 SQLite 独占句柄的实例排他锁、会话、分层配置、凭据、网络、诊断追踪与本地化 |
-| `@themelios/storage` | SQLite 同步事务、提交切面、`time_domains`、CAS 及备份维护原语 |
+| `@themelios/runtime` | 安装、基于 SQLite 独占句柄的实例排他锁、会话、分层配置、凭据、网络、诊断追踪、本地化、通用操作契约 |
+| `@themelios/storage` | SQLite 同步事务、提交切面、`time_domains`、字节登记、CAS、备份、恢复与回收 |
 | `@themelios/content` | 材料、精确文本选区、成果保存、来源图、表示索引与图像适配器 |
 | `@themelios/models` | 网关连接、生成、向量、重排、转写、独立任务执行（`models.runTask`）、Prompt 与表示复用 |
-| `@themelios/application` | 应用装配、通用 `Operation` 与可组合标准操作包、`WireCodec` 与 `AgentRefBridge` |
-| `@themelios/transports` | 共享安全策略与基于操作目录的 CLI（`runApplicationCli`）、HTTP/SSE 与 MCP 监听实现 |
+| `@themelios/application` | 应用装配，内容、任务和提示词的标准操作，JSON 与 SDK 值的边界转换 |
+| `@themelios/transports` | 共享认证策略与基于操作目录的 CLI、HTTP/SSE、MCP 和 gRPC |
+| `@themelios/pdf` | PDF 探测、选页、文本提取、选页渲染 |
+| `@themelios/media` | 通过本机 FFmpeg/ffprobe 探测时长、裁切压缩音视频、提取音轨与单帧 |
 
 ## 一个实例中的保存和读取
 
 `Installation.at(root, application)` 绑定程序与配置位置。`instance.init()` 初始化当前格式，`instance.open()` 持有 `run/instance.lock` 系统锁并在会话内管理有效配置、数据库、CAS 与网络资源。重载后新调用读取新配置与资源，在途调用继续使用已捕获的一代资源。
 
-材料导入先写不可变 CAS，再在 SQLite 短事务中采用。应用自有表可与 `prepared.adopt(tx)` 共享同一提交。结果保存归一化整个完成值的依赖，将正文、已保存文件和来源一起采用。`Completed` 可直接当作下次输入；`SavedResult` 在会话重开后仍可读取。相同字节能共享 CAS，材料引用各自保留来源。
+材料导入先写不可变 CAS，再在 SQLite 短事务中采用。应用自有表可与 `prepared.adopt(tx)` 共享同一提交，也可登记字节后通过业务外键直接持有对象。结果保存归一化整个完成值的依赖，将正文、已保存文件和来源一起采用。`Completed` 可直接当作下次输入；`SavedResult` 在会话重开后仍可读取。相同字节能共享 CAS，材料引用各自保留来源。
 
 ## 应用与扩展
 

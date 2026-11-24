@@ -4,19 +4,19 @@ import { defineTask, type OutputIssue } from "@themelios/models/tasks";
 const input = z
   .object({
     language: z
-      .enum(["zh-CN", "en"])
+      .string()
+      .trim()
+      .min(1)
       .default("zh-CN")
       .meta({ descriptionKey: "tasks.summary.fields.language" }),
     maxSections: z
       .number()
       .int()
       .min(1)
-      .max(12)
       .default(6)
       .meta({ descriptionKey: "tasks.summary.fields.maxSections" }),
     focus: z
       .string()
-      .max(2000)
       .nullable()
       .default(null)
       .meta({ descriptionKey: "tasks.summary.fields.focus" }),
@@ -28,17 +28,14 @@ const section = z
     heading: z
       .string()
       .min(1)
-      .max(160)
       .meta({ descriptionKey: "tasks.summary.fields.heading" }),
     markdown: z
       .string()
       .min(1)
-      .max(20000)
       .meta({ descriptionKey: "tasks.summary.fields.markdown" }),
     sourceKeys: z
       .array(z.string().regex(/^S[1-9][0-9]*$/))
       .min(1)
-      .max(64)
       .meta({ descriptionKey: "tasks.summary.fields.sourceKeys" }),
   })
   .strict();
@@ -48,18 +45,20 @@ const output = z
     title: z
       .string()
       .min(1)
-      .max(200)
       .meta({ descriptionKey: "tasks.summary.fields.title" }),
     sections: z
       .array(section)
-      .max(12)
       .meta({ descriptionKey: "tasks.summary.fields.sections" }),
-    notes: z
-      .string()
-      .max(4000)
-      .meta({ descriptionKey: "tasks.summary.fields.notes" }),
+    notes: z.string().meta({ descriptionKey: "tasks.summary.fields.notes" }),
   })
   .strict();
+
+const exampleText =
+  "本周完成资料目录迁移。已保存的文本材料可以离线读取。下一步接入真实模型。";
+const exampleExtent = {
+  kind: "text" as const,
+  bytes: Buffer.byteLength(exampleText),
+};
 
 export const documentSummary = defineTask<
   z.output<typeof input>,
@@ -73,13 +72,13 @@ export const documentSummary = defineTask<
   output,
   requirements: {
     minMaterials: 1,
-    maxMaterials: 64,
     inputs: [
-      { mediaType: "text/plain", needs: ["text"] },
-      { mediaType: "text/markdown", needs: ["text"] },
+      { mediaType: "text/*", needs: ["text"] },
       { mediaType: "application/json", needs: ["text"] },
       { mediaType: "application/pdf", needs: ["text"] },
       { mediaType: "image/*", needs: ["visual"] },
+      { mediaType: "audio/*", needs: ["speech"] },
+      { mediaType: "video/*", needs: ["visual"] },
     ],
   },
   templates: { system: "system.md.liquid", user: "user.md.liquid" },
@@ -96,9 +95,16 @@ export const documentSummary = defineTask<
           key: "S1",
           mediaType: "text/plain",
           name: "progress.txt",
-          text: "本周完成资料目录迁移。已保存的文本材料可以离线读取。下一步接入真实模型。",
-          originalExtent: "全文",
-          deliveredExtent: ["全文"],
+          text: exampleText,
+          originalExtent: exampleExtent,
+          requestedRange: null,
+          delivered: [
+            {
+              mediaType: "text/plain",
+              sourceRange: null,
+              extent: exampleExtent,
+            },
+          ],
           role: "primary",
         },
       ],

@@ -7,6 +7,7 @@ import {
   type Completed,
   type Json,
 } from "@themelios/core";
+import { createHash } from "node:crypto";
 import { createNetwork, type Network } from "@themelios/runtime/network";
 import { createSecrets } from "@themelios/runtime/secrets";
 import { z } from "zod";
@@ -15,11 +16,12 @@ import {
   prepareGeneration,
   providerOutputSchema,
   streamGeneration,
+  validateGeneration,
 } from "./generation.js";
 import { ModelCalls, queuedStream } from "./model-call.js";
 import { ModelTelemetry } from "./model-telemetry.js";
 import { embed, rank, transcript } from "./other-model-operations.js";
-import { createPreparation, readMediaBytes } from "./preparation.js";
+import { createPreparation } from "./preparation.js";
 import { createPrompts } from "./prompts.js";
 import {
   type BoundModel,
@@ -31,6 +33,7 @@ import {
 import {
   connectionSchema,
   modelBindingSchema,
+  modelAttemptsSchema,
   modelDefaultsSchema,
   modelNameSchema,
   matchesMime,
@@ -45,14 +48,17 @@ import {
 } from "./tasks.js";
 import type {
   FetchFunction,
+  GenerationCallOptions,
   GenerateRequest,
   Models,
   ModelsOptions,
   TaskDefinition,
   TaskRequest,
+  Tasks,
 } from "./types.js";
 
 export * from "./types.js";
+export { taskRouteSchema } from "./schema.js";
 export {
   connectionSchema,
   modelBindingSchema,
@@ -68,7 +74,6 @@ export {
   defineTask,
   describeTask,
   mediaDescription,
-  readMediaBytes,
 };
 
 export function createModels(options: ModelsOptions): Models {
@@ -113,19 +118,67 @@ export function createModels(options: ModelsOptions): Models {
     ) ?? requireCapability(model, "generate");
   const observe = (model: BoundModel) =>
     new ModelTelemetry(model.identity, options.diagnostics);
+  const attemptsFor = (options?: GenerationCallOptions) =>
+    options?.maxAttempts === undefined
+      ? calls.attempts
+      : parseValue(modelAttemptsSchema, options.maxAttempts, "input.invalid");
   let closing: Promise<void> | undefined;
-  let defaultPrompts = options.prompts;
-  let defaultPreparation = options.preparation;
+  let defaultTasks: Tasks | undefined;
+  const soleBinding = bound.size === 1 ? bound.keys().next().value : undefined;
+  const routes = options.routes ?? {};
+
+  function taskExecutor() {
+    const prompts =
+      options.prompts ??
+      createPrompts(
+        options.resourceRoot === undefined
+          ? {}
+          : { resourceRoot: options.resourceRoot },
+      );
+    const mediaDescriptionDefaults = routes["media.describe"]?.variables;
+    const preparation =
+      options.preparation ??
+      createPreparation({
+        models,
+        prompts,
+        ...(mediaDescriptionDefaults === undefined
+          ? {}
+          : { mediaDescriptionDefaults }),
+        ...(options.adapters === undefined
+          ? {}
+          : { adapters: options.adapters }),
+      });
+    return createTasks({
+      models,
+      prompts,
+      preparation,
+      routes,
+      ...(options.diagnostics === undefined
+        ? {}
+        : { diagnostics: options.diagnostics }),
+    });
+  }
 
   const models: Models = {
     describe,
+    validateGeneration(request) {
+      calls.assertOpen();
+      validateGeneration(binding(request.model), request);
+    },
+    fingerprint(name) {
+      const { binding: configured, connection } = binding(name);
+      return createHash("sha256")
+        .update(JSON.stringify({ binding: configured, connection }))
+        .digest("hex");
+    },
     async generate<O extends Json>(
       request: GenerateRequest<O>,
-      callOptions?: CallOptions,
+      callOptions?: GenerationCallOptions,
     ) {
       calls.assertOpen();
       const model = binding(request.model);
       const prepared = prepareGeneration(model, request);
+      const attempts = attemptsFor(callOptions);
       return calls.run(
         "models.generate",
         model.identity,
@@ -136,7 +189,7 @@ export function createModels(options: ModelsOptions): Models {
             prepared,
             call,
             model.identity,
-            calls.attempts,
+            attempts,
             telemetry,
             () => language(model, call, telemetry, prepared.openaiApi),
           );
@@ -145,12 +198,16 @@ export function createModels(options: ModelsOptions): Models {
     },
     stream<O extends Json>(
       request: GenerateRequest<O>,
-      callOptions?: CallOptions,
+      callOptions?: GenerationCallOptions,
     ) {
       const captured = (() => {
         try {
           const model = binding(request.model);
-          return { model, prepared: prepareGeneration(model, request, true) };
+          return {
+            model,
+            prepared: prepareGeneration(model, request, true),
+            attempts: attemptsFor(callOptions),
+          };
         } catch (error) {
           return { error };
         }
@@ -159,14 +216,14 @@ export function createModels(options: ModelsOptions): Models {
         "models.stream",
         async function* (call) {
           if ("error" in captured) throw captured.error;
-          const { model, prepared } = captured;
+          const { model, prepared, attempts } = captured;
           const telemetry = observe(model);
           return yield* queuedStream(calls, call, model.identity, () =>
             streamGeneration(
               prepared,
               call,
               model.identity,
-              calls.attempts,
+              attempts,
               telemetry,
               () => language(model, call, telemetry, prepared.openaiApi),
             ),
@@ -225,42 +282,13 @@ export function createModels(options: ModelsOptions): Models {
       request: TaskRequest<RawI>,
       callOptions?: CallOptions,
     ): Promise<Completed<O>> {
-      const prompts = (defaultPrompts ??= createPrompts(
-        options.resourceRoot === undefined
-          ? {}
-          : { resourceRoot: options.resourceRoot },
-      ));
-      const preparation = (defaultPreparation ??= createPreparation({
-        models,
-        prompts,
-        ...(options.adapters === undefined
-          ? {}
-          : { adapters: options.adapters }),
-      }));
-      const defaultModel =
-        request.model ??
-        options.routes?.[task.id]?.model ??
-        (bound.size === 1 ? bound.keys().next().value : undefined);
-      const tasks = createTasks({
-        models,
-        prompts,
-        preparation,
-        routes: {
-          ...(options.routes ?? {}),
-          ...(defaultModel === undefined
-            ? {}
-            : {
-                [task.id]: {
-                  ...options.routes?.[task.id],
-                  model: defaultModel,
-                },
-              }),
-        },
-        ...(options.diagnostics === undefined
-          ? {}
-          : { diagnostics: options.diagnostics }),
-      });
-      return tasks.run(task, request, callOptions);
+      const selected =
+        request.model === undefined &&
+        !Object.hasOwn(routes, task.id) &&
+        soleBinding !== undefined
+          ? { ...request, model: soleBinding }
+          : request;
+      return (defaultTasks ??= taskExecutor()).run(task, selected, callOptions);
     },
     close() {
       return (closing ??= (async () => {

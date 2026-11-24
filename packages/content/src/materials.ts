@@ -121,7 +121,10 @@ export function createMaterials(
     database.requireWritable(operation);
     const scope = openCall(operation, options);
     try {
-      const captured = captureImport(input, limits.maxInlineBytes);
+      const captured = captureImport(
+        input,
+        Math.min(limits.maxInlineBytes, limits.maxImportBytes),
+      );
       const artifact = await importArtifact(cas, captured, limits, {
         signal: scope.signal,
       });
@@ -206,7 +209,6 @@ export function createMaterials(
           ref,
           utf8Text(bytes, artifact),
           artifact.mediaType === "text/markdown",
-          artifact.blob,
         );
         scope.throwIfAborted();
         return blocks;

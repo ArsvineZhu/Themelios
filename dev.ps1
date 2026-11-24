@@ -1,12 +1,11 @@
 ﻿# Dot-source this file: . ./dev.ps1 env
-param([ValidateSet('env', 'init', 'status')][string]$Action = 'env')
+param([ValidateSet('env', 'bootstrap', 'init', 'status')][string]$Action = 'env')
 $themeliosRepoRoot = $PSScriptRoot
 $themeliosTempRoot = Join-Path $themeliosRepoRoot 'temp'
 $themeliosEnvPaths = @{
     TEMP = 'runtime'; TMP = 'runtime'; TMPDIR = 'runtime'
     UV_CACHE_DIR = 'cache/uv'; PIP_CACHE_DIR = 'cache/pip'
     UV_PROJECT_ENVIRONMENT = 'venvs/themelios'; UV_PYTHON_INSTALL_DIR = 'tools/python'
-    CARGO_HOME = 'tools/cargo-home'; CARGO_TARGET_DIR = 'build/native'
     BUN_INSTALL_CACHE_DIR = 'cache/bun'
     npm_config_cache = 'cache/npm'; XDG_CACHE_HOME = 'cache/xdg'
     RUFF_CACHE_DIR = 'cache/ruff'; PYTHONPYCACHEPREFIX = 'cache/python-bytecode'
@@ -29,11 +28,15 @@ foreach ($themeliosBin in @($themeliosPythonScripts, (Join-Path $themeliosTempRo
 $env:ZVEC_GREP_HOME = Join-Path $themeliosTempRoot 'tools/zvec-grep/runtime'
 $env:ZVEC_GREP_MODEL_CACHE = Join-Path $themeliosTempRoot 'tools/zvec-grep/models'
 if ($Action -eq 'env') { return }
-$themeliosUv = Get-Command uv -CommandType Application -ErrorAction Stop | Select-Object -First 1
 Push-Location -LiteralPath $themeliosRepoRoot
 try {
-    & $themeliosUv.Source run --no-project --with tomlkit python -B (Join-Path $themeliosRepoRoot 'scripts/workspace.py') $Action
-    if ($LASTEXITCODE -ne 0) { throw '工作区初始化失败。' }
+    $themeliosWorkspace = Join-Path $themeliosRepoRoot 'scripts/workspace.py'
+    if ($Action -eq 'bootstrap') {
+        python -B $themeliosWorkspace bootstrap
+    } else {
+        uv run --no-project --with tomlkit python -B $themeliosWorkspace $Action
+    }
+    if ($LASTEXITCODE -ne 0) { throw "Workspace cmd: $Action  failed。" }
 } finally {
     Pop-Location
 }

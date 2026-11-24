@@ -100,3 +100,54 @@ test("a reloaded session leaves captured calls on their original settings and cl
   }
   expect(closed).toEqual(["stream", 60000, "stream", 6500]);
 });
+
+test("a failed resource registration leaves queued updates and retries on the same generation", async () => {
+  await mkdir(join("temp", "work"), { recursive: true });
+  const root = await mkdtemp(join("temp", "work", "runtime-registration-"));
+  const entered = Promise.withResolvers<void>();
+  const first = Promise.withResolvers<void>();
+  const closed: string[] = [];
+  const instance = Installation.at(root, {
+    id: "test.registration",
+    formatId: "test.registration",
+    settings: runtimeSettings,
+    async provision() {},
+    async open(env) {
+      return {
+        bind(fail: boolean) {
+          return env.bindResource(
+            (settings) => settings.locale,
+            async ({ settings }) => {
+              if (fail && settings.locale === "zh-CN") {
+                entered.resolve();
+                await first.promise;
+              }
+              return {
+                locale: settings.locale,
+                close: () => {
+                  closed.push(settings.locale);
+                },
+              };
+            },
+          );
+        },
+      };
+    },
+  }).instance("default");
+
+  await instance.init();
+  const session = await instance.open();
+  try {
+    const failed = session.api.bind(true).catch((error: unknown) => error);
+    await entered.promise;
+    const updated = session.configuration.set("/locale", "en");
+    const retried = session.api.bind(false);
+    first.reject(new Error("initial factory failed"));
+    expect(await failed).toMatchObject({ message: "initial factory failed" });
+    await updated;
+    expect((await retried).get().locale).toBe("en");
+  } finally {
+    await session.close();
+  }
+  expect(closed).toEqual(["en"]);
+});

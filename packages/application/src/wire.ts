@@ -1,13 +1,15 @@
-import type { AcceptInput, Materials, Origin } from "@themelios/content";
+import { originSchema, type AcceptInput } from "@themelios/content";
 import {
   artifactRefSchema,
   instantSchema,
   jsonSchema,
-  parseValue,
+  mediaTypeSchema,
   preparedRepresentationSchema,
+  producerSchema,
   rangeSchema,
-  type ArtifactRef,
-  type CallOptions,
+  representationCoverageSchema,
+  resultOutputNameSchema,
+  sourceCoverageSchema,
   type Completed,
   type ErrorInfo,
   type InlineMaterial,
@@ -17,9 +19,11 @@ import {
   type ProducedFile,
   type Producer,
   type Range,
+  type RepresentationCoverage,
   type SavedFile,
   type SavedResult,
   type Selection,
+  type SourceCoverage,
 } from "@themelios/core";
 import {
   modelNameSchema,
@@ -31,58 +35,13 @@ import {
 import { sourceEntrySchema } from "@themelios/models/tasks";
 import { z } from "zod";
 
-export const wireArtifactRefSchema = artifactRefSchema;
-
-export const mediaTypeSchema = z
-  .string()
-  .regex(/^[\w!#$&^.+-]+\/[\w!#$&^.+-]+$/);
-
-export const wireOriginSchema = z.strictObject({
-  kind: z.enum(["file", "url", "application"]),
-  locator: z.string().min(1).optional(),
-  capturedAt: instantSchema,
-  metadata: jsonSchema.optional(),
-});
-
-export interface WireProducer {
-  kind: "model" | "transform" | "application";
-  name: string;
-  version?: string | undefined;
-  details?: Json | undefined;
-}
-
-const wireProducerSchema: z.ZodType<WireProducer> = z.strictObject({
-  kind: z.enum(["model", "transform", "application"]),
-  name: z.string().min(1),
-  version: z.string().min(1).optional(),
-  details: jsonSchema.optional(),
-});
-
-function toProducer(producer: WireProducer): Producer {
-  return {
-    kind: producer.kind,
-    name: producer.name,
-    ...(producer.version === undefined ? {} : { version: producer.version }),
-    ...(producer.details === undefined ? {} : { details: producer.details }),
-  };
-}
-
-export function toOrigin(origin: z.infer<typeof wireOriginSchema>): Origin {
-  return {
-    kind: origin.kind,
-    capturedAt: origin.capturedAt,
-    ...(origin.locator === undefined ? {} : { locator: origin.locator }),
-    ...(origin.metadata === undefined ? {} : { metadata: origin.metadata }),
-  };
-}
-
 export interface WireSelection {
   ref: string;
   range?: Range | undefined;
 }
 
 export const wireSelectionSchema: z.ZodType<WireSelection> = z.strictObject({
-  ref: wireArtifactRefSchema,
+  ref: artifactRefSchema,
   range: rangeSchema.optional(),
 });
 
@@ -99,13 +58,14 @@ const wireInlineSchema = z.strictObject({
 });
 
 export const wireAcceptSchema = wireInlineSchema.extend({
-  origin: wireOriginSchema.optional(),
+  origin: originSchema.optional(),
 });
 
 export interface WireProducedFile {
   name: string;
   material: WireInlineMaterial | WireSelection;
   sourceIndices: number[];
+  coverage?: RepresentationCoverage | undefined;
 }
 
 export interface WireResultOutput {
@@ -122,13 +82,14 @@ export interface WireInputUse {
   source: WireMaterial;
   delivered: WireMaterial[];
   role: "primary" | "context";
+  coverage?: SourceCoverage | undefined;
 }
 
 export interface WireCompleted {
   value: Json;
   inputs: WireInputUse[];
   files: WireProducedFile[];
-  producer: WireProducer;
+  producer: Producer;
   representation?: z.infer<typeof wireRepresentationSchema> | undefined;
 }
 
@@ -154,7 +115,7 @@ export type WireBatchItemResult =
 export interface WirePreview {
   model: string;
   messages: Preview["messages"];
-  sources: { entries: z.infer<typeof sourceEntrySchema>[] };
+  sources: { entries: Preview["sources"]["entries"] };
   pending: Preview["pending"];
   taskSchema?: Json;
   sentSchema?: Json;
@@ -169,7 +130,7 @@ export const wireCompletedSchema: z.ZodType<WireCompleted> = z.lazy(() =>
     value: jsonSchema,
     inputs: z.array(wireInputUseSchema),
     files: z.array(wireProducedFileSchema),
-    producer: wireProducerSchema,
+    producer: producerSchema,
     representation: wireRepresentationSchema.optional(),
   }),
 );
@@ -180,8 +141,8 @@ const wireMaterialSchema: z.ZodType<WireMaterial> = z.lazy(() =>
     z.strictObject({ inline: wireInlineSchema }),
     z.strictObject({
       resultOutput: z.strictObject({
-        result: z.union([wireArtifactRefSchema, wireCompletedSchema]),
-        output: z.string().min(1).optional(),
+        result: z.union([artifactRefSchema, wireCompletedSchema]),
+        output: resultOutputNameSchema.optional(),
       }),
     }),
   ]),
@@ -192,6 +153,7 @@ const wireInputUseSchema: z.ZodType<WireInputUse> = z.lazy(() =>
     source: wireMaterialSchema,
     delivered: z.array(wireMaterialSchema),
     role: z.enum(["primary", "context"]),
+    coverage: sourceCoverageSchema.optional(),
   }),
 );
 
@@ -199,28 +161,31 @@ const wireProducedFileSchema: z.ZodType<WireProducedFile> = z.strictObject({
   name: z.string().min(1),
   material: z.union([wireSelectionSchema, wireInlineSchema]),
   sourceIndices: z.array(z.int().nonnegative()),
+  coverage: representationCoverageSchema.optional(),
 });
 
 const savedFileSchema: z.ZodType<SavedFile> = z.strictObject({
   material: z.strictObject({
-    ref: wireArtifactRefSchema,
+    ref: artifactRefSchema,
     range: rangeSchema.optional(),
   }) as z.ZodType<Selection>,
   sourceIndices: z.array(z.int().nonnegative()),
+  coverage: representationCoverageSchema.optional(),
 });
 
 export const wireSavedSchema = z.strictObject({
-  ref: wireArtifactRefSchema,
+  ref: artifactRefSchema,
   value: jsonSchema,
   inputs: z.array(
     z.strictObject({
       source: wireSelectionSchema,
       delivered: z.array(wireSelectionSchema),
       role: z.enum(["primary", "context"]),
+      coverage: sourceCoverageSchema.optional(),
     }),
   ),
   files: z.record(z.string(), savedFileSchema),
-  producer: wireProducerSchema,
+  producer: producerSchema,
 });
 
 const wireTaskMaterialSchema: z.ZodType<WireTaskMaterial> = z.strictObject({
@@ -236,14 +201,10 @@ export const wirePreviewInputSchema = z.strictObject({
   parameters: modelParametersSchema.optional(),
 });
 
-export const wireRunTaskSchema: z.ZodType<WireRunTaskInput> = z.strictObject({
-  task: modelNameSchema,
-  variables: jsonSchema.optional(),
-  materials: z.array(wireTaskMaterialSchema),
-  model: modelNameSchema.optional(),
-  parameters: modelParametersSchema.optional(),
-  persist: z.boolean().optional(),
-});
+export const wireRunTaskSchema: z.ZodType<WireRunTaskInput> =
+  wirePreviewInputSchema.extend({
+    persist: z.boolean().optional(),
+  });
 
 export const wireResultSchema = z.union([wireSavedSchema, wireCompletedSchema]);
 
@@ -277,159 +238,108 @@ export const wirePreviewSchema = z.strictObject({
   sentSchema: jsonSchema.optional(),
 });
 
-export function parseWireInline(value: unknown): AcceptInput {
-  const input = parseValue(
-    wireAcceptSchema,
-    value,
-    "transport.invalid_request",
-  );
+export function decodeWireAccept(
+  input: z.output<typeof wireAcceptSchema>,
+): AcceptInput {
   return {
     bytes: decodeBase64(input.bytes),
     mediaType: input.mediaType,
     ...(input.name === undefined ? {} : { name: input.name }),
-    ...(input.origin === undefined ? {} : { origin: toOrigin(input.origin) }),
+    ...(input.origin === undefined ? {} : { origin: input.origin }),
   };
 }
 
-export interface WireCodec {
-  resolveSelection(selection: WireSelection): Selection;
-  decodeCompleted(wire: WireCompleted): Promise<Completed>;
-  decodeMaterial(wire: WireMaterial): Promise<Material>;
-  encodeCompleted(completed: Completed): WireCompleted;
-  encodePreview(preview: Preview): WirePreview;
+function decodeSelection({ ref, range }: WireSelection): Selection {
+  return range === undefined ? { ref } : { ref, range };
 }
 
-export function createWireCodec(
-  content: Pick<Materials, "resolve"> & {
-    readResult(ref: ArtifactRef, options?: CallOptions): Promise<SavedResult>;
-  },
-  options?: CallOptions,
-): WireCodec {
-  function resolveSelection(selection: WireSelection): Selection {
-    const ref = content.resolve(selection.ref);
-    return selection.range === undefined
-      ? { ref }
-      : { ref, range: selection.range };
-  }
-
-  async function decodeMaterial(wire: WireMaterial): Promise<Material> {
-    if ("inline" in wire) return decodeInline(wire.inline);
-    if ("resultOutput" in wire) {
-      const target = wire.resultOutput.result;
-      const result =
-        typeof target === "string"
-          ? await content.readResult(content.resolve(target), options)
-          : await decodeCompleted(target);
-      return {
-        result,
-        ...(wire.resultOutput.output === undefined
-          ? {}
-          : { output: wire.resultOutput.output }),
-      };
-    }
-    return resolveSelection(wire);
-  }
-
-  async function decodeInputUse(use: WireInputUse): Promise<InputUse> {
+function decodeMaterial(wire: WireMaterial): Material {
+  if ("inline" in wire) return decodeInline(wire.inline);
+  if ("resultOutput" in wire) {
+    const { result, output } = wire.resultOutput;
     return {
-      source: await decodeMaterial(use.source),
-      delivered: await Promise.all(use.delivered.map(decodeMaterial)),
-      role: use.role,
+      result: typeof result === "string" ? result : decodeCompleted(result),
+      ...(output === undefined ? {} : { output }),
     };
   }
+  return decodeSelection(wire);
+}
 
-  async function decodeCompleted(wire: WireCompleted): Promise<Completed> {
-    return {
-      value: wire.value,
-      inputs: await Promise.all(wire.inputs.map(decodeInputUse)),
-      files: wire.files.map((file): ProducedFile => ({
-        name: file.name,
-        material:
-          "bytes" in file.material
-            ? decodeInline(file.material)
-            : resolveSelection(file.material),
-        sourceIndices: file.sourceIndices,
-      })),
-      producer: toProducer(wire.producer),
-      ...(wire.representation
-        ? {
-            representation: preparedRepresentationSchema.parse(
-              wire.representation,
-            ),
-          }
-        : {}),
-    };
-  }
-
-  function encodeMaterial(material: Material): WireMaterial {
-    if ("bytes" in material) return { inline: encodeInline(material) };
-    if ("result" in material) {
-      const target = material.result;
-      return {
-        resultOutput: {
-          result: "ref" in target ? target.ref : encodeCompleted(target),
-          ...(material.output === undefined ? {} : { output: material.output }),
-        },
-      };
-    }
-    return material;
-  }
-
-  function encodeCompleted(completed: Completed): WireCompleted {
-    return {
-      value: completed.value,
-      inputs: completed.inputs.map((use) => ({
-        source: encodeMaterial(use.source),
-        delivered: use.delivered.map(encodeMaterial),
-        role: use.role,
-      })),
-      files: completed.files.map((file) => ({
-        name: file.name,
-        material:
-          "bytes" in file.material
-            ? encodeInline(file.material)
-            : file.material,
-        sourceIndices: [...file.sourceIndices],
-      })),
-      producer: completed.producer,
-      ...(completed.representation
-        ? { representation: completed.representation }
-        : {}),
-    };
-  }
-
+export function decodeCompleted(wire: WireCompleted): Completed {
+  const { representation, ...node } = wire;
   return {
-    resolveSelection,
-    decodeCompleted,
-    decodeMaterial,
-    encodeCompleted,
-    encodePreview(preview): WirePreview {
-      return {
-        model: preview.model,
-        messages: preview.messages,
-        sources: { entries: [...preview.sources.entries] },
-        pending: preview.pending,
-        ...(preview.taskSchema === undefined
-          ? {}
-          : { taskSchema: preview.taskSchema }),
-        ...(preview.sentSchema === undefined
-          ? {}
-          : { sentSchema: preview.sentSchema }),
-      };
-    },
+    ...node,
+    inputs: wire.inputs.map((use): InputUse => ({
+      ...use,
+      source: decodeMaterial(use.source),
+      delivered: use.delivered.map(decodeMaterial),
+    })),
+    files: wire.files.map((file): ProducedFile => ({
+      ...file,
+      material:
+        "bytes" in file.material
+          ? decodeInline(file.material)
+          : decodeSelection(file.material),
+    })),
+    ...(representation === undefined
+      ? {}
+      : {
+          representation: {
+            ...representation,
+            source: decodeSelection(representation.source),
+          },
+        }),
   };
 }
 
-export async function decodeTaskMaterials(
-  codec: WireCodec,
+function encodeMaterial(material: Material): WireMaterial {
+  if ("bytes" in material) return { inline: encodeInline(material) };
+  if ("result" in material) {
+    const target = material.result;
+    return {
+      resultOutput: {
+        result: typeof target === "string" ? target : encodeCompleted(target),
+        ...(material.output === undefined ? {} : { output: material.output }),
+      },
+    };
+  }
+  return material;
+}
+
+export function encodeCompleted(completed: Completed): WireCompleted {
+  return {
+    value: completed.value,
+    inputs: completed.inputs.map((use) => ({
+      source: encodeMaterial(use.source),
+      delivered: use.delivered.map(encodeMaterial),
+      role: use.role,
+      ...(use.coverage === undefined ? {} : { coverage: use.coverage }),
+    })),
+    files: completed.files.map((file) => ({
+      name: file.name,
+      material:
+        "bytes" in file.material ? encodeInline(file.material) : file.material,
+      sourceIndices: [...file.sourceIndices],
+      ...(file.coverage === undefined ? {} : { coverage: file.coverage }),
+    })),
+    producer: completed.producer,
+    ...(completed.representation
+      ? { representation: completed.representation }
+      : {}),
+  };
+}
+
+export function encodePreview(preview: Preview): WirePreview {
+  return { ...preview, sources: { entries: preview.sources.entries } };
+}
+
+export function decodeTaskMaterials(
   items: readonly WireTaskMaterial[],
-): Promise<TaskMaterial[]> {
-  return Promise.all(
-    items.map(async (item) => {
-      const source = await codec.decodeMaterial(item.source);
-      return item.role === undefined ? { source } : { source, role: item.role };
-    }),
-  );
+): TaskMaterial[] {
+  return items.map(({ source, role }) => ({
+    source: decodeMaterial(source),
+    ...(role === undefined ? {} : { role }),
+  }));
 }
 
 function encodeInline(material: InlineMaterial): WireInlineMaterial {
@@ -449,5 +359,5 @@ function decodeInline(material: WireInlineMaterial): InlineMaterial {
 }
 
 function decodeBase64(text: string): Uint8Array {
-  return Uint8Array.from(Buffer.from(text, "base64"));
+  return Buffer.from(text, "base64");
 }

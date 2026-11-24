@@ -5,7 +5,12 @@ import {
 } from "@themelios/application";
 import { createSecrets, type Session } from "@themelios/runtime";
 import type { Principal } from "@themelios/runtime/operations";
-import { serveApplication } from "@themelios/transports";
+import {
+  serveApplication,
+  type ApplicationListeners,
+} from "@themelios/transports";
+
+type Workbench = ApplicationApi<ApplicationSettings>;
 
 export const localPrincipal: Principal = {
   id: "local",
@@ -18,6 +23,7 @@ export async function serve(
   signal?: AbortSignal,
 ) {
   const current = () => session.configuration.snapshot();
+  const { allowOperations, grpc, http, mcp } = current().transports;
   const policy = () => {
     const config = current().transports;
     return {
@@ -27,7 +33,12 @@ export async function serve(
       allowedOrigins: config.http.allowedOrigins,
     };
   };
-  const common = {
+  const published = {
+    operations: standardOperations<Workbench>(),
+    ...(allowOperations === undefined ? {} : { allowOperations }),
+    locale: () => current().locale,
+  };
+  const tools = {
     name: "Themelios",
     resource: {
       name: "material",
@@ -35,43 +46,56 @@ export async function serve(
       operation: "materials.read",
       linksFrom: ["materials.accept", "materials.inspect"],
     },
-    operations: standardOperations<ApplicationApi<ApplicationSettings>>(),
-    locale: () => current().locale,
-    agentRefs: (app: ApplicationApi<ApplicationSettings>) => ({
+    agentRefs: (app: Workbench) => ({
       resolveRef: app.materials.resolve,
       formatRef: app.materials.agentRef,
     }),
   };
-  const { http, mcp } = current().transports;
-  await serveApplication(session, {
-    ...(signal ? { signal } : {}),
-    ...(mode === "stdio" || mcp.mode === "stdio"
-      ? {
-          stdio: { ...common, principal: localPrincipal, limits: policy },
-        }
-      : {}),
-    ...(mode === "serve" && http.listen
-      ? {
-          http: {
-            address: http.listen,
-            options: {
-              ...common,
-              policy,
-              secrets: createSecrets({
-                baseDir: session.instance.paths.config,
-              }),
-              enableMcp: mcp.mode === "http",
-            },
-          },
-        }
-      : {}),
-    ...(mode === "serve"
-      ? {
-          ready: (endpoints) =>
-            process.stderr.write(
-              JSON.stringify({ event: "themelios.ready", endpoints }) + "\n",
-            ),
-        }
-      : {}),
-  });
+  const listeners: ApplicationListeners<Workbench> = signal ? { signal } : {};
+  if (mode === "stdio" || mcp.mode === "stdio")
+    listeners.stdio = {
+      ...published,
+      ...tools,
+      principal: {
+        ...localPrincipal,
+        permissions: mcp.localPermissions ?? localPrincipal.permissions,
+      },
+      limits: policy,
+    };
+  if (mode === "stdio") return serveApplication(session, listeners);
+
+  const remote = {
+    ...published,
+    policy,
+    secrets: createSecrets({ baseDir: session.instance.paths.config }),
+  };
+  if (http.listen)
+    listeners.http = {
+      address: http.listen,
+      ...(http.idleTimeoutSeconds === undefined
+        ? {}
+        : { idleTimeoutSeconds: http.idleTimeoutSeconds }),
+      options: { ...remote, ...tools, enableMcp: mcp.mode === "http" },
+    };
+  if (grpc.listen)
+    listeners.grpc = {
+      address: grpc.listen,
+      ...(grpc.tls === undefined ? {} : { tls: grpc.tls }),
+      options: remote,
+    };
+  listeners.ready = (endpoints) => {
+    const unconfigured =
+      (endpoints.http || endpoints.grpc) &&
+      !Object.keys(policy().authTokens).length;
+    process.stderr.write(
+      JSON.stringify({
+        event: "themelios.ready",
+        endpoints,
+        ...(unconfigured
+          ? { configureBearerTokens: "/transports/authTokens" }
+          : {}),
+      }) + "\n",
+    );
+  };
+  await serveApplication(session, listeners);
 }

@@ -1,12 +1,12 @@
 import { isDeepStrictEqual } from "node:util";
 import writeAtomic from "write-file-atomic";
-import type { Json } from "@themelios/core";
+import { appError, AppError, errorCode, type Json } from "@themelios/core";
 import type {
   Configuration,
   ConfigurationChange,
   SettingExplanation,
 } from "../settings.js";
-import { errno, failure } from "../failure.js";
+import type { ResourceUpdate } from "../resources.js";
 import {
   type Candidate,
   type ConfigurationFiles,
@@ -17,18 +17,13 @@ import {
   readLayers,
 } from "./load.js";
 import { SettingFields } from "./definition.js";
-import { at, freeze, leafPaths, pathParts, pointer, setAt } from "./path.js";
-
-interface Prepared {
-  activate(): void;
-  discard(): Promise<void>;
-}
+import { at, leafPaths, pathParts, pointer, setAt } from "./path.js";
 
 type ManagedEdit = { path: string; value: Json | undefined };
 
 export class ActiveConfiguration<S> implements Configuration<S> {
   #desired: Candidate<S>;
-  #active: Readonly<S>;
+  #active: Candidate<S>;
   #pending = new Set<string>();
   #tail: Promise<unknown> = Promise.resolve();
   #closing = false;
@@ -39,14 +34,14 @@ export class ActiveConfiguration<S> implements Configuration<S> {
     initial: Candidate<S>,
     readonly mode: "read-write" | "read-only",
     readonly current: () => Readonly<S> | undefined,
-    readonly prepare: (settings: Readonly<S>) => Promise<Prepared>,
+    readonly prepare: (settings: Readonly<S>) => Promise<ResourceUpdate>,
   ) {
     this.#desired = initial;
-    this.#active = initial.value;
+    this.#active = initial;
   }
 
   snapshot(): Readonly<S> {
-    return this.current() ?? this.#active;
+    return this.current() ?? this.#active.value;
   }
 
   describe(path?: string) {
@@ -57,13 +52,13 @@ export class ActiveConfiguration<S> implements Configuration<S> {
     const parts = pathParts(path);
     const field = this.fields.describeFields(path)[0];
     if (!field || field.path !== pointer(parts))
-      throw failure("config.unknown_setting", { path });
+      throw appError("config.unknown_setting", { details: { path } });
     const value = (input: Json) =>
       field.metadata.sensitive && field.metadata.format !== "credential"
         ? "[REDACTED]"
         : structuredClone(input);
     const desired = at(asJson(this.#desired.value), parts);
-    const effective = at(asJson(this.#active), parts);
+    const effective = at(asJson(this.#active.value), parts);
     return {
       field,
       contributions: contributions(this.#desired, this.files, parts).map(
@@ -90,20 +85,26 @@ export class ActiveConfiguration<S> implements Configuration<S> {
     return this.#tail;
   }
 
-  #enqueue(edit?: {
-    path: string;
-    value: Json | undefined;
-  }): Promise<ConfigurationChange> {
+  /** Serializes initial resource registration with generation updates. */
+  serialize<T>(work: () => Promise<T>): Promise<T> {
     if (this.#closing)
-      return Promise.reject(failure("runtime.closed", { state: "closing" }));
-    if (edit && this.mode === "read-only") {
       return Promise.reject(
-        failure("runtime.read_only", { operation: "configuration.update" }),
+        appError("runtime.closed", { details: { state: "closing" } }),
       );
-    }
-    const result = this.#tail.then(() => this.#update(edit));
+    const result = this.#tail.then(work);
     this.#tail = result.catch(() => undefined);
     return result;
+  }
+
+  #enqueue(edit?: ManagedEdit): Promise<ConfigurationChange> {
+    if (edit && this.mode === "read-only") {
+      return Promise.reject(
+        appError("runtime.read_only", {
+          details: { operation: "configuration.update" },
+        }),
+      );
+    }
+    return this.serialize(() => this.#update(edit));
   }
 
   async #readDesired(edit?: ManagedEdit) {
@@ -118,45 +119,42 @@ export class ActiveConfiguration<S> implements Configuration<S> {
       }
       editLayer(layers.managed, pathParts(edit.path), edit.value);
     }
-    let desired = loadCandidate(this.fields, this.files, layers);
+    const desired = loadCandidate(this.fields, this.files, layers);
     const changed = this.#changed(this.#desired.value, desired.value);
-    if (
-      edit &&
-      edit.value !== undefined &&
-      !changed.length &&
-      previousManaged
-    ) {
-      desired = { ...desired, layers: { ...layers, managed: previousManaged } };
-    }
     return { desired, changed, previousManaged };
   }
 
-  #effective(desired: Readonly<S>): Readonly<S> {
-    const different = this.#changed(this.#active, desired);
-    const effective = structuredClone(desired) as Record<string, Json>;
-    for (const path of different) {
-      const parts = pathParts(path);
-      if (this.fields.field(parts)?.metadata.effect === "restart") {
-        setAt(effective, parts, at(asJson(this.#active), parts));
+  #effective(desired: Candidate<S>): Candidate<S> {
+    const deferred = this.#changed(this.#active.value, desired.value)
+      .map(pathParts)
+      .filter(
+        (parts) => this.fields.field(parts)?.metadata.effect === "restart",
+      );
+    if (!deferred.length) return desired;
+    const layers = structuredClone(desired.layers);
+    // Keep each deferred setting's inputs and file provenance together.
+    for (const layer of ["installation", "instance", "managed"] as const) {
+      for (const parts of deferred) {
+        setAt(layers[layer], parts, at(this.#active.layers[layer], parts));
       }
     }
-    const mixed = effective as Readonly<S>;
-    const issues = this.fields.definition.validateEffective?.(mixed) ?? [];
-    if (
-      issues.length ||
-      !this.fields.definition.schema.safeParse(mixed).success
-    ) {
+    try {
+      return loadCandidate(this.fields, this.files, layers);
+    } catch (error) {
+      if (!(error instanceof AppError) || error.code !== "config.invalid")
+        throw error;
       return this.#active;
     }
-    return freeze(mixed);
   }
 
   async #update(edit?: ManagedEdit): Promise<ConfigurationChange> {
     const { desired, changed, previousManaged } = await this.#readDesired(edit);
-    const active = this.#effective(desired.value);
-    const applied = this.#changed(this.#active, active);
-    const pending = new Set(this.#changed(active, desired.value));
-    const prepared = applied.length ? await this.prepare(active) : undefined;
+    const active = this.#effective(desired);
+    const applied = this.#changed(this.#active.value, active.value);
+    const pending = new Set(this.#changed(active.value, desired.value));
+    const prepared = applied.length
+      ? await this.prepare(active.value)
+      : undefined;
     try {
       if (edit && !isDeepStrictEqual(previousManaged, desired.layers.managed)) {
         await writeAtomic(
@@ -166,11 +164,13 @@ export class ActiveConfiguration<S> implements Configuration<S> {
       }
     } catch (error) {
       await prepared?.discard();
-      throw failure(
-        "config.write_failed",
-        { file: this.files.managed, reason: errno(error) ?? "write_failed" },
-        error,
-      );
+      throw appError("config.write_failed", {
+        details: {
+          file: this.files.managed,
+          reason: errorCode(error) ?? "write_failed",
+        },
+        cause: error,
+      });
     }
     this.#desired = desired;
     this.#active = active;

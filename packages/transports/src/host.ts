@@ -1,67 +1,164 @@
-import { appError, type MessageParams } from "@themelios/core";
+import { appError, toAppError, type MessageParams } from "@themelios/core";
 import type { Session } from "@themelios/runtime";
+import { startGrpcServer } from "./grpc/index.js";
 import { createHttpHandler } from "./http/server.js";
 import { serveMcpStdio } from "./mcp/server.js";
-import type { McpStdioOptions, RemoteTransportOptions } from "./types.js";
+import type {
+  GrpcListener,
+  McpStdioOptions,
+  RemoteOperationOptions,
+  RemoteTransportOptions,
+} from "./types.js";
+
+const defaultHttpIdleSeconds = 180;
+
+export interface ApplicationListeners<App> {
+  signal?: AbortSignal;
+  http?: {
+    address: { host: string; port: number };
+    options: RemoteTransportOptions<App>;
+    idleTimeoutSeconds?: number;
+  };
+  grpc?: GrpcListener & { options: RemoteOperationOptions<App> };
+  stdio?: McpStdioOptions<App>;
+  ready?: (endpoints: Readonly<Record<string, string>>) => void;
+}
+
+async function openHttp<App>(
+  app: App,
+  listener: NonNullable<ApplicationListeners<App>["http"]>,
+  defaults: Pick<RemoteTransportOptions<App>, "translate" | "languages">,
+) {
+  const { address, options } = listener;
+  const idle = listener.idleTimeoutSeconds ?? defaultHttpIdleSeconds;
+  const handler = createHttpHandler(app, { ...defaults, ...options });
+  try {
+    const server = Bun.serve({
+      hostname: address.host,
+      port: address.port,
+      idleTimeout: idle,
+      maxRequestBodySize: Number.MAX_SAFE_INTEGER,
+      fetch(request, server) {
+        return handler.fetch(request, (seconds) => {
+          if (idle > 0 && (seconds === 0 || seconds > idle))
+            server.timeout(request, seconds > 255 ? 0 : seconds);
+        });
+      },
+    });
+    const endpoints = {
+      http: server.url.href,
+      ...(options.enableMcp ? { mcp: new URL("/mcp", server.url).href } : {}),
+    };
+    return {
+      endpoints,
+      async close() {
+        await Promise.all([server.stop(true), handler.close()]);
+      },
+    };
+  } catch (error) {
+    await handler.close();
+    throw error;
+  }
+}
+
+async function publishEndpoints(
+  session: Pick<Session<unknown, unknown>, "setEndpoints">,
+  endpoints: Readonly<Record<string, string>>,
+) {
+  const advertised = { ...endpoints };
+  await session.setEndpoints((current) => ({ ...current, ...advertised }));
+  return async () => {
+    try {
+      await session.setEndpoints((current) =>
+        Object.fromEntries(
+          Object.entries(current).filter(
+            ([name, address]) => advertised[name] !== address,
+          ),
+        ),
+      );
+    } catch (error) {
+      // A closed session has already removed its owner record.
+      if (toAppError(error).code !== "runtime.closed") throw error;
+    }
+  };
+}
+
+interface OpenListener {
+  readonly endpoints: Readonly<Record<string, string>>;
+  readonly closed?: Promise<void>;
+  close(): void | Promise<void>;
+}
+
+/** Opens transports one at a time so the host can own each before starting the next. */
+async function* openListeners<App, S>(
+  session: Session<App, S>,
+  options: ApplicationListeners<App>,
+): AsyncGenerator<OpenListener> {
+  const translate = (locale: string, key: string, params?: MessageParams) =>
+    session.localize(key, params, locale);
+  const defaults = { translate, languages: session.languages };
+  if (options.stdio) {
+    const stdio = await serveMcpStdio(session.api, {
+      translate,
+      ...options.stdio,
+    });
+    yield {
+      endpoints: { mcp: "stdio" },
+      closed: stdio.closed,
+      close: () => stdio.close(),
+    };
+  }
+  if (options.http) yield await openHttp(session.api, options.http, defaults);
+  if (options.grpc) {
+    const { options: grpc, ...listen } = options.grpc;
+    const listener = await startGrpcServer(session.api, listen, {
+      ...defaults,
+      ...grpc,
+    });
+    yield {
+      endpoints: { grpc: listener.address },
+      close: () => listener.close(),
+    };
+  }
+}
 
 export async function serveApplication<App, S>(
   session: Session<App, S>,
-  options: {
-    signal?: AbortSignal;
-    http?: {
-      address: { host: string; port: number };
-      options: RemoteTransportOptions<App>;
-    };
-    stdio?: McpStdioOptions<App>;
-    ready?: (endpoints: Readonly<Record<string, string>>) => void;
-  },
+  options: ApplicationListeners<App>,
 ): Promise<void> {
   const signal = options.signal;
-  const translate = (locale: string, key: string, params?: MessageParams) =>
-    session.localize(key, params, locale);
+  if (signal?.aborted) return;
   const endpoints: Record<string, string> = {};
   const close: Array<() => void | Promise<void>> = [];
-  const done = Promise.withResolvers<void>();
-  const abort = () => done.resolve();
+  const done = Promise.withResolvers<{ error?: unknown }>();
+  let stopping = false;
+  let unpublish: (() => Promise<void>) | undefined;
+  const stop = (result: { error?: unknown } = {}) => {
+    stopping = true;
+    done.resolve(result);
+  };
+  const abort = () => stop();
   signal?.addEventListener("abort", abort, { once: true });
-  if (signal?.aborted) {
-    abort();
-    return;
-  }
   let hostingError: unknown;
   let cleanupErrors: unknown[] = [];
   try {
-    if (options.stdio) {
-      const stdio = await serveMcpStdio(session.api, {
-        translate,
-        ...options.stdio,
-      });
-      close.push(() => stdio.close());
-      endpoints.mcp = "stdio";
-      void stdio.closed.then(abort, done.reject);
+    for await (const listener of openListeners(session, options)) {
+      close.push(() => listener.close());
+      Object.assign(endpoints, listener.endpoints);
+      void listener.closed?.then(abort, (error) => stop({ error }));
+      if (stopping) break;
     }
-    if (options.http) {
-      const { address, options: http } = options.http;
-      const handler = createHttpHandler(session.api, { translate, ...http });
-      close.push(() => handler.close());
-      const listener = Bun.serve({
-        hostname: address.host,
-        port: address.port,
-        maxRequestBodySize: Number.MAX_SAFE_INTEGER,
-        fetch: handler.fetch,
-      });
-      close.push(() => listener.stop(true));
-      endpoints.http = listener.url.href;
-      if (http.enableMcp) endpoints.mcp = new URL("/mcp", listener.url).href;
+    if (!stopping) {
+      if (!close.length) {
+        throw appError("transport.invalid_request", {
+          details: { reason: "No listener configured" },
+        });
+      }
+      unpublish = await publishEndpoints(session, endpoints);
+      if (!stopping) options.ready?.(endpoints);
     }
-    if (!options.http && !options.stdio) {
-      throw appError("transport.invalid_request", {
-        details: { reason: "No listener configured" },
-      });
-    }
-    await session.setEndpoints(endpoints);
-    options.ready?.(endpoints);
-    await done.promise;
+    const result = await done.promise;
+    if ("error" in result) throw result.error;
   } catch (error) {
     hostingError = error;
   } finally {
@@ -72,6 +169,7 @@ export async function serveApplication<App, S>(
     cleanupErrors = shutdown.flatMap((item) =>
       item.status === "rejected" ? [item.reason] : [],
     );
+    await unpublish?.().catch((error) => cleanupErrors.push(error));
   }
   if (hostingError && !cleanupErrors.length) throw hostingError;
   if (hostingError) cleanupErrors.unshift(hostingError);

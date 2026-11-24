@@ -4,9 +4,15 @@ import type {
   SQLQueryBindings,
   Statement,
 } from "bun:sqlite";
-import type { CommitPoint, Instant } from "@themelios/core";
-import { commitPointSchema } from "@themelios/core";
-import { storageError } from "./errors.js";
+import {
+  appError,
+  blobRefSchema,
+  commitPointSchema,
+  type BlobRef,
+  type CommitPoint,
+  type Instant,
+} from "@themelios/core";
+import type { BlobInfo } from "./cas.js";
 
 export type BorrowedStatement<Row, Params extends SQLQueryBindings[]> = Pick<
   Statement<Row, Params>,
@@ -36,6 +42,43 @@ export interface WriteTransaction {
   };
   readonly seq: bigint;
   readonly recordedAt: Instant;
+  /** Register a published CAS object and return its address for an owning row's foreign key. */
+  registerBlob(blob: BlobInfo): BlobRef;
+}
+
+export function registerBlob(
+  sql: WriteTransaction["sql"],
+  blob: BlobInfo,
+): BlobRef {
+  const { ref, sizeBytes } = blob;
+  if (!blobRefSchema.safeParse(ref).success)
+    throw appError("storage.blob_ref_invalid", { details: { blobRef: ref } });
+  if (!Number.isSafeInteger(sizeBytes) || sizeBytes < 0)
+    throw appError("storage.options_invalid", {
+      details: { field: "sizeBytes" },
+    });
+  if (
+    sql.run(
+      "INSERT INTO blobs (ref, size_bytes) VALUES (?, ?) ON CONFLICT(ref) DO NOTHING",
+      ref,
+      sizeBytes,
+    ).changes === 0
+  ) {
+    const entry = sql
+      .query<{ size_bytes: bigint }>(
+        "SELECT size_bytes FROM blobs WHERE ref = ?",
+      )
+      .get(ref)!;
+    if (entry.size_bytes !== BigInt(sizeBytes))
+      throw appError("storage.blob_corrupt", {
+        details: {
+          blobRef: ref,
+          expected: Number(entry.size_bytes),
+          actual: sizeBytes,
+        },
+      });
+  }
+  return ref;
 }
 
 export function borrowSql(
@@ -108,7 +151,7 @@ export function synchronousResult<T>(value: T, operation: "read" | "write"): T {
   ) {
     // Observe rejection from async callbacks resumed after the transaction closes.
     if (value instanceof Promise) void value.catch(() => undefined);
-    throw storageError("storage.async_transaction", { operation });
+    throw appError("storage.async_transaction", { details: { operation } });
   }
   return value;
 }
@@ -117,9 +160,11 @@ export function resolveCut(tx: ReadTransaction, at?: CommitPoint): bigint {
   if (at === undefined) return tx.cut;
   const parsed = commitPointSchema.safeParse(at);
   if (!parsed.success || BigInt(parsed.data) > tx.cut) {
-    throw storageError("storage.cut_invalid", {
-      requestedCut: at,
-      latestCut: tx.cut.toString(),
+    throw appError("storage.cut_invalid", {
+      details: {
+        requestedCut: at,
+        latestCut: tx.cut.toString(),
+      },
     });
   }
   const requested = BigInt(parsed.data);
@@ -129,9 +174,11 @@ export function resolveCut(tx: ReadTransaction, at?: CommitPoint): bigint {
     )
     .get()!;
   if (requested < floor) {
-    throw storageError("storage.history_unavailable", {
-      requestedCut: at,
-      earliestCut: floor.toString(),
+    throw appError("storage.history_unavailable", {
+      details: {
+        requestedCut: at,
+        earliestCut: floor.toString(),
+      },
     });
   }
   return requested;

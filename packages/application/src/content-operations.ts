@@ -1,9 +1,10 @@
-import { extentSchema, type Materials, type Results } from "@themelios/content";
+import { originSchema, type Materials, type Results } from "@themelios/content";
 import {
+  artifactRefSchema,
   commitPointSchema,
+  extentSchema,
   instantSchema,
-  type ArtifactRef,
-  type CallOptions,
+  mediaTypeSchema,
 } from "@themelios/core";
 import { z } from "zod";
 import {
@@ -11,14 +12,10 @@ import {
   type AnyOperation,
 } from "@themelios/runtime/operations";
 import {
-  createWireCodec,
-  mediaTypeSchema,
-  parseWireInline,
-  toOrigin,
+  decodeCompleted,
+  decodeWireAccept,
   wireAcceptSchema,
-  wireArtifactRefSchema,
   wireCompletedSchema,
-  wireOriginSchema,
   wireSavedSchema,
   wireSelectionSchema,
 } from "./wire.js";
@@ -28,16 +25,16 @@ export interface ContentOperationTarget {
   readonly results: Results;
 }
 
-const requiredRef = z.strictObject({ ref: wireArtifactRefSchema });
+const requiredRef = z.strictObject({ ref: artifactRefSchema });
 
 const artifactInfoSchema = z.strictObject({
-  ref: wireArtifactRefSchema,
+  ref: artifactRefSchema,
   kind: z.enum(["material", "result"]),
   mediaType: mediaTypeSchema,
   sizeBytes: z.int().nonnegative(),
   name: z.string().min(1).optional(),
   extent: extentSchema,
-  origin: wireOriginSchema.optional(),
+  origin: originSchema.optional(),
   createdAt: instantSchema,
   createdAtCut: commitPointSchema,
 });
@@ -66,51 +63,38 @@ export function contentOperations<
   App extends ContentOperationTarget,
 >(): readonly AnyOperation<App>[] {
   return [
-    defineOperation<App, unknown, unknown>({
+    defineOperation<App>()({
       id: "materials.accept",
       description: "Import bytes as immutable material.",
       permission: "write",
       kind: "unary",
-      input: wireAcceptSchema,
+      input: wireAcceptSchema.transform(decodeWireAccept),
+      binaryInput: z
+        .strictObject({
+          body: z.instanceof(ReadableStream<Uint8Array>),
+          mediaType: mediaTypeSchema.optional(),
+          name: z.string().min(1).optional(),
+        })
+        .transform(({ body, mediaType, name }) => ({
+          body,
+          ...(mediaType === undefined ? {} : { mediaType }),
+          ...(name === undefined ? {} : { name }),
+        })),
       output: wireSelectionSchema,
       http: [
         {
           method: "POST",
           path: "/materials",
           status: 201,
-          binaryInput: z.strictObject({
-            body: z.instanceof(ReadableStream<Uint8Array>),
-            mediaType: mediaTypeSchema,
-            name: z.string().min(1).optional(),
-          }),
+          binaryBody: true,
           queryStrings: ["name"],
         },
         { method: "POST", path: "/materials/accept", status: 201 },
       ],
-      execute(app, value, context) {
-        if (typeof value === "object" && value !== null && "body" in value) {
-          const payload = value as {
-            body: ReadableStream<Uint8Array>;
-            mediaType: string;
-            name?: string;
-            origin?: z.infer<typeof wireOriginSchema>;
-          };
-          return app.materials.accept(
-            {
-              body: payload.body,
-              mediaType: payload.mediaType,
-              ...(payload.name === undefined ? {} : { name: payload.name }),
-              ...(payload.origin === undefined
-                ? {}
-                : { origin: toOrigin(payload.origin) }),
-            },
-            context.options,
-          );
-        }
-        return app.materials.accept(parseWireInline(value), context.options);
-      },
+      execute: (app, input, context) =>
+        app.materials.accept(input, context.options),
     }),
-    defineOperation<App, { ref: string }, unknown>({
+    defineOperation<App>()({
       id: "materials.inspect",
       description: "Inspect material metadata.",
       permission: "read",
@@ -126,7 +110,7 @@ export function contentOperations<
         return app.materials.inspect(app.materials.resolve(ref));
       },
     }),
-    defineOperation<App, { ref: string }, unknown>({
+    defineOperation<App>()({
       id: "materials.read",
       description: "Read original bytes and metadata.",
       permission: "read",
@@ -142,26 +126,24 @@ export function contentOperations<
         return app.materials.read(app.materials.resolve(ref), context.options);
       },
     }),
-    defineOperation<App, z.infer<typeof wireSelectionSchema>, { text: string }>(
-      {
-        id: "materials.text",
-        description: "Read a text or JSON selection.",
-        permission: "read",
-        input: wireSelectionSchema,
-        output: z.strictObject({ text: z.string() }),
-        mcp: { readOnlyHint: true, idempotentHint: true },
-        http: { method: "POST", path: "/materials/text" },
-        async execute(app, selection, context) {
-          const ref = app.materials.resolve(selection.ref);
-          const resolved =
-            selection.range === undefined
-              ? { ref }
-              : { ref, range: selection.range };
-          return { text: await app.materials.text(resolved, context.options) };
-        },
+    defineOperation<App>()({
+      id: "materials.text",
+      description: "Read a text or JSON selection.",
+      permission: "read",
+      input: wireSelectionSchema,
+      output: z.strictObject({ text: z.string() }),
+      mcp: { readOnlyHint: true, idempotentHint: true },
+      http: { method: "POST", path: "/materials/text" },
+      async execute(app, selection, context) {
+        const ref = app.materials.resolve(selection.ref);
+        const resolved =
+          selection.range === undefined
+            ? { ref }
+            : { ref, range: selection.range };
+        return { text: await app.materials.text(resolved, context.options) };
       },
-    ),
-    defineOperation<App, { ref: string }, unknown>({
+    }),
+    defineOperation<App>()({
       id: "materials.structure",
       description: "Read text blocks with source coordinates.",
       permission: "read",
@@ -180,7 +162,7 @@ export function contentOperations<
         );
       },
     }),
-    defineOperation<App, { ref: string; depth?: number | undefined }, unknown>({
+    defineOperation<App>()({
       id: "materials.sources",
       description: "Trace links from material or result to its sources.",
       permission: "read",
@@ -200,21 +182,13 @@ export function contentOperations<
         );
       },
     }),
-    defineOperation<
-      App,
-      {
-        at?: string | undefined;
-        after?: string | undefined;
-        limit?: number | undefined;
-      },
-      unknown
-    >({
+    defineOperation<App>()({
       id: "materials.list",
       description: "List material metadata at a commit cut.",
       permission: "read",
       input: z.strictObject({
         at: commitPointSchema.optional(),
-        after: wireArtifactRefSchema.optional(),
+        after: artifactRefSchema.optional(),
         limit: z.int().positive().max(1000).optional(),
       }),
       output: z.array(artifactInfoSchema),
@@ -235,7 +209,7 @@ export function contentOperations<
         });
       },
     }),
-    defineOperation<App, { ref: string }, null>({
+    defineOperation<App>()({
       id: "materials.retain",
       description: "Retain a material as a root.",
       permission: "write",
@@ -253,7 +227,7 @@ export function contentOperations<
         return null;
       },
     }),
-    defineOperation<App, { ref: string }, null>({
+    defineOperation<App>()({
       id: "materials.release",
       description: "Release a retained material root.",
       permission: "write",
@@ -271,7 +245,7 @@ export function contentOperations<
         return null;
       },
     }),
-    defineOperation<App, z.infer<typeof wireCompletedSchema>, unknown>({
+    defineOperation<App>()({
       id: "results.save",
       description: "Save a completed value and its source graph.",
       permission: "write",
@@ -279,22 +253,11 @@ export function contentOperations<
       output: wireSavedSchema,
       mcp: { expose: false },
       http: { method: "POST", path: "/results", status: 201 },
-      async execute(app, wire, context) {
-        const codec = createWireCodec(
-          {
-            resolve: (ref) => app.materials.resolve(ref),
-            readResult: (ref: ArtifactRef, opts?: CallOptions) =>
-              app.results.read(ref, opts),
-          },
-          context.options,
-        );
-        return app.results.save(
-          await codec.decodeCompleted(wire),
-          context.options,
-        );
+      execute(app, wire, context) {
+        return app.results.save(decodeCompleted(wire), context.options);
       },
     }),
-    defineOperation<App, { ref: string }, unknown>({
+    defineOperation<App>()({
       id: "results.read",
       description: "Read a saved result and its precise source references.",
       permission: "read",

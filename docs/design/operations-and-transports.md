@@ -4,7 +4,7 @@ Themelios 把 SDK 作为宿主应用直接消费的核心接口，同时通过�
 
 ## 通用 `Operation` 契约
 
-应用通过 SDK 实现业务，再从 `@themelios/runtime/operations` 导入 `defineOperation<App, I, O>` 声明对外操作。将同一组声明传给需要启用的协议入口。
+应用通过 SDK 实现业务，再从 `@themelios/runtime/operations` 导入 `defineOperation<App>()` 声明对外操作。操作类型与输入输出 Schema 一起定义执行合同。将同一组声明传给需要启用的协议入口。
 
 | 字段 | 职责 |
 | --- | --- |
@@ -30,10 +30,11 @@ Themelios 把 SDK 作为宿主应用直接消费的核心接口，同时通过�
 ## 统一传输层（@themelios/transports）
 
 - **共享 HTTP 安全管线（`runProtectedHttp`）**：HTTP/SSE 业务路由与 `/mcp` Streamable HTTP 共用同一套请求租约追踪（`RequestTracker` + `retainResponse`）、`Host` / `Origin` / CORS 校验、`Bearer` 令牌与常数时间认证、语言协商（`Accept-Language`）与 `traceId` 脱敏错误返回。
-- **HTTP 与 SSE**：根据操作目录自动注册全部 REST 路径（例如 `/instance`、`/materials`、`/materials/:ref/content`、`/tasks/:id/run`、`/tasks/:id/stream`、`/configuration`）与通用 `/operations/:id`；启用 `enableMcp: true` 时在同一个监听端点挂载 `/mcp`。
+- **HTTP 与 SSE**：按操作目录注册专用 REST 路径。没有指定 `http` 的操作使用 `POST /operations/<id>`；`http: false` 关闭入口。启用 `enableMcp: true` 时在同一端点挂载 `/mcp`。监听空闲时限与业务执行期限各有用途；流式请求允许在两个事件之间保持连接。
+- **gRPC**：`themelios.Operations` 用 `Invoke` 执行普通操作，用 `Stream` 返回任务事件或原件字节，用双向 `Upload` 提供操作元数据和原始上传。HTTP 和 gRPC 都按 Operation 声明的 `binaryInput` 验证流式输入。Protobuf 定义随 Transports 包提供。
 - **MCP（HTTP 和 stdio）**按操作目录与当前权限公开普通操作。应用可提供资源 URI 模板和一个读取字节的操作。工作台在 `themelios://materials/{ref}` 提供原件。
 - **CLI** 的 `runApplicationCli` 接收应用的 `Installation` 和操作目录，生成命令并管理会话。工作台在自身入口装配材料、成果、任务、提示词和配置命令。
-- **监听与关停**由 `serveApplication` 管理。应用传入会话、监听地址和认证配置。已由其他服务管理监听器的应用可直接挂载 `createHttpHandler`。
+- **监听与关停**由 `serveApplication` 管理。应用传入会话、监听地址和认证配置，也可用 `allowOperations` 限定公开目录。已由其他服务管理监听器的应用可直接挂载 `createHttpHandler`。
 
 ## MCP 边界的 Agent 短引用桥接
 

@@ -11,12 +11,17 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
-import { AppError, instantSchema, throwIfAborted } from "@themelios/core";
+import {
+  appError,
+  errorCode,
+  AppError,
+  instantSchema,
+  throwIfAborted,
+} from "@themelios/core";
 import { z } from "zod";
 import { SettingFields } from "./configuration/definition.js";
 import { loadCandidate, readLayers } from "./configuration/load.js";
 import { bootstrapDiagnostics } from "./diagnostics.js";
-import { errno, failure } from "./failure.js";
 import { openInstanceLock } from "./lock.js";
 import {
   configurationFiles,
@@ -74,8 +79,8 @@ export class Installation<Api, S> {
 
   instance(name: string): Instance<Api, S> {
     if (!namePattern.test(name))
-      throw failure("runtime.instance_name_invalid", { name });
-    return this.#at(join(this.dataRoot, name), name);
+      throw appError("runtime.instance_name_invalid", { details: { name } });
+    return this.#at(join(this.dataRoot, name), name, true);
   }
 
   external(root: string): Instance<Api, S> {
@@ -83,7 +88,7 @@ export class Installation<Api, S> {
     return this.#at(absolute, basename(absolute));
   }
 
-  #at(root: string, name: string): Instance<Api, S> {
+  #at(root: string, name: string, createConfigRoot = false): Instance<Api, S> {
     const application = this.application;
     const paths = instancePaths(root);
     const filesFor = (info: InstanceInfo) =>
@@ -91,21 +96,26 @@ export class Installation<Api, S> {
     const locate = async (): Promise<InstanceInfo> => {
       const manifest = await readManifest(root);
       if (manifest.applicationId !== application.id) {
-        throw failure("runtime.application_mismatch", {
-          expected: application.id,
-          actual: manifest.applicationId,
+        throw appError("runtime.application_mismatch", {
+          details: {
+            expected: application.id,
+            actual: manifest.applicationId,
+          },
         });
       }
       if (manifest.formatId !== application.formatId) {
-        throw failure("runtime.format_mismatch", {
-          expected: application.formatId,
-          actual: manifest.formatId,
+        throw appError("runtime.format_mismatch", {
+          details: {
+            expected: application.formatId,
+            actual: manifest.formatId,
+          },
         });
       }
       return { ...manifest, paths };
     };
     return {
-      init: () => initialize(application, this.configRoot, root, name),
+      init: () =>
+        initialize(application, this.configRoot, root, name, createConfigRoot),
       locate,
       open: (options = {}) =>
         openSession(application, locate, filesFor, options),
@@ -147,9 +157,12 @@ async function readManifest(root: string): Promise<Manifest> {
   try {
     return manifestSchema.parse(JSON.parse(await readFile(file, "utf8")));
   } catch (error) {
-    if (errno(error) === "ENOENT")
-      throw failure("runtime.instance_not_found", undefined, error);
-    throw failure("runtime.instance_invalid", { path: file }, error);
+    if (errorCode(error) === "ENOENT")
+      throw appError("runtime.instance_not_found", { cause: error });
+    throw appError("runtime.instance_invalid", {
+      details: { path: file },
+      cause: error,
+    });
   }
 }
 
@@ -158,7 +171,7 @@ async function targetState(path: string): Promise<"missing" | "empty"> {
   try {
     directory = (await lstat(path)).isDirectory();
   } catch (error) {
-    if (errno(error) === "ENOENT") return "missing";
+    if (errorCode(error) === "ENOENT") return "missing";
     throw error;
   }
   if (directory) {
@@ -171,13 +184,13 @@ async function targetState(path: string): Promise<"missing" | "empty"> {
       } catch {
         /* Keep the occupied manifest in place. */
       }
-      throw failure(
+      throw appError(
         "runtime.instance_exists",
-        id ? { instanceId: id } : undefined,
+        id ? { details: { instanceId: id } } : {},
       );
     }
   }
-  throw failure("runtime.instance_not_empty", { path });
+  throw appError("runtime.instance_not_empty", { details: { path } });
 }
 
 async function initialize<Api, S>(
@@ -185,6 +198,7 @@ async function initialize<Api, S>(
   configRoot: string,
   target: string,
   name: string,
+  createConfigRoot: boolean,
 ): Promise<InstanceInfo> {
   const diagnostics = bootstrapDiagnostics(randomUUID());
   const parent = dirname(target);
@@ -192,6 +206,7 @@ async function initialize<Api, S>(
   try {
     await mkdir(parent, { recursive: true });
     await targetState(target);
+    if (createConfigRoot) await mkdir(configRoot, { recursive: true });
     staging = await mkdtemp(join(parent, "." + name + ".init-"));
     const paths = instancePaths(staging);
     await Promise.all(
@@ -245,11 +260,14 @@ async function initialize<Api, S>(
         code:
           error instanceof AppError
             ? error.code
-            : (errno(error) ?? "runtime.init_failed"),
+            : (errorCode(error) ?? "runtime.init_failed"),
       });
     }
     if (error instanceof AppError) throw error;
-    throw failure("runtime.init_failed", { path: target }, error);
+    throw appError("runtime.init_failed", {
+      details: { path: target },
+      cause: error,
+    });
   }
 }
 
@@ -270,7 +288,7 @@ async function publishInstance(staging: string, target: string): Promise<void> {
       if (
         state !== "missing" ||
         process.platform !== "win32" ||
-        errno(error) !== "EPERM"
+        errorCode(error) !== "EPERM"
       )
         throw error;
       firstSharingError ??= error;
@@ -284,7 +302,10 @@ async function preparePublicationTarget(target: string): Promise<void> {
   try {
     await rmdir(target);
   } catch (error) {
-    if (errno(error) !== "ENOENT" && (await targetState(target)) !== "missing")
+    if (
+      errorCode(error) !== "ENOENT" &&
+      (await targetState(target)) !== "missing"
+    )
       throw error;
   }
 }
@@ -294,6 +315,6 @@ async function removeStaging(path: string): Promise<string> {
     await rm(path, { recursive: true, force: true });
     return "removed";
   } catch (error) {
-    return errno(error) ?? "cleanup_failed";
+    return errorCode(error) ?? "cleanup_failed";
   }
 }

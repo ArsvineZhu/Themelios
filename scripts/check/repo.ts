@@ -52,35 +52,35 @@ try {
     (path) => path.startsWith("tests/") && path.endsWith(".test.ts"),
   );
   await buildPackages(names, true);
-  if (names.length) {
-    for (const pkg of targeted)
-      await run(
-        [bun, "check", "--no-script", "--no-pretty", "-p", pkg.root],
-        quiet,
-      );
-  } else await run([bun, "check", "--no-script", "--no-pretty", "-b"], quiet);
-  if (code.length) {
-    await run([bun, "fmt", "--check", ...code], quiet);
+  // The build already checks the workspace packages. The root project owns
+  // the remaining scripts and tests and can use the emitted declarations.
+  if (!names.length)
     await run(
-      [bun, "x", "--no-install", "oxlint", "--format=agent", ...code],
+      [bun, "check", "--no-script", "--no-pretty", "-p", repoRoot],
       quiet,
     );
+  if (code.length) {
+    await run([bun, "fmt", "--check", ...code], { ...quiet, label: "bun fmt" });
+    await run([bun, "x", "--no-install", "oxlint", "--format=agent", ...code], {
+      ...quiet,
+      label: "oxlint",
+    });
   }
   const python = process.platform === "win32" ? "python" : "python3";
-  await run(
-    [
-      python,
-      "-B",
-      "scripts/check/manage.py",
-      "length",
-      ...(names.length
-        ? scope.filter((path) => /\.(?:rs|py|tsx?|[mc]?js)$/.test(path))
-        : []),
-    ],
-    quiet,
-  );
+  const lengthFiles = names.length
+    ? scope.filter((path) => /\.(?:rs|py|tsx?|[mc]?js)$/.test(path))
+    : [];
+  if (!names.length || lengthFiles.length)
+    await run(
+      [python, "-B", "scripts/check/manage.py", "length", ...lengthFiles],
+      { ...quiet, label: "Source length check" },
+    );
   await checkBoundaries([...targeted]);
-  if (tests.length) await run([bun, "test", "--agent", ...tests], quiet);
+  if (tests.length)
+    await run([bun, "test", "--agent", ...tests], {
+      ...quiet,
+      label: "bun test",
+    });
   console.log(
     "Themelios checks passed" + (labels ? " for " + labels : "") + ".",
   );

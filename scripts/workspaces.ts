@@ -1,17 +1,12 @@
-import { readdir } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 
 export const repoRoot = resolve(import.meta.dir, "..");
 
-interface Export {
-  types: string;
-  import: string;
-}
 export interface Manifest {
   name: string;
   version: string;
   private?: boolean;
-  exports?: Record<string, Export>;
+  exports?: Record<string, { types: string; import: string }>;
   dependencies?: Record<string, string>;
   devDependencies?: Record<string, string>;
   optionalDependencies?: Record<string, string>;
@@ -31,18 +26,10 @@ export async function workspaces(): Promise<Workspace[]> {
   const manifest = await readManifest(repoRoot);
   const found: Workspace[] = [];
   for (const pattern of manifest.workspaces?.packages ?? []) {
-    const parent = join(repoRoot, dirname(pattern));
-    const siblings = await readdir(parent, { withFileTypes: true }).catch(
-      (error) => {
-        if (error.code === "ENOENT") return [];
-        throw error;
-      },
-    );
-    for (const child of siblings) {
-      if (!child.isDirectory()) continue;
-      const root = join(parent, child.name);
-      if (await Bun.file(join(root, "package.json")).exists())
-        found.push({ root, manifest: await readManifest(root) });
+    const matches = new Bun.Glob(`${pattern}/package.json`);
+    for await (const path of matches.scan({ cwd: repoRoot, onlyFiles: true })) {
+      const root = join(repoRoot, dirname(path));
+      found.push({ root, manifest: await readManifest(root) });
     }
   }
   return found;
@@ -101,26 +88,29 @@ export function exportSources(pkg: Workspace): string[] {
 
 export async function run(
   args: string[],
-  options: { cwd?: string; quiet?: boolean } = {},
-): Promise<void> {
+  options: {
+    cwd?: string;
+    quiet?: boolean;
+    capture?: boolean;
+    label?: string;
+  } = {},
+): Promise<string> {
   const child = Bun.spawn(args, {
     cwd: options.cwd ?? repoRoot,
     stdin: "ignore",
-    stdout: options.quiet ? "pipe" : "inherit",
+    stdout: options.quiet || options.capture ? "pipe" : "inherit",
     stderr: options.quiet ? "pipe" : "inherit",
   });
   const [exit, output, diagnostics] = await Promise.all([
     child.exited,
-    options.quiet && child.stdout
-      ? new Response(child.stdout).text()
-      : undefined,
-    options.quiet && child.stderr
-      ? new Response(child.stderr).text()
-      : undefined,
+    child.stdout ? new Response(child.stdout).text() : undefined,
+    child.stderr ? new Response(child.stderr).text() : undefined,
   ]);
   if (exit !== 0) {
     if (output) process.stderr.write(output);
     if (diagnostics) process.stderr.write(diagnostics);
-    throw new Error(args.slice(1).join(" ") + " exited with code " + exit);
+    const command = options.label ?? args.slice(1).join(" ");
+    throw new Error(`${command} exited with code ${exit}`);
   }
+  return output ?? "";
 }

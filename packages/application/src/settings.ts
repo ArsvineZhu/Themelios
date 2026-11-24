@@ -1,15 +1,14 @@
 import { isIP } from "node:net";
-import { jsonSchema } from "@themelios/core";
 import {
   connectionSchema,
-  mimePatternSchema,
   modelBindingSchema,
   modelNameSchema,
-  modelParametersSchema,
+  taskRouteSchema,
 } from "@themelios/models";
 import {
   combineSettings,
   runtimeSettings,
+  type RuntimeSettings,
   type SettingEffect,
   type SettingIssue,
   type SettingMeta,
@@ -29,60 +28,38 @@ const permissions = z
     (items) => new Set(items).size === items.length,
     "Use each permission once",
   );
-const size = (fallback: number, max: number) =>
-  z.int().min(1).max(max).default(fallback);
+const budget = (fallback: number) => z.int().positive().default(fallback);
 
-const policy = z.strictObject({
-  representations: z
-    .array(
-      z.strictObject({
-        mediaType: mimePatternSchema,
-        recipe: modelNameSchema,
-        parameters: jsonSchema.optional(),
-      }),
-    )
-    .optional(),
-  models: z
-    .array(
-      z.strictObject({
-        mediaType: mimePatternSchema,
-        recipe: z.enum(["media.describe", "speech.transcribe"]),
-        model: modelNameSchema,
-      }),
-    )
-    .optional(),
-});
-const taskRoute = z.strictObject({
-  model: modelNameSchema,
-  parameters: modelParametersSchema.optional(),
-  preparation: policy.optional(),
-});
 const listen = z.strictObject({
   host: z.string().min(1).default("127.0.0.1"),
-  port: z.int().min(1).max(65535),
+  port: z.int().min(0).max(65535),
 });
 const schema = z.strictObject({
   models: z
     .strictObject({
-      timeoutMs: size(120_000, 3_600_000),
-      maxAttempts: size(1, 5),
-      concurrency: size(4, 64),
+      timeoutMs: budget(120_000),
+      maxAttempts: budget(1),
+      concurrency: budget(4),
       bindings: z.record(modelNameSchema, modelBindingSchema).default({}),
       connections: z.record(modelNameSchema, connectionSchema).default({}),
-      tasks: z.record(modelNameSchema, taskRoute).default({}),
+      tasks: z.record(modelNameSchema, taskRouteSchema).default({}),
     })
     .prefault({}),
   content: z
     .strictObject({
-      maxImportBytes: size(1_073_741_824, Number.MAX_SAFE_INTEGER),
-      maxInlineBytes: size(8_388_608, 67_108_864),
+      maxImportBytes: budget(1_073_741_824),
+      maxInlineBytes: budget(8_388_608),
     })
     .prefault({}),
   preparation: z
     .strictObject({
-      maxMaterialBytes: size(67_108_864, 1_073_741_824),
-      image: z
-        .strictObject({ maxPixels: size(40_000_000, 268_435_456) })
+      maxMaterialBytes: budget(67_108_864),
+      image: z.strictObject({ maxPixels: budget(40_000_000) }).prefault({}),
+      media: z
+        .strictObject({
+          ffmpeg: z.string().min(1).optional(),
+          ffprobe: z.string().min(1).optional(),
+        })
         .prefault({}),
     })
     .prefault({}),
@@ -91,7 +68,8 @@ const schema = z.strictObject({
     .prefault({}),
   transports: z
     .strictObject({
-      maxJsonBytes: size(8_388_608, 1_073_741_824),
+      maxJsonBytes: budget(8_388_608),
+      allowOperations: z.array(z.string().min(1)).optional(),
       authTokens: z
         .record(
           modelNameSchema,
@@ -101,22 +79,33 @@ const schema = z.strictObject({
       http: z
         .strictObject({
           listen: listen.optional(),
+          idleTimeoutSeconds: z.int().min(0).max(255).optional(),
           allowedHosts: z
             .array(z.string().min(1))
             .default(["localhost", "127.0.0.1", "[::1]"]),
           allowedOrigins: z.array(z.url({ protocol: /^https?$/ })).default([]),
         })
         .prefault({}),
+      grpc: z
+        .strictObject({
+          listen: listen.optional(),
+          tls: z
+            .strictObject({ key: fileCredential, cert: fileCredential })
+            .optional(),
+        })
+        .prefault({}),
       mcp: z
-        .strictObject({ mode: z.enum(["stdio", "http"]).optional() })
+        .strictObject({
+          mode: z.enum(["stdio", "http"]).optional(),
+          localPermissions: permissions.optional(),
+        })
         .prefault({}),
     })
     .prefault({}),
 });
 
 type Configured = z.infer<typeof schema>;
-export type ApplicationSettings = Configured &
-  import("@themelios/runtime/settings").RuntimeSettings;
+export type ApplicationSettings = z.output<typeof schema> & RuntimeSettings;
 
 function setting(
   path: string,
@@ -143,7 +132,9 @@ const entries: readonly [string, SettingEffect, Partial<SettingMeta>?][] = [
   [
     "/models/maxAttempts",
     "next-call",
-    { scopes: ["installation", "instance", "task"] },
+    {
+      scopes: ["installation", "instance", "task"],
+    },
   ],
   ["/models/concurrency", "reload"],
   ["/models/connections/*", "reload"],
@@ -154,12 +145,20 @@ const entries: readonly [string, SettingEffect, Partial<SettingMeta>?][] = [
   ["/content/maxInlineBytes", "next-call", { unit: "bytes" }],
   ["/preparation/maxMaterialBytes", "next-call", { unit: "bytes" }],
   ["/preparation/image/maxPixels", "next-call", { unit: "pixels" }],
+  ["/preparation/media/ffmpeg", "next-call", { format: "path" }],
+  ["/preparation/media/ffprobe", "next-call", { format: "path" }],
   ["/storage/synchronous", "restart"],
   ["/transports/maxJsonBytes", "next-call", { unit: "bytes" }],
+  ["/transports/allowOperations", "restart"],
   ["/transports/http/listen", "restart"],
+  ["/transports/http/idleTimeoutSeconds", "restart", { unit: "seconds" }],
   ["/transports/http/allowedHosts", "reload"],
   ["/transports/http/allowedOrigins", "reload"],
+  ["/transports/grpc/listen", "restart"],
+  ["/transports/grpc/tls/key", "restart", { format: "credential" }],
+  ["/transports/grpc/tls/cert", "restart", { format: "credential" }],
   ["/transports/mcp/mode", "restart"],
+  ["/transports/mcp/localPermissions", "restart"],
   ["/transports/authTokens/*", "reload"],
   ["/transports/authTokens/*/secret", "reload", { format: "credential" }],
 ];
@@ -230,11 +229,19 @@ function preparationIssues(
 function taskIssues(models: Configured["models"]): SettingIssue[] {
   return Object.entries(models.tasks).flatMap(([name, route]) => {
     const path = "/models/tasks/" + name;
-    const primary = Object.hasOwn(models.bindings, route.model)
-      ? []
-      : [{ path: path + "/model", messageKey: "model.binding_not_found" }];
+    const bindings = [
+      ["model", route.model] as const,
+      ...(route.fallback ?? []).map(
+        (model, index) => [`fallback/${index}`, model] as const,
+      ),
+    ];
     return [
-      ...primary,
+      ...bindings
+        .filter(([, model]) => !Object.hasOwn(models.bindings, model))
+        .map(([field]) => ({
+          path: `${path}/${field}`,
+          messageKey: "model.binding_not_found",
+        })),
       ...preparationIssues(
         path + "/preparation/representations",
         route.preparation?.representations ?? [],
@@ -260,12 +267,14 @@ function isLoopback(host: string): boolean {
 function listenerIssues(transports: Configured["transports"]): SettingIssue[] {
   const issues: SettingIssue[] = [];
   if (!Object.keys(transports.authTokens).length) {
-    const listen = transports.http.listen;
-    if (listen && !isLoopback(listen.host)) {
-      issues.push({
-        path: "/transports/http/listen/host",
-        messageKey: "config.listener_requires_auth",
-      });
+    for (const protocol of ["http", "grpc"] as const) {
+      const listener = transports[protocol].listen;
+      if (listener && !isLoopback(listener.host)) {
+        issues.push({
+          path: `/transports/${protocol}/listen/host`,
+          messageKey: "config.listener_requires_auth",
+        });
+      }
     }
   }
   if (transports.mcp.mode === "http" && !transports.http.listen) {

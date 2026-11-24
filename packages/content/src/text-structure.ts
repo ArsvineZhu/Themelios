@@ -1,7 +1,7 @@
 import remarkGfm from "remark-gfm";
 import remarkParse from "remark-parse";
 import { unified } from "unified";
-import type { ArtifactRef, BlobRef, Selection } from "@themelios/core";
+import type { ArtifactRef, Selection } from "@themelios/core";
 
 export interface TextBlock {
   kind:
@@ -36,8 +36,6 @@ const blockKinds: Readonly<Record<string, BlockKind>> = {
   thematicBreak: "thematic-break",
 };
 const parser = unified().use(remarkParse).use(remarkGfm);
-const maxStructureCacheEntries = 128;
-const structureCache = new Map<string, readonly CachedBlock[]>();
 
 function bytePositions(text: string): Uint32Array | Float64Array {
   const offsets =
@@ -78,38 +76,22 @@ function computeBlocks(text: string, markdown: boolean): CachedBlock[] {
     : paragraphBlocks(source, block);
 }
 
-function cachedBlocks(key: string, text: string, markdown: boolean) {
-  let cached = structureCache.get(key);
-  if (cached) structureCache.delete(key);
-  else {
-    cached = computeBlocks(text, markdown);
-    if (structureCache.size >= maxStructureCacheEntries) {
-      const oldest = structureCache.keys().next().value;
-      if (oldest !== undefined) structureCache.delete(oldest);
-    }
-  }
-  structureCache.set(key, cached);
-  return cached;
-}
-
 export function structureText(
   ref: ArtifactRef,
   text: string,
   markdown: boolean,
-  blobRef?: BlobRef,
 ): TextBlock[] {
-  const cached = blobRef
-    ? cachedBlocks(`${blobRef}:${markdown ? "md" : "txt"}`, text, markdown)
-    : computeBlocks(text, markdown);
-  return cached.map(({ kind, start, end, text: snippet, depth }) => ({
-    kind,
-    selection: {
-      ref,
-      range: { kind: "text", start, end },
-    },
-    text: snippet,
-    ...(depth === undefined ? {} : { depth }),
-  }));
+  return computeBlocks(text, markdown).map(
+    ({ kind, start, end, text: snippet, depth }) => ({
+      kind,
+      selection: {
+        ref,
+        range: { kind: "text", start, end },
+      },
+      text: snippet,
+      ...(depth === undefined ? {} : { depth }),
+    }),
+  );
 }
 
 function markdownBlocks(source: string, block: MakeBlock): CachedBlock[] {

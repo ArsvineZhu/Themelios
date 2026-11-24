@@ -1,9 +1,14 @@
 # 在普通脚本中使用模型与模板
 
-将此目录复制到工作区外，再从 `examples/inventory` 复制 `install-release.ts` 到同一目录。运行：
+将此目录复制到工作区外。在构建 Themelios 的工作区运行以下命令，将 `/ABS/CONSUMER` 换成复制目录的实际路径：
 
 ```sh
-bun install-release.ts /ABS/RELEASE/packages
+bun scripts/install-packages.ts ./artifacts/packages /ABS/CONSUMER
+```
+
+进入消费目录，再运行：
+
+```sh
 THEMELIOS_MODEL_URL=http://127.0.0.1:8080/v1 THEMELIOS_MODEL_ID=your-model bun embedded-summary.ts
 ```
 

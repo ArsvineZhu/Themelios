@@ -1,23 +1,24 @@
-import {
-  copyFile,
-  cp,
-  mkdir,
-  mkdtemp,
-  realpath,
-  rename,
-} from "node:fs/promises";
+import { cp, mkdir, mkdtemp, realpath, rename } from "node:fs/promises";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { deepStrictEqual, equal, ok } from "node:assert/strict";
+import { parseArgs } from "node:util";
 import {
   Client,
   StreamableHTTPClientTransport,
 } from "@modelcontextprotocol/client";
 import { repoRoot, run } from "../../scripts/workspaces.js";
 
-const flags = process.argv.slice(2).filter((arg) => arg !== "--");
-const live = flags.includes("--live");
-const portableFlag = flags.indexOf("--portable");
-const release = resolve(repoRoot, "artifacts/packages");
+const { values } = parseArgs({
+  args: process.argv.slice(2).filter((arg) => arg !== "--"),
+  options: {
+    live: { type: "boolean" },
+    packages: { type: "string" },
+    portable: { type: "string" },
+  },
+});
+const release = values.packages
+  ? resolve(values.packages)
+  : join(repoRoot, "artifacts/packages");
 const parent = resolve(
   process.env.THEMELIOS_CONSUMER_ROOT ?? join(repoRoot, "..", "temp"),
 );
@@ -33,7 +34,7 @@ if (
 }
 const sandbox = await mkdtemp(join(parent, "themelios-release-"));
 const bun = process.execPath;
-const installer = join(repoRoot, "examples/inventory/install-release.ts");
+const installer = join(repoRoot, "scripts/install-packages.ts");
 
 async function prepare(kind: "inventory" | "embedded"): Promise<string> {
   const path = join(sandbox, kind);
@@ -41,8 +42,7 @@ async function prepare(kind: "inventory" | "embedded"): Promise<string> {
     recursive: true,
     filter: (item) => !["node_modules", "bun.lock"].includes(basename(item)),
   });
-  await copyFile(installer, join(path, "install-release.ts"));
-  await run([bun, "install-release.ts", release], { cwd: path, quiet: true });
+  await run([bun, installer, release, path], { quiet: true });
   return path;
 }
 
@@ -215,7 +215,7 @@ try {
     "-e",
     "await import('@themelios/models'); await import('@themelios/models/tasks'); let hasApp = true; try { import.meta.resolve('@themelios/application'); } catch { hasApp = false; } if (hasApp) throw new Error('Expected standalone embedded install without @themelios/application'); console.log(true)",
   ]);
-  if (live) {
+  if (values.live) {
     const model = (await call(embedded, [
       bun,
       "--no-install",
@@ -237,13 +237,10 @@ try {
     console.log("External model: " + model.producer.details.providerModel);
   }
 
-  if (portableFlag >= 0) {
-    const directory = flags[portableFlag + 1];
-    if (!directory || directory.startsWith("--"))
-      throw new Error("Pass the unpacked release directory after --portable.");
+  if (values.portable) {
     const initial = join(sandbox, "Portable 原目录");
     const moved = join(sandbox, "Portable 已搬迁");
-    await cp(resolve(directory), initial, { recursive: true });
+    await cp(resolve(values.portable), initial, { recursive: true });
     const invoke = (root: string, args: string[], json = true) =>
       call(
         sandbox,

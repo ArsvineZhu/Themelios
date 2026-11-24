@@ -1,11 +1,19 @@
+import { appError } from "@themelios/core";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import i18next from "i18next";
-import { failure } from "./failure.js";
 
 export type Dictionaries = Readonly<
   Record<string, Readonly<Record<string, string>>>
 >;
+
+export function isLanguageTag(value: string): boolean {
+  try {
+    return Intl.getCanonicalLocales(value).length === 1;
+  } catch {
+    return false;
+  }
+}
 
 function dictionary(language: string): Readonly<Record<string, string>> {
   const filename = join(
@@ -38,14 +46,16 @@ export function mergeLocales(
       >);
       for (const [key, value] of Object.entries(values)) {
         if (Object.hasOwn(locale, key) && locale[key] !== value) {
-          throw failure("config.invalid", {
-            issues: [
-              {
-                path: key,
-                messageKey: "config.locale_conflict",
-                params: { language },
-              },
-            ],
+          throw appError("config.invalid", {
+            details: {
+              issues: [
+                {
+                  path: key,
+                  messageKey: "config.locale_conflict",
+                  params: { language },
+                },
+              ],
+            },
           });
         }
         locale[key] = value;
@@ -71,9 +81,12 @@ export async function createLocalizer(additions?: Dictionaries) {
     initAsync: false,
     interpolation: { escapeValue: false },
   });
-  return (
+  const translate = (
     locale: string,
     key: string,
     params?: Readonly<Record<string, string | number | boolean>>,
   ) => instance.getFixedT(locale, "translation")(key, params ?? {});
+  return Object.assign(translate, {
+    languages: Object.freeze(Object.keys(merged)),
+  });
 }

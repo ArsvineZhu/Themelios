@@ -1,5 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
-import type { Json } from "@themelios/core";
+import { appError, type Json } from "@themelios/core";
 import type { RuntimeDiagnostics } from "./diagnostics.js";
 import type {
   Closable,
@@ -7,10 +7,14 @@ import type {
   ResourceContext,
   ResourceSlot,
 } from "./execution.js";
-import { failure } from "./failure.js";
 import type { Network } from "./network.js";
 import type { Secrets } from "./secrets.js";
 import { extractRuntimeSettings, type RuntimeSettings } from "./settings.js";
+
+export interface ResourceUpdate {
+  activate(): void;
+  discard(): Promise<void>;
+}
 
 class Shared<T extends Closable> {
   #references = 0;
@@ -97,8 +101,13 @@ export class SessionResources<S> {
     readonly closeFailure: (owner: string, error: unknown) => void,
   ) {}
 
-  get active(): Resources<S> {
-    if (!this.#active) throw failure("runtime.closed", { state: "closed" });
+  get active(): OperationResources<S> {
+    return this.#current();
+  }
+
+  #current(): Resources<S> {
+    if (!this.#active)
+      throw appError("runtime.closed", { details: { state: "closed" } });
     return this.#active;
   }
 
@@ -107,30 +116,25 @@ export class SessionResources<S> {
     create: (context: ResourceContext<S>) => Promise<T>,
     current: () => OperationResources<S> | undefined,
   ): Promise<ResourceSlot<T>> {
-    if (this.#slot) throw failure("runtime.resource_bound");
+    if (this.#slot) throw appError("runtime.resource_bound");
+    const generation = this.#current();
+    generation.useApplication(
+      new Shared("application", await create(generation)),
+    );
     this.#slot = { select, create };
-    try {
-      this.active.useApplication(
-        new Shared("application", await create(this.active)),
-      );
-    } catch (error) {
-      this.#slot = undefined;
-      throw error;
-    }
     return {
       get: () => {
         const generation = current() as Resources<S> | undefined;
-        const value = (generation ?? this.active).app?.value;
-        if (!value) throw failure("runtime.closed", { state: "closed" });
+        const value = (generation ?? this.#current()).app?.value;
+        if (!value)
+          throw appError("runtime.closed", { details: { state: "closed" } });
         return value as T;
       },
     };
   }
 
   /** Creates a complete resource generation before adopting it synchronously. */
-  async prepare(
-    settings: Readonly<S>,
-  ): Promise<{ activate(): void; discard(): Promise<void> }> {
+  async prepare(settings: Readonly<S>): Promise<ResourceUpdate> {
     const old = this.#active;
     const next = extractRuntimeSettings(settings);
     const makeDiagnostics =
@@ -221,8 +225,8 @@ export class SessionResources<S> {
 }
 
 function networkSettings({ network }: RuntimeSettings) {
-  const { proxy, proxyAuthorization, caFile } = network;
-  return { proxy, proxyAuthorization, caFile };
+  const { proxy, noProxy, proxyAuthorization, caFile } = network;
+  return { proxy, noProxy, proxyAuthorization, caFile };
 }
 
 function diagSettings({ logging }: RuntimeSettings) {

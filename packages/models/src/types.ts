@@ -7,15 +7,19 @@ import type {
   InputUse,
   Json,
   Material,
-  Range,
+  Extent,
+  MediaInput,
+  ModalityNeed,
+  RepresentationAdapter,
+  SourceCoverage,
   SavedResult,
   Selection,
 } from "@themelios/core";
 import type { Diagnostics } from "@themelios/runtime/diagnostics";
 import type { CredentialRef } from "@themelios/runtime/secrets";
+import type { preparationPolicySchema, taskRouteSchema } from "./schema.js";
 
 export type ModelOperation = "generate" | "embed" | "rank" | "transcribe";
-export type ModalityNeed = "text" | "visual" | "speech" | "motion";
 export type FetchFunction = (
   input: string | URL | Request,
   init?: RequestInit,
@@ -47,7 +51,9 @@ export interface ModelParameters {
   readonly topP?: number;
   readonly maxOutputTokens?: number;
   readonly seed?: number;
-  readonly providerOptions?: Readonly<Record<string, Json>>;
+  readonly providerOptions?: Readonly<
+    Record<string, Readonly<Record<string, Json>>>
+  >;
 }
 
 export interface EmbeddingSpace {
@@ -163,12 +169,10 @@ export interface Transcript {
   readonly notices: readonly ModelNotice[];
 }
 
-export interface SourceEntry {
+export interface SourceEntry extends SourceCoverage {
   readonly key: string;
   readonly mediaType: string;
-  readonly name?: string;
-  readonly originalExtent: string;
-  readonly deliveredExtent: readonly string[];
+  readonly name?: string | undefined;
   readonly role: "primary" | "context";
 }
 
@@ -202,7 +206,11 @@ export interface TaskExample<I extends Json, O extends Json> {
 }
 
 export type TaskTemplates =
-  | { readonly system: string; readonly user: string }
+  | {
+      readonly system: string;
+      readonly user: string;
+      readonly resourceRoot?: string;
+    }
   | { readonly inline: true; readonly system?: string; readonly user: string };
 
 export interface TaskDefinitionInput<I extends Json, O extends Json, RawI = I> {
@@ -279,81 +287,7 @@ export interface TaskRequest<I> {
   readonly parameters?: ModelParameters;
 }
 
-export type MediaExtent =
-  | { readonly kind: "text"; readonly bytes: number }
-  | {
-      readonly kind: "image";
-      readonly width: number;
-      readonly height: number;
-      readonly frames: number;
-    }
-  | { readonly kind: "pages"; readonly pages: number }
-  | { readonly kind: "time"; readonly durationMs: number }
-  | { readonly kind: "unknown" };
-
-export interface MediaInput {
-  readonly source: Material;
-  readonly info: {
-    readonly mediaType: string;
-    readonly sizeBytes: number;
-    readonly name?: string;
-    readonly extent: MediaExtent;
-  };
-  readonly range?: Range;
-  open(options?: { signal?: AbortSignal }): Promise<ReadableStream<Uint8Array>>;
-}
-
-export interface RecipeDescription {
-  readonly id: string;
-  readonly version: string;
-  readonly inputMimeTypes: readonly string[];
-  readonly outputMimeTypes: readonly string[];
-  readonly supplies: readonly ModalityNeed[];
-  readonly parameters: z.ZodType<Json>;
-  readonly priority: number;
-  readonly titleKey: string;
-}
-
-export interface PreparedRepresentation {
-  readonly result: Completed;
-  readonly outputs: readonly string[];
-}
-
-export interface RepresentationAdapter {
-  readonly description: RecipeDescription;
-  available(): Promise<{
-    readonly available: boolean;
-    readonly missing: readonly string[];
-  }>;
-  probe(input: MediaInput, options?: CallOptions): Promise<MediaExtent>;
-  validateForModel?(
-    representation: PreparedRepresentation,
-    input: MediaInput,
-  ): void;
-  parametersForModel?(
-    inputMime: string,
-    acceptedMime: (mediaType: string) => boolean,
-    parameters: Json,
-  ): Json;
-  prepare(
-    input: MediaInput,
-    parameters: Json,
-    options?: CallOptions,
-  ): Promise<PreparedRepresentation>;
-}
-
-export interface PreparationPolicy {
-  readonly representations?: readonly {
-    readonly mediaType: string;
-    readonly recipe: string;
-    readonly parameters?: Json;
-  }[];
-  readonly models?: readonly {
-    readonly mediaType: string;
-    readonly recipe: "media.describe" | "speech.transcribe";
-    readonly model: string;
-  }[];
-}
+export type PreparationPolicy = z.output<typeof preparationPolicySchema>;
 
 export interface PreparationCallOptions extends CallOptions {
   readonly preparation?: PreparationPolicy;
@@ -382,7 +316,7 @@ export interface PreparationStore {
     readonly mediaType: string;
     readonly sizeBytes: number;
     readonly name?: string;
-    readonly extent: MediaExtent;
+    readonly extent: Extent;
   };
   read(
     ref: Selection["ref"],
@@ -407,11 +341,7 @@ export interface PreparationOptions {
   readonly models?: Models;
   readonly prompts?: Prompts;
   readonly adapters?: readonly RepresentationAdapter[];
-  readonly imageNeedsOrientation?: (
-    input: MediaInput,
-    options?: CallOptions,
-  ) => Promise<boolean>;
-  readonly modelIdentity?: (model: string) => Json;
+  readonly mediaDescriptionDefaults?: Readonly<Record<string, Json>>;
   readonly maxMaterialBytes?: number;
   readonly maxInlineBytes?: number;
 }
@@ -431,11 +361,7 @@ export interface Preparation {
   ): Promise<PreparedInput>;
 }
 
-export interface TaskRoute {
-  readonly model: string;
-  readonly parameters?: ModelParameters;
-  readonly preparation?: PreparationPolicy;
-}
+export type TaskRoute = z.output<typeof taskRouteSchema>;
 
 export interface Preview {
   readonly model: string;
@@ -589,13 +515,15 @@ export interface ModelsOptions {
 
 export interface Models {
   describe(binding: string): ModelBinding;
+  fingerprint(binding: string): string;
+  validateGeneration(request: GenerateRequest<Json>): void;
   generate<O extends Json>(
     request: GenerateRequest<O>,
-    options?: CallOptions,
+    options?: GenerationCallOptions,
   ): Promise<Generated<O>>;
   stream<O extends Json>(
     request: GenerateRequest<O>,
-    options?: CallOptions,
+    options?: GenerationCallOptions,
   ): Flow<Generated<O>>;
   embed(request: EmbedRequest, options?: CallOptions): Promise<Embedded>;
   rank(request: RankRequest, options?: CallOptions): Promise<Ranked>;
@@ -609,4 +537,8 @@ export interface Models {
     options?: CallOptions,
   ): Promise<Completed<O>>;
   close(): Promise<void>;
+}
+
+export interface GenerationCallOptions extends CallOptions {
+  readonly maxAttempts?: number;
 }

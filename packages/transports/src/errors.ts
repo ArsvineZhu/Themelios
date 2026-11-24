@@ -32,7 +32,7 @@ map(
 map([410, 4], "storage.history_unavailable");
 map(
   [413, 2],
-  "transport.request_too_large transport.result_too_large content.inline_too_large",
+  "transport.request_too_large transport.result_too_large content.inline_too_large storage.limit_exceeded",
 );
 map([415, 2], "transport.unsupported_media_type");
 map([422, 2], "time.overflow time.order_undefined time.domain_mismatch");
@@ -67,16 +67,30 @@ export const transportError = (code: string, details?: Json, cause?: unknown) =>
 export function errorLocale(
   header: string | null | undefined,
   fallback = "zh-CN",
+  available: readonly string[] = Object.keys(runtimeLocales),
 ): string {
   const choices = (header ?? "").split(",").flatMap((item) => {
     const [tag, quality] = item.trim().toLowerCase().split(";");
-    if (!tag || !/^(?:en|zh)(?:-|$)/.test(tag)) return [];
+    if (!tag) return [];
     const weight =
       quality === undefined ? 1 : Number(quality.trim().replace(/^q=/, ""));
     if (!Number.isFinite(weight) || weight <= 0 || weight > 1) return [];
-    return [{ locale: tag.startsWith("zh") ? "zh-CN" : "en", weight }];
+    return [{ tag, weight }];
   });
-  return choices.sort((a, b) => b.weight - a.weight)[0]?.locale ?? fallback;
+  for (const { tag } of choices.sort((a, b) => b.weight - a.weight)) {
+    if (tag === "*") return fallback;
+    const parts = tag.split("-");
+    while (parts.length) {
+      const prefix = parts.join("-");
+      const exact = available.find((locale) => locale.toLowerCase() === prefix);
+      const region = available.find((locale) =>
+        locale.toLowerCase().startsWith(prefix + "-"),
+      );
+      if (exact || region) return exact ?? region!;
+      parts.pop();
+    }
+  }
+  return fallback;
 }
 
 export interface ErrorPresentation {
@@ -92,7 +106,10 @@ export function normalizeError(
 ): ErrorInfo {
   const appErr = toAppError(error);
   const { code, messageKey, params, details, retryable } = appErr;
-  const language = options.locale === "en" ? "en" : "zh-CN";
+  const language =
+    (options.locale ?? "zh-CN").toLowerCase().split("-")[0] === "zh"
+      ? "zh-CN"
+      : "en";
   const dictionary = runtimeLocales[language];
   const translated = options.translate?.(messageKey, params);
   const text =

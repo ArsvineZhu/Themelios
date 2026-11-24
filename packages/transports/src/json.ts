@@ -1,4 +1,4 @@
-import { throwIfAborted } from "@themelios/core";
+import { streamChunks } from "@themelios/core";
 import { transportError } from "./errors.js";
 
 export const defaultMaxJsonBytes = 8 * 1024 * 1024;
@@ -37,50 +37,35 @@ export async function readJson(
     });
   const body = request.body;
   if (!body) return {};
-  const reader = body.getReader();
-  const stop = () => {
-    void reader.cancel(signal.reason).catch(() => undefined);
-  };
-  signal.addEventListener("abort", stop, { once: true });
   let received = 0;
   const text = new TextDecoder("utf-8", { fatal: true });
   const parts: string[] = [];
-  try {
-    while (true) {
-      throwIfAborted(signal);
-      const next = await reader.read();
-      throwIfAborted(signal);
-      if (next.done) break;
-      received += next.value.byteLength;
-      if (received > maximum)
-        throw transportError("transport.request_too_large", {
-          actualBytes: received,
-          maxJsonBytes: maximum,
-        });
-      try {
-        parts.push(text.decode(next.value, { stream: true }));
-      } catch (cause) {
-        throw transportError(
-          "transport.invalid_request",
-          { reason: "invalid_utf8" },
-          cause,
-        );
-      }
-    }
+  for await (const chunk of streamChunks(body, signal)) {
+    received += chunk.byteLength;
+    if (received > maximum)
+      throw transportError("transport.request_too_large", {
+        actualBytes: received,
+        maxJsonBytes: maximum,
+      });
     try {
-      return received
-        ? (JSON.parse(parts.join("") + text.decode()) as unknown)
-        : {};
+      parts.push(text.decode(chunk, { stream: true }));
     } catch (cause) {
       throw transportError(
         "transport.invalid_request",
-        { reason: "invalid_json" },
+        { reason: "invalid_utf8" },
         cause,
       );
     }
-  } finally {
-    signal.removeEventListener("abort", stop);
-    await reader.cancel().catch(() => undefined);
-    reader.releaseLock();
+  }
+  try {
+    return received
+      ? (JSON.parse(parts.join("") + text.decode()) as unknown)
+      : {};
+  } catch (cause) {
+    throw transportError(
+      "transport.invalid_request",
+      { reason: "invalid_json" },
+      cause,
+    );
   }
 }

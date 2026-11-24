@@ -16,6 +16,7 @@ import {
   artifactRefSchema,
   commitPointSchema,
   throwIfAborted,
+  streamChunks,
   type ArtifactRef,
   type CallOptions,
   type CommitPoint,
@@ -163,61 +164,36 @@ async function readBounded(
   limit: number,
   signal: AbortSignal,
 ): Promise<Uint8Array> {
-  if (input.content instanceof Uint8Array) {
-    throwIfAborted(signal);
-    if (input.content.byteLength > limit)
-      throw failure("inventory.file_too_large", { maxBytes: limit });
-    return input.content.slice();
-  }
-  const reader = input.content.getReader();
-  const cancel = () => {
-    void reader.cancel(signal.reason).catch(() => undefined);
-  };
-  signal.addEventListener("abort", cancel, { once: true });
   try {
     const chunks: Uint8Array[] = [];
     let length = 0;
-    while (true) {
-      throwIfAborted(signal);
-      const next = await reader.read();
-      throwIfAborted(signal);
-      if (next.done) break;
-      length += next.value.byteLength;
+    for await (const chunk of streamChunks(input.content, signal)) {
+      length += chunk.byteLength;
       if (length > limit)
         throw failure("inventory.file_too_large", { maxBytes: limit });
-      chunks.push(next.value);
+      chunks.push(new Uint8Array(chunk));
     }
-    const bytes = new Uint8Array(length);
-    let offset = 0;
-    for (const chunk of chunks) {
-      bytes.set(chunk, offset);
-      offset += chunk.byteLength;
-    }
-    return bytes;
+    return Buffer.concat(chunks, length);
   } catch (error) {
     throwIfAborted(signal);
     if (error instanceof AppError) throw error;
     throw failure("inventory.read_failed", undefined, error);
-  } finally {
-    signal.removeEventListener("abort", cancel);
-    await reader.cancel().catch(() => undefined);
-    reader.releaseLock();
   }
 }
 
+const csvHeader = ["sku", "name", "quantity"];
+
 function parseRows(bytes: Uint8Array, maxRows: number): CsvRow[] {
-  let records: unknown;
+  const seen = new Set<string>();
   let count = 0;
   try {
     const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-    records = parse(text, {
+    const rows = parse<CsvRow, unknown>(text, {
       bom: true,
       columns(header: string[]) {
         if (
-          header.length !== 3 ||
-          header[0] !== "sku" ||
-          header[1] !== "name" ||
-          header[2] !== "quantity"
+          header.length !== csvHeader.length ||
+          !csvHeader.every((name, index) => header[index] === name)
         ) {
           throw failure("inventory.invalid_header");
         }
@@ -230,38 +206,30 @@ function parseRows(bytes: Uint8Array, maxRows: number): CsvRow[] {
         count += 1;
         if (count > maxRows)
           throw failure("inventory.row_count", { min: 1, max: maxRows });
-        return record;
+        const result = rowSchema.safeParse(record);
+        if (!result.success) {
+          throw failure("inventory.invalid_row", {
+            record: count,
+            fields: result.error.issues.map((issue) => issue.path.join(".")),
+          });
+        }
+        if (seen.has(result.data.sku)) {
+          throw failure("inventory.duplicate_sku", {
+            record: count,
+            sku: result.data.sku,
+          });
+        }
+        seen.add(result.data.sku);
+        return { ...result.data, sourceRecord: count };
       },
     });
+    if (rows.length === 0)
+      throw failure("inventory.row_count", { min: 1, max: maxRows });
+    return rows;
   } catch (error) {
     if (error instanceof AppError) throw error;
     throw failure("inventory.invalid_csv", undefined, error);
   }
-  if (
-    !Array.isArray(records) ||
-    records.length < 1 ||
-    records.length > maxRows
-  ) {
-    throw failure("inventory.row_count", { min: 1, max: maxRows });
-  }
-  const seen = new Set<string>();
-  return records.map((record, index) => {
-    const result = rowSchema.safeParse(record);
-    if (!result.success) {
-      throw failure("inventory.invalid_row", {
-        record: index + 1,
-        fields: result.error.issues.map((issue) => issue.path.join(".")),
-      });
-    }
-    if (seen.has(result.data.sku)) {
-      throw failure("inventory.duplicate_sku", {
-        record: index + 1,
-        sku: result.data.sku,
-      });
-    }
-    seen.add(result.data.sku);
-    return { ...result.data, sourceRecord: index + 1 };
-  });
 }
 
 function chooseCut(
@@ -307,7 +275,7 @@ function present(row: StoredRow): InventoryRow {
   };
 }
 
-export const inventoryApplication: ApplicationModule<InventoryApi, Settings> = {
+const inventoryApplication: ApplicationModule<InventoryApi, Settings> = {
   id: "example.inventory",
   formatId: FORMAT,
   settings: combineSettings(runtimeSettings, inventorySettings),
@@ -341,14 +309,12 @@ export const inventoryApplication: ApplicationModule<InventoryApi, Settings> = {
       }),
     );
     const cas = env.own(await Cas.open(env.paths.objects));
-    const content = env.own(
-      createContent({
-        database,
-        cas,
-        maxImportBytes: MAX_FILE_BYTES,
-        maxInlineBytes: MAX_FILE_BYTES,
-      }),
-    );
+    const content = createContent({
+      database,
+      cas,
+      maxImportBytes: MAX_FILE_BYTES,
+      maxInlineBytes: MAX_FILE_BYTES,
+    });
 
     function checkSource(ref: ArtifactRef) {
       const source = database.read((tx) =>
@@ -366,25 +332,22 @@ export const inventoryApplication: ApplicationModule<InventoryApi, Settings> = {
       importCsv(input, options) {
         return env.execution.run(
           "inventory.import",
-          async (signal) => {
-            if (env.mode === "read-only") {
-              throw new AppError({
-                code: "runtime.read_only",
-                messageKey: "runtime.read_only",
-                details: { operation: "inventory.import" },
-              });
-            }
+          async (signal, call) => {
+            database.requireWritable("inventory.import");
             const settings = env.configuration.snapshot().inventory;
-            const progress = options?.onProgress;
             const bytes = await readBounded(
               input,
               settings.maxFileBytes,
               signal,
             );
-            progress?.({ stage: "inventory.read", completed: 1, total: 3 });
+            call.progress({ stage: "inventory.read", completed: 1, total: 3 });
             const rows = parseRows(bytes, settings.maxRows);
-            progress?.({ stage: "inventory.parsed", completed: 2, total: 3 });
-            throwIfAborted(signal);
+            call.progress({
+              stage: "inventory.parsed",
+              completed: 2,
+              total: 3,
+            });
+            call.throwIfAborted();
             const prepared = await content.materials.prepare(
               {
                 bytes,
@@ -400,7 +363,7 @@ export const inventoryApplication: ApplicationModule<InventoryApi, Settings> = {
             );
             try {
               // 所有 await 已结束；此检查之后进入一个完整的同步提交段。
-              throwIfAborted(signal);
+              call.throwIfAborted();
               const result = database.write((tx) => {
                 const source = prepared.adopt(tx);
                 tx.sql
@@ -433,7 +396,7 @@ export const inventoryApplication: ApplicationModule<InventoryApi, Settings> = {
                   rows: rows.length,
                 };
               });
-              progress?.({
+              call.progress({
                 stage: "inventory.committed",
                 completed: 3,
                 total: 3,
@@ -559,22 +522,21 @@ const importOutput = z.strictObject({
   sourceRef: artifactRefSchema,
   rows: z.int().nonnegative(),
 });
-type ImportInput = z.infer<typeof importJson> | z.infer<typeof importUpload>;
-
 export const inventoryOperations = [
   ...instanceOperations<InventoryApi>(),
-  defineOperation<InventoryApi, ImportInput, z.infer<typeof importOutput>>({
+  defineOperation<InventoryApi>()({
     id: "inventory.import",
     description: "Import a CSV batch of inventory SKU rows.",
     permission: "write",
     input: z.union([importJson, importUpload]),
+    binaryInput: importUpload,
     output: importOutput,
     mcp: { input: importJson },
     http: {
       method: "POST",
       path: "/inventory",
       status: 201,
-      binaryInput: importUpload,
+      binaryBody: true,
       queryStrings: ["name"],
     },
     cli: {
@@ -599,22 +561,19 @@ export const inventoryOperations = [
         ctx.options,
       ),
   }),
-  defineOperation<
-    InventoryApi,
-    z.infer<typeof importUpload>,
-    z.infer<typeof importOutput>
-  >({
+  defineOperation<InventoryApi>()({
     id: "inventory.importStream",
     description: "Import a CSV and stream ingestion progress.",
     permission: "write",
     kind: "stream",
     input: importUpload,
+    binaryInput: importUpload,
     output: importOutput,
     cli: false,
     http: {
       method: "POST",
       path: "/inventory/import-stream",
-      binaryInput: importUpload,
+      binaryBody: true,
       queryStrings: ["name"],
     },
     execute: (app, input, ctx) =>
@@ -638,7 +597,7 @@ export const inventoryOperations = [
         ctx.options,
       ),
   }),
-  defineOperation<InventoryApi, { ref: ArtifactRef }, BinaryReadResult>({
+  defineOperation<InventoryApi>()({
     id: "inventory.source",
     description: "Download the original CSV bytes.",
     permission: "read",
@@ -652,11 +611,7 @@ export const inventoryOperations = [
     },
     execute: (app, { ref }, ctx) => app.readSource(ref, ctx.options),
   }),
-  defineOperation<
-    InventoryApi,
-    { at?: CommitPoint | undefined },
-    { cut: CommitPoint; rows: InventoryRow[] }
-  >({
+  defineOperation<InventoryApi>()({
     id: "inventory.list",
     description: "List active inventory items at a commit cut.",
     permission: "read",
@@ -670,11 +625,7 @@ export const inventoryOperations = [
     },
     execute: (app, { at }, ctx) => app.list(at, ctx.options),
   }),
-  defineOperation<
-    InventoryApi,
-    { sku: string; at?: CommitPoint | undefined },
-    { cut: CommitPoint; rows: InventoryVersion[] }
-  >({
+  defineOperation<InventoryApi>()({
     id: "inventory.history",
     description: "List version history for an inventory SKU.",
     permission: "read",
@@ -697,11 +648,7 @@ export const inventoryOperations = [
     },
     execute: (app, { sku, at }, ctx) => app.history(sku, at, ctx.options),
   }),
-  defineOperation<
-    InventoryApi,
-    { ref: ArtifactRef; destination: string },
-    { sourceRef: ArtifactRef; destination: string }
-  >({
+  defineOperation<InventoryApi>()({
     id: "inventory.export",
     description: "Export the exact CSV source material by artifact ref.",
     permission: "read",

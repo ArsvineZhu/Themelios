@@ -4,7 +4,6 @@
 /artifacts/
 /packages/*/LICENSE
 /extensions/*/LICENSE
-/packages/transports/resources/proto/
 .env
 .env.*
 !.env.example

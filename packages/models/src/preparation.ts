@@ -2,31 +2,37 @@ import { createHash } from "node:crypto";
 import {
   AppError,
   appError,
+  isTextMedia,
   openCall,
+  readMediaBytes,
+  rangeSchema,
   throwIfAborted,
   type CallOptions,
+  type Completed,
+  type DeliveredMedia,
   type InputUse,
   type Json,
   type Material,
+  type MediaInput,
+  type ModalityNeed,
+  type PreparedRepresentation,
+  type RepresentationAdapter,
+  type SavedResult,
   type Selection,
 } from "@themelios/core";
+import { deliveredMedia } from "./delivery.js";
 import {
   detectInlineMimeType,
-  isTextMedia,
   normalizeMaterialInput,
-  rangeDescription,
-  readMediaBytes,
   readMediaText,
   resolveMedia,
+  resolveResultOutput,
+  type ResolvedMediaInput,
 } from "./media-input.js";
 import { createSourceDirectory, matchesMime } from "./schema.js";
-import {
-  createMediaDescriptionInlineTask,
-  prepareModelRepresentation,
-} from "./textualize.js";
+import { createPrompts } from "./prompts.js";
+import { planModelRepresentation } from "./textualize.js";
 import type {
-  MediaInput,
-  ModalityNeed,
   ModelCapabilities,
   ModelPart,
   Preparation,
@@ -34,15 +40,23 @@ import type {
   PreparationOptions,
   PreparationPlan,
   PreparationPolicy,
-  PreparedRepresentation,
-  RepresentationAdapter,
   SourceEntry,
   TaskMaterial,
   TaskMaterialInput,
   TaskRequirements,
 } from "./types.js";
 
-export { readMediaBytes, rangeDescription } from "./media-input.js";
+interface Delivery {
+  actual: Material[];
+  parts: ModelPart[];
+  coverage: DeliveredMedia[];
+}
+
+function partBytes(part: ModelPart): number {
+  return part.kind === "text"
+    ? Buffer.byteLength(part.text)
+    : part.bytes.byteLength;
+}
 
 type Route =
   | { kind: "native" }
@@ -116,6 +130,7 @@ export function createPreparation(
 ): Preparation {
   const maxMaterialBytes = options.maxMaterialBytes ?? 67_108_864;
   const maxInlineBytes = options.maxInlineBytes ?? 8_388_608;
+  let prompts = options.prompts;
   const adapters = [...(options.adapters ?? [])].sort(
     (a, b) =>
       b.description.priority - a.description.priority ||
@@ -130,6 +145,9 @@ export function createPreparation(
         issues: [{ path: "preparation", messageKey: "input.duplicate_recipe" }],
       },
     });
+  const normalizers = adapters.filter(
+    (adapter) => adapter.requiresNormalization !== undefined,
+  );
 
   function supports(
     adapter: RepresentationAdapter,
@@ -161,9 +179,16 @@ export function createPreparation(
     ) {
       return false;
     }
-    const knownImage = ["image/jpeg", "image/png", "image/webp"].includes(mime);
-    if (!knownImage || !options.imageNeedsOrientation) return true;
-    return !(await options.imageNeedsOrientation(input, call));
+    for (const adapter of normalizers) {
+      if (
+        adapter.description.inputMimeTypes.some((type) =>
+          matchesMime(type, mime),
+        ) &&
+        (await adapter.requiresNormalization?.(input, call))
+      )
+        return false;
+    }
+    return true;
   }
 
   function transform(
@@ -222,12 +247,13 @@ export function createPreparation(
     }
   }
 
-  function modelRoute(
+  async function modelRoute(
     input: MediaInput,
     needs: readonly ModalityNeed[],
     model: ModelCapabilities,
+    call: CallOptions,
     policy?: PreparationPolicy,
-  ): Route | undefined {
+  ): Promise<Route | undefined> {
     const rule = ruleFor(input.info.mediaType, policy?.models);
     if (
       !rule ||
@@ -239,7 +265,10 @@ export function createPreparation(
     const assist = options.models.describe(rule.model).capabilities;
     const operation =
       rule.recipe === "media.describe" ? "generate" : "transcribe";
-    if (covers(assist.needs, needs) && assist.operations.includes(operation)) {
+    if (
+      assist.operations.includes(operation) &&
+      (await installedRoute(input, needs, assist, call))
+    ) {
       return { kind: "model", recipe: rule.recipe, model: rule.model };
     }
   }
@@ -256,7 +285,7 @@ export function createPreparation(
     if (rule) return explicitRoute(input, key, needs, model, rule);
     return (
       (await installedRoute(input, needs, model, call)) ??
-      modelRoute(input, needs, model, policy) ??
+      (await modelRoute(input, needs, model, call, policy)) ??
       unsupported(
         input,
         key,
@@ -266,7 +295,7 @@ export function createPreparation(
   }
 
   async function part(
-    input: MediaInput,
+    input: ResolvedMediaInput,
     call: CallOptions,
     maxBytes: number,
   ): Promise<ModelPart> {
@@ -276,6 +305,14 @@ export function createPreparation(
         text: await readMediaText(input, options.store, call, maxBytes),
       };
     }
+    if (input.range) {
+      throw appError("input.capability_missing", {
+        details: {
+          mediaType: input.info.mediaType,
+          required: "representation for the selected range",
+        },
+      });
+    }
     return {
       kind: "media",
       bytes: await readMediaBytes(input, call, maxBytes),
@@ -284,22 +321,36 @@ export function createPreparation(
     };
   }
 
-  function representationRecipe(
+  async function planRepresentation(
     choice: Exclude<Route, { kind: "native" }>,
+    input: MediaInput,
     key: string,
-  ): { id: string; parameters?: Json } {
+    call: CallOptions,
+  ) {
     if (choice.kind === "model") {
-      const templates =
-        choice.recipe === "media.describe"
-          ? createMediaDescriptionInlineTask().templates
-          : null;
-      const binding =
-        options.modelIdentity?.(choice.model) ??
-        options.models?.describe(choice.model);
+      const planned = await planModelRepresentation({
+        recipe: choice.recipe,
+        model: choice.model,
+        input,
+        call,
+        models: options.models!,
+        prompts: (prompts ??= createPrompts()),
+        preparation,
+        ...(options.mediaDescriptionDefaults === undefined
+          ? {}
+          : {
+              descriptionDefaults: options.mediaDescriptionDefaults,
+            }),
+      });
       const hash = createHash("sha256")
-        .update(JSON.stringify({ binding, templates }))
+        .update(JSON.stringify(planned.identity))
         .digest("hex");
-      return { id: `${choice.recipe}:${hash}` };
+      return {
+        id: `${choice.recipe}:${hash}`,
+        action: `${choice.recipe} (${choice.model})`,
+        originalExtent: planned.originalExtent,
+        run: planned.run,
+      };
     }
     const { description } = choice.adapter;
     const parameters = description.parameters.safeParse(choice.parameters);
@@ -313,10 +364,30 @@ export function createPreparation(
         },
       });
     }
+    const identity = await choice.adapter.cacheIdentity?.();
     const hash = createHash("sha256")
-      .update(JSON.stringify([description.version, parameters.data]))
+      .update(
+        JSON.stringify([
+          description.version,
+          parameters.data,
+          identity ?? null,
+        ]),
+      )
       .digest("hex");
-    return { id: `${description.id}:${hash}`, parameters: parameters.data };
+    return {
+      id: `${description.id}:${hash}`,
+      action: description.id,
+      originalExtent: input.info.extent,
+      async run() {
+        const representation = await choice.adapter.prepare(
+          input,
+          parameters.data,
+          call,
+        );
+        choice.adapter.validateForModel?.(representation, input);
+        return representation;
+      },
+    };
   }
 
   async function trySavedRepresentation(
@@ -324,9 +395,7 @@ export function createPreparation(
     input: MediaInput,
     call: CallOptions,
     maxBytes: number,
-  ): Promise<
-    { actual: Material[]; parts: ModelPart[]; coverage: string[] } | undefined
-  > {
+  ): Promise<Delivery | undefined> {
     const store = options.store;
     if (!store?.findRepresentation || !("ref" in input.source)) return;
     const source: Selection = {
@@ -336,69 +405,45 @@ export function createPreparation(
     const found = store.findRepresentation(source, "model-input", recipe);
     if (!found) return;
     const saved = await store.readResult(found.result, call);
-    const actual: Material[] = found.outputs.map((output) => ({
-      result: saved,
-      output,
-    }));
-    const parts: ModelPart[] = [];
-    for (const selected of actual)
-      parts.push(await part(resolveMedia(selected, store), call, maxBytes));
-    return { actual, parts, coverage: describeOutputs(input, found.outputs) };
+    return readOutputs(saved, found.outputs, input, call, maxBytes);
   }
 
-  function describeOutputs(input: MediaInput, outputs: readonly string[]) {
-    const extent = rangeDescription(input);
-    return outputs.map((output) =>
-      outputs.length > 1 ? `${extent} (${output})` : extent,
-    );
+  async function readOutputs(
+    result: Completed | SavedResult,
+    outputs: readonly string[],
+    input: MediaInput,
+    call: CallOptions,
+    maxBytes: number,
+  ): Promise<Delivery> {
+    const actual: Material[] = [];
+    const parts: ModelPart[] = [];
+    const coverage: DeliveredMedia[] = [];
+    let remainingBytes = maxBytes;
+    for (const name of outputs) {
+      const selected = resolveResultOutput(result, name, options.store);
+      const modelPart = await part(selected, call, remainingBytes);
+      remainingBytes -= partBytes(modelPart);
+      actual.push(selected.source);
+      parts.push(modelPart);
+      coverage.push(
+        deliveredMedia(input, modelPart, {
+          name,
+          ...(selected.coverage === undefined
+            ? {}
+            : { coverage: selected.coverage }),
+        }),
+      );
+    }
+    return { actual, parts, coverage };
   }
 
   async function materialize(
-    choice: Route,
+    recipe: { id: string; run(): Promise<PreparedRepresentation> },
     input: MediaInput,
-    key: string,
     call: CallOptions,
     maxBytes: number,
-  ): Promise<{ actual: Material[]; parts: ModelPart[]; coverage: string[] }> {
-    if (choice.kind === "native") {
-      return {
-        actual: [input.source],
-        parts: [await part(input, call, maxBytes)],
-        coverage: [rangeDescription(input)],
-      };
-    }
-    const recipe = representationRecipe(choice, key);
-    const reused = await trySavedRepresentation(
-      recipe.id,
-      input,
-      call,
-      maxBytes,
-    );
-    if (reused) return reused;
-
-    let representation: PreparedRepresentation;
-    if (choice.kind === "transform") {
-      representation = await choice.adapter.prepare(
-        input,
-        recipe.parameters ?? {},
-        call,
-      );
-      choice.adapter.validateForModel?.(representation, input);
-    } else {
-      representation = await prepareModelRepresentation({
-        recipe: choice.recipe,
-        model: choice.model,
-        input,
-        call,
-        models: options.models!,
-        ...(options.prompts ? { prompts: options.prompts } : {}),
-        preparation,
-        maxMaterialBytes,
-        readPart: part,
-      });
-    }
-    let { result } = representation;
-    const { outputs } = representation;
+  ): Promise<Delivery> {
+    let { result, outputs } = await recipe.run();
     if ("ref" in input.source) {
       result = {
         ...result,
@@ -409,24 +454,22 @@ export function createPreparation(
         },
       };
     }
-    const actual = outputs.map((output) => ({ result, output }));
-    const parts: ModelPart[] = [];
-    for (const item of actual) {
-      parts.push(await part(resolveMedia(item, options.store), call, maxBytes));
-    }
-    return {
-      actual,
-      parts,
-      coverage: describeOutputs(input, outputs),
-    };
+    return readOutputs(result, outputs, input, call, maxBytes);
   }
 
   async function readSource(
     source: Material,
     key: string,
     signal: AbortSignal,
-  ): Promise<MediaInput> {
-    const input = resolveMedia(source, options.store);
+  ): Promise<ResolvedMediaInput> {
+    const input = await resolveMedia(source, options.store, { signal });
+    if (input.range) {
+      const parsed = rangeSchema.safeParse(input.range);
+      if (!parsed.success)
+        throw appError("content.range_invalid", {
+          details: { sourceKey: key, reason: "invalid material selection" },
+        });
+    }
     if ("bytes" in input.source) {
       if (input.source.bytes.byteLength > maxInlineBytes) {
         throw appError("content.inline_too_large", {
@@ -443,16 +486,58 @@ export function createPreparation(
         input.info.name,
       );
     }
-    if (input.info.sizeBytes > maxMaterialBytes) {
+    const byteSelection =
+      isTextMedia(input.info.mediaType) && input.range?.kind === "text";
+    const inputBytes = byteSelection
+      ? input.range.end - input.range.start
+      : input.info.sizeBytes;
+    if (inputBytes > maxMaterialBytes) {
       throw appError("model.input_too_large", {
         details: {
           sourceKey: key,
-          actualBytes: input.info.sizeBytes,
+          actualBytes: inputBytes,
           maxBytes: maxMaterialBytes,
         },
       });
     }
     throwIfAborted(signal);
+    return input;
+  }
+
+  async function originalInfo(
+    input: ResolvedMediaInput,
+    call: CallOptions,
+    selectedAdapter?: RepresentationAdapter,
+  ): Promise<ResolvedMediaInput> {
+    if (input.info.extent.kind !== "unknown") return input;
+    if (selectedAdapter) {
+      const extent = await selectedAdapter.probe(input, call);
+      return { ...input, info: { ...input.info, extent } };
+    }
+    for (const adapter of adapters) {
+      if (
+        !adapter.description.inputMimeTypes.some((mime) =>
+          matchesMime(mime, input.info.mediaType),
+        )
+      )
+        continue;
+      if (!(await adapter.available()).available) continue;
+      try {
+        const extent = await adapter.probe(input, call);
+        if (extent.kind !== "unknown")
+          return { ...input, info: { ...input.info, extent } };
+      } catch (error) {
+        throwIfAborted(call.signal);
+        // Optional metadata readers may lack a decoder for an otherwise valid native input.
+        if (
+          !(error instanceof AppError) ||
+          !["content.decode_failed", "input.capability_missing"].includes(
+            error.code,
+          )
+        )
+          throw error;
+      }
+    }
     return input;
   }
 
@@ -465,62 +550,84 @@ export function createPreparation(
     preview: boolean,
     remainingBytes: number,
   ) {
-    const input = await readSource(inputMaterial.source, key, call.signal!);
-    const wanted = ruleFor(input.info.mediaType, requirements.inputs);
-    if (!wanted) return unsupported(input, key, "task input media type");
+    const source = await readSource(inputMaterial.source, key, call.signal!);
+    const wanted = ruleFor(source.info.mediaType, requirements.inputs);
+    if (!wanted) return unsupported(source, key, "task input media type");
     const choice = await route(
-      input,
+      source,
       key,
       wanted.needs,
       model,
       call,
       call.preparation,
     );
+    const input =
+      choice.kind === "model"
+        ? source
+        : await originalInfo(
+            source,
+            call,
+            choice.kind === "transform" ? choice.adapter : undefined,
+          );
+    const recipe =
+      choice.kind === "native"
+        ? undefined
+        : await planRepresentation(choice, input, key, call);
     const role = inputMaterial.role ?? "primary";
     const entry: SourceEntry = {
       key,
       role,
       mediaType: input.info.mediaType,
-      originalExtent: rangeDescription(input),
-      deliveredExtent: [],
+      originalExtent: recipe?.originalExtent ?? input.info.extent,
+      requestedRange: input.range ?? null,
+      delivered: [],
       ...(input.info.name === undefined ? {} : { name: input.info.name }),
     };
-    const cached =
-      preview && choice.kind !== "native"
-        ? await trySavedRepresentation(
-            representationRecipe(choice, key).id,
-            input,
-            call,
-            remainingBytes,
-          )
-        : undefined;
-    if (preview && choice.kind !== "native" && !cached) {
-      const action =
-        choice.kind === "model"
-          ? `${choice.recipe} (${choice.model})`
-          : choice.adapter.description.id;
-      return {
-        entry,
-        input,
-        pending: {
-          sourceKey: key,
-          action,
-          requiresModel: choice.kind === "model",
-        },
-        parts: [{ kind: "text" as const, text: `<pending: ${action}>` }],
+    let delivered: Delivery;
+    if (!recipe) {
+      const native = await part(input, call, remainingBytes);
+      delivered = {
+        actual: [input.source],
+        parts: [native],
+        coverage: [deliveredMedia(input, native)],
       };
+    } else {
+      const cached = await trySavedRepresentation(
+        recipe.id,
+        input,
+        call,
+        remainingBytes,
+      );
+      if (preview && !cached) {
+        const action = recipe.action;
+        return {
+          entry,
+          input,
+          pending: {
+            sourceKey: key,
+            action,
+            requiresModel: choice.kind === "model",
+          },
+          parts: [{ kind: "text" as const, text: `<pending: ${action}>` }],
+        };
+      }
+      delivered =
+        cached ?? (await materialize(recipe, input, call, remainingBytes));
     }
-    const delivered =
-      cached ?? (await materialize(choice, input, key, call, remainingBytes));
     return {
-      entry: { ...entry, deliveredExtent: delivered.coverage },
+      entry: { ...entry, delivered: delivered.coverage },
       input,
       parts: delivered.parts,
       use: {
         source: input.source,
         delivered: delivered.actual,
         role,
-      } as InputUse,
+        coverage: {
+          originalExtent: entry.originalExtent,
+          requestedRange: entry.requestedRange,
+          delivered: delivered.coverage,
+        },
+      } satisfies InputUse,
     };
   }
 
@@ -533,10 +640,10 @@ export function createPreparation(
     maxBytes: number,
   ) {
     for (const part of parts) {
-      previous.bytes +=
-        part.kind === "text"
-          ? Buffer.byteLength(part.text)
-          : part.bytes.byteLength;
+      const mime = part.kind === "text" ? "text/plain" : part.mediaType;
+      if (!canSend(model, mime))
+        return unsupported(input, key, `model input supporting ${mime}`);
+      previous.bytes += partBytes(part);
       if (part.kind === "media" && part.mediaType.startsWith("image/"))
         previous.images++;
     }

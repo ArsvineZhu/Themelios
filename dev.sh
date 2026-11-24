@@ -9,8 +9,6 @@ if [ -n "${CODEX_THREAD_ID:-}${CODEX_SESSION_ID:-}${ANTIGRAVITY_AGENT:-}${CLAUDE
     export AGENT=1
 fi
 export UV_PYTHON_INSTALL_DIR="$THEMELIOS_REPO_ROOT/temp/tools/python"
-export CARGO_HOME="$THEMELIOS_REPO_ROOT/temp/tools/cargo-home"
-export CARGO_TARGET_DIR="$THEMELIOS_REPO_ROOT/temp/build/native"
 export BUN_INSTALL_CACHE_DIR="$THEMELIOS_REPO_ROOT/temp/cache/bun"
 export PIP_CACHE_DIR="$THEMELIOS_REPO_ROOT/temp/cache/pip"
 export RUFF_CACHE_DIR="$THEMELIOS_REPO_ROOT/temp/cache/ruff"
@@ -24,7 +22,7 @@ export ZVEC_GREP_HOME="$THEMELIOS_REPO_ROOT/temp/tools/zvec-grep/runtime"
 export ZVEC_GREP_MODEL_CACHE="$THEMELIOS_REPO_ROOT/temp/tools/zvec-grep/models"
 export THEMELIOS_BUN_DIR="$THEMELIOS_REPO_ROOT/temp/tools/bun-$(uname -s | tr '[:upper:]' '[:lower:]')"
 mkdir -p "$UV_CACHE_DIR" "$PYTHONPYCACHEPREFIX" \
-    "$UV_PYTHON_INSTALL_DIR" "$PIP_CACHE_DIR" "$RUFF_CACHE_DIR" "$CARGO_HOME" "$CARGO_TARGET_DIR" \
+    "$UV_PYTHON_INSTALL_DIR" "$PIP_CACHE_DIR" "$RUFF_CACHE_DIR" \
     "$BUN_INSTALL_CACHE_DIR" "$TEMP" "$npm_config_cache" "$XDG_CACHE_HOME"
 
 for themelios_bin in "$UV_PROJECT_ENVIRONMENT/bin" "$THEMELIOS_REPO_ROOT/temp/tools/zvec-grep/node_modules/@zvec/zvec-grep/bin" "$THEMELIOS_REPO_ROOT/temp/tools/codegraph/node_modules/.bin" "$THEMELIOS_BUN_DIR/node_modules/.bin" "$THEMELIOS_REPO_ROOT/node_modules/.bin"; do
@@ -41,7 +39,13 @@ export PATH
 if [ "${1:-env}" = "env" ]; then
     return 0 2>/dev/null || exit 0
 fi
-if (cd -- "$THEMELIOS_REPO_ROOT" && uv run --no-project --with tomlkit python -B "$THEMELIOS_REPO_ROOT/scripts/workspace.py" "${1:-env}"); then
+if (
+    cd -- "$THEMELIOS_REPO_ROOT" || exit
+    case "$1" in
+        bootstrap) python3 -B scripts/workspace.py bootstrap ;;
+        *) uv run --no-project --with tomlkit python -B scripts/workspace.py "$1" ;;
+    esac
+); then
     return 0 2>/dev/null || exit 0
 else
     themelios_status=$?

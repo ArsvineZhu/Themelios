@@ -3,9 +3,8 @@ import { basename, dirname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { orderedWorkspaces, repoRoot, run, workspaces } from "./workspaces.js";
 import {
-  materialize,
-  publishDirectory,
-  publishFile,
+  materializeLinks,
+  publishRelease,
   removeBuildTree,
   requireNew,
 } from "./portable/files.js";
@@ -134,19 +133,18 @@ export async function buildPortable(
   await requireNew(output);
   await requireNew(archiveOutput);
 
-  const stagingRoot = join(repoRoot, "artifacts", "staging");
+  const stagingRoot = join(repoRoot, "temp", "build", "portable");
   await mkdir(stagingRoot, { recursive: true });
   const staging = await mkdtemp(join(stagingRoot, `${target.name}-`));
   const build = join(staging, "build");
-  const app = join(staging, "app");
   // Keep the directory name the same inside the archive and at the chosen output path.
   const candidate = join(staging, "release", basename(output));
+  const app = join(candidate, "app");
   const localArchive = join(staging, `archive${target.extension}`);
   try {
     await buildInStaging(build, all, closure, name);
     await stageApplication(build, app, all, closure, name);
-    await mkdir(candidate, { recursive: true });
-    await materialize(app, join(candidate, "app"));
+    await materializeLinks(app);
     await copyLauncher(candidate, target);
     await mkdir(join(candidate, "config"));
     await Bun.write(
@@ -190,8 +188,7 @@ export async function buildPortable(
     });
     await archive(candidate, localArchive, target);
     await mkdir(dirname(output), { recursive: true });
-    await publishDirectory(candidate, output);
-    await publishFile(localArchive, archiveOutput);
+    await publishRelease(candidate, output, localArchive, archiveOutput);
     return { output, archive: archiveOutput };
   } finally {
     await removeBuildTree(staging).catch((error) =>

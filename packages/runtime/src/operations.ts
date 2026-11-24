@@ -15,7 +15,7 @@ import {
 } from "./paths.js";
 import type { Configuration } from "./settings.js";
 
-export type Permission = "read" | "write" | "admin";
+export type Permission = string;
 
 export interface Principal {
   readonly id: string;
@@ -29,16 +29,17 @@ export interface OperationContext {
 }
 
 export type OperationKind = "unary" | "stream" | "binary-read";
+export type HttpMethod = "GET" | "HEAD" | "POST" | "PATCH" | "PUT" | "DELETE";
 
 export interface HttpRouteSpec {
-  readonly method: "GET" | "POST";
+  readonly method: HttpMethod;
   readonly path: string;
   readonly status?: number;
   readonly paramMap?: Readonly<Record<string, string>>;
   readonly queryStrings?: readonly string[];
   readonly queryNumbers?: readonly string[];
   readonly mergeParamsIntoBody?: boolean;
-  readonly binaryInput?: z.ZodType;
+  readonly binaryBody?: boolean;
 }
 
 export interface McpToolSpec {
@@ -71,47 +72,73 @@ export interface CliCommandSpec {
   ): unknown | Promise<unknown>;
 }
 
-export interface Operation<App = unknown, I = unknown, O = unknown> {
+export type Operation<App = unknown, I = unknown, O = unknown, R = O> = {
   readonly id: string;
   readonly description: string;
   readonly permission: Permission;
-  readonly kind?: OperationKind;
   readonly input: z.ZodType<I>;
-  readonly output?: z.ZodType;
+  readonly binaryInput?: z.ZodType<I>;
   readonly http?: false | HttpRouteSpec | readonly HttpRouteSpec[];
   readonly mcp?: McpToolSpec;
   readonly cli?: CliCommandSpec | false;
   present?(
-    output: O,
+    output: R,
     app: App,
     context: OperationContext,
   ): string | Promise<string>;
-  execute(
-    app: App,
-    input: I,
-    context: OperationContext,
-  ): O | Promise<O> | Flow<O>;
-}
+} & (
+  | {
+      readonly kind?: "unary";
+      readonly output: z.ZodType;
+      execute(app: App, input: I, context: OperationContext): O | Promise<O>;
+    }
+  | {
+      readonly kind: "stream";
+      readonly output: z.ZodType;
+      execute(app: App, input: I, context: OperationContext): Flow<O>;
+    }
+  | {
+      readonly kind: "binary-read";
+      readonly output?: never;
+      execute(
+        app: App,
+        input: I,
+        context: OperationContext,
+      ): BinaryReadResult | Promise<BinaryReadResult>;
+    }
+);
 
-export type AnyOperation<App = any> = Operation<App, any, any>;
-export type OperationDirectory<App = any> = ReadonlyMap<
+export type AnyOperation<App = unknown> = Operation<App>;
+export type OperationDirectory<App = unknown> = ReadonlyMap<
   string,
-  Operation<App, unknown, unknown>
+  AnyOperation<App>
 >;
 
-export function defineOperation<App, I, O>(
-  spec: Operation<App, I, O>,
-): Operation<App, I, O> {
-  if (!/^[a-z][a-zA-Z0-9]*(?:\.[a-z][a-zA-Z0-9]*)+$/.test(spec.id)) {
-    throw appError("config.invalid", {
-      details: {
-        issues: [
-          { path: spec.id, messageKey: "transport.invalid_operation_id" },
-        ],
-      },
-    });
-  }
-  return Object.freeze(spec);
+export type OperationValue<T> = T extends object
+  ? { readonly [Key in keyof T]: OperationValue<T[Key]> }
+  : T;
+
+/** Bind a host API while inferring an operation's contract from its schemas. */
+export function defineOperation<App>() {
+  return <Input extends z.ZodType, Output extends z.ZodType>(
+    spec: Operation<
+      App,
+      z.output<NoInfer<Input>>,
+      OperationValue<z.input<NoInfer<Output>>>,
+      z.output<NoInfer<Output>>
+    > & { readonly input: Input; readonly output?: Output },
+  ) => {
+    if (!/^[a-z][a-zA-Z0-9]*(?:\.[a-z][a-zA-Z0-9]*)+$/.test(spec.id)) {
+      throw appError("config.invalid", {
+        details: {
+          issues: [
+            { path: spec.id, messageKey: "transport.invalid_operation_id" },
+          ],
+        },
+      });
+    }
+    return Object.freeze(spec);
+  };
 }
 
 export function assertOperationPermission(
@@ -128,7 +155,7 @@ export function assertOperationPermission(
 export function createOperationDirectory<App>(
   operations: readonly AnyOperation<App>[],
 ): OperationDirectory<App> {
-  const directory = new Map<string, Operation<App, unknown, unknown>>();
+  const directory = new Map<string, AnyOperation<App>>();
   for (const operation of operations) {
     if (directory.has(operation.id)) {
       throw appError("config.invalid", {
@@ -142,7 +169,7 @@ export function createOperationDirectory<App>(
         },
       });
     }
-    directory.set(operation.id, operation as Operation<App, unknown, unknown>);
+    directory.set(operation.id, operation);
   }
   return directory;
 }
@@ -203,24 +230,28 @@ export function callOperation<App>(
   id: string,
   rawInput: unknown,
   context: OperationContext,
-  inputSchema?: z.ZodType,
+  binary = false,
 ): Promise<unknown> | Flow<unknown> {
   const operation = directory.get(id);
   if (!operation) {
     throw appError("transport.not_found", { details: { operation: id } });
   }
   assertOperationPermission(operation, context.principal);
-  const input = parseValue(
-    inputSchema ?? operation.input,
-    rawInput,
-    "transport.invalid_request",
+  const schema = binary ? operation.binaryInput : operation.input;
+  if (!schema)
+    throw appError("transport.invalid_request", {
+      details: { operation: id, reason: "binary_input_not_supported" },
+    });
+  const input = parseValue(schema, rawInput, "transport.invalid_request");
+  if (operation.kind === "stream") {
+    return checkedFlow(operation, operation.execute(app, input, context));
+  }
+  if (operation.kind === "binary-read") {
+    return Promise.resolve(operation.execute(app, input, context));
+  }
+  return Promise.resolve(operation.execute(app, input, context)).then(
+    (output) => validateOutput(operation, output),
   );
-  const result = operation.execute(app, input, context);
-  return operation.kind === "stream"
-    ? checkedFlow(operation, result as Flow<unknown>)
-    : Promise.resolve(result).then((output) =>
-        validateOutput(operation, output),
-      );
 }
 
 export interface InstanceOperationTarget {
@@ -275,7 +306,7 @@ export function instanceOperations<
   App extends InstanceOperationTarget,
 >(): readonly AnyOperation<App>[] {
   return [
-    defineOperation<App, Record<string, never>, unknown>({
+    defineOperation<App>()({
       id: "instance.info",
       description: "Read instance identity and paths.",
       permission: "read",
@@ -292,7 +323,7 @@ export function configurationOperations<
   App extends ConfigurationOperationTarget,
 >(): readonly AnyOperation<App>[] {
   return [
-    defineOperation<App, { path?: string | undefined }, unknown>({
+    defineOperation<App>()({
       id: "configuration.describe",
       description: "Describe the available settings.",
       permission: "read",
@@ -302,7 +333,7 @@ export function configurationOperations<
       http: { method: "GET", path: "/configuration", queryStrings: ["path"] },
       execute: (app, { path }) => app.configuration.describe(path),
     }),
-    defineOperation<App, { path: string }, unknown>({
+    defineOperation<App>()({
       id: "configuration.explain",
       description:
         "Explain the source, desired and effective value of a setting.",
@@ -313,11 +344,7 @@ export function configurationOperations<
       http: { method: "POST", path: "/configuration/explain" },
       execute: (app, { path }) => app.configuration.explain(path),
     }),
-    defineOperation<
-      App,
-      { path: string; value: z.infer<typeof jsonSchema> },
-      unknown
-    >({
+    defineOperation<App>()({
       id: "configuration.set",
       description: "Update a managed setting.",
       permission: "admin",
@@ -327,7 +354,7 @@ export function configurationOperations<
       http: { method: "POST", path: "/configuration/set" },
       execute: (app, { path, value }) => app.configuration.set(path, value),
     }),
-    defineOperation<App, { path: string }, unknown>({
+    defineOperation<App>()({
       id: "configuration.unset",
       description: "Remove a managed setting.",
       permission: "admin",
@@ -337,7 +364,7 @@ export function configurationOperations<
       http: { method: "POST", path: "/configuration/unset" },
       execute: (app, { path }) => app.configuration.unset(path),
     }),
-    defineOperation<App, Record<string, never>, unknown>({
+    defineOperation<App>()({
       id: "configuration.reload",
       description: "Read updated configuration from disk.",
       permission: "admin",

@@ -1,6 +1,7 @@
 import { z } from "zod";
-import type { Json } from "@themelios/core";
-import { failure } from "./failure.js";
+import { appError, type Json } from "@themelios/core";
+import { isLanguageTag } from "./locales.js";
+import { networkTimeoutSchema, noProxySchema } from "./network.js";
 import { credentialSchema } from "./secrets.js";
 
 export type SettingScope = "installation" | "instance" | "task" | "call";
@@ -76,7 +77,7 @@ export const httpUrlSchema = z.url({ protocol: /^https?$/ }).refine(
 );
 
 const schema = z.strictObject({
-  locale: z.enum(["zh-CN", "en"]).default("zh-CN"),
+  locale: z.string().refine(isLanguageTag).default("zh-CN"),
   runtime: z
     .strictObject({
       shutdownGraceMs: z.int().min(0).max(300000).default(10000),
@@ -94,8 +95,9 @@ const schema = z.strictObject({
     .prefault({}),
   network: z
     .strictObject({
-      timeoutMs: z.int().min(1).max(3600000).default(60000),
+      timeoutMs: networkTimeoutSchema,
       proxy: httpUrlSchema.optional(),
+      noProxy: noProxySchema.default([]),
       proxyAuthorization: credentialSchema.optional(),
       caFile: z.string().min(1).optional(),
     })
@@ -146,6 +148,7 @@ export const runtimeSettings: SettingsDefinition<RuntimeSettings> = {
       unit: "ms",
     }),
     "/network/proxy": field("network/proxy", "reload"),
+    "/network/noProxy": field("network/noProxy", "reload"),
     "/network/proxyAuthorization": field(
       "network/proxyAuthorization",
       "reload",
@@ -182,25 +185,29 @@ export function combineSettings<A, B>(
     !(a.schema instanceof z.ZodObject) ||
     !(b.schema instanceof z.ZodObject)
   ) {
-    throw failure("config.invalid", {
-      issues: [{ path: "", messageKey: "config.object_required" }],
+    throw appError("config.invalid", {
+      details: {
+        issues: [{ path: "", messageKey: "config.object_required" }],
+      },
     });
   }
   const left = a.schema.shape;
   const right = b.schema.shape;
   const collision = Object.keys(left).find((key) => Object.hasOwn(right, key));
   if (collision) {
-    throw failure("config.invalid", {
-      issues: [
-        { path: "/" + collision, messageKey: "config.duplicate_setting" },
-      ],
+    throw appError("config.invalid", {
+      details: {
+        issues: [
+          { path: "/" + collision, messageKey: "config.duplicate_setting" },
+        ],
+      },
     });
   }
   return {
-    schema: z.strictObject({
-      ...left,
-      ...right,
-    }) as unknown as SettingsDefinition<A & B>["schema"],
+    // Each section validates its own values. Zod rejects keys absent from both sections.
+    schema: z.intersection(a.schema.strict(), b.schema.strict()) as z.ZodType<
+      A & B
+    >,
     fields: { ...a.fields, ...b.fields },
     validateEffective: (value) => [
       ...(a.validateEffective?.(value as Readonly<A>) ?? []),

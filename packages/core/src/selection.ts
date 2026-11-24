@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { appError } from "./errors.js";
+import { mediaTypeSchema } from "./media-type.js";
 
 export const artifactRefSchema = z
   .string()
@@ -83,7 +84,7 @@ export interface InlineMaterial {
 export const inlineMaterialSchema = z
   .strictObject({
     bytes: z.instanceof(Uint8Array),
-    mediaType: z.string().regex(/^[\w!#$&^.+-]+\/[\w!#$&^.+-]+$/),
+    mediaType: mediaTypeSchema.toLowerCase(),
     name: z.string().min(1).optional(),
   })
   .transform(({ bytes, mediaType, name }): InlineMaterial =>

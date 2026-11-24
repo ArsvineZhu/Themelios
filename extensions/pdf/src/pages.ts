@@ -1,5 +1,9 @@
-import { appError, throwIfAborted, type ProducedFile } from "@themelios/core";
-import { PDFDocument } from "pdf-lib";
+import {
+  appError,
+  throwIfAborted,
+  type RepresentationFile,
+} from "@themelios/core";
+import { PDFDocument, PDFName, PDFPageLeaf } from "pdf-lib";
 import type { PDFDocumentProxy } from "pdfjs-dist/legacy/build/pdf.mjs";
 
 export async function copyPages(
@@ -13,6 +17,12 @@ export async function copyPages(
     { length: range.end - range.start },
     (_entry, index) => range.start + index,
   );
+  const partial = pages.length < document.getPageCount();
+  if (partial) {
+    // Links, attached files and form widgets can retain objects outside the selected pages.
+    for (const page of pages)
+      document.getPage(page - 1).node.delete(PDFName.Annots);
+  }
   const copied = await selection.copyPages(
     document,
     pages.map((page) => page - 1),
@@ -20,6 +30,18 @@ export async function copyPages(
   for (const page of copied) {
     throwIfAborted(signal);
     selection.addPage(page);
+  }
+  if (partial) {
+    const embedded = selection.context
+      .enumerateIndirectObjects()
+      .filter(([, object]) => object instanceof PDFPageLeaf);
+    if (embedded.length !== pages.length)
+      throw appError("input.capability_missing", {
+        details: {
+          mediaType: "application/pdf",
+          required: "a PDF text or visual route for linked pages",
+        },
+      });
   }
   return { pages, bytes: await selection.save() };
 }
@@ -41,7 +63,7 @@ export async function renderPages(
       details: { mediaType: "application/pdf", required: ["visual"] },
     });
   });
-  const files: ProducedFile[] = [];
+  const files: RepresentationFile[] = [];
   const pages: { page: number; name: string; width: number; height: number }[] =
     [];
   let totalBytes = 0;
@@ -88,6 +110,10 @@ export async function renderPages(
         name,
         sourceIndices: [0],
         material: { bytes, mediaType: "image/png", name },
+        coverage: {
+          sourceRange: { kind: "pages", start: number, end: number + 1 },
+          extent: { kind: "image", width, height, frames: 1 },
+        },
       });
     } finally {
       page.cleanup();

@@ -35,7 +35,6 @@ Content 的采用操作同时保留顶层材料，应用无需为每条库存行
 | `main.ts`                                     | 应用设置、CSV 验证、ApplicationModule、业务操作与 HTTP/MCP/CLI 入口 |
 | `schema.sql`                                  | 库存导入及版本表，含数量范围、当前版本唯一性和来源约束              |
 | `package.json`                                | 实际消费包及 CSV/Zod 依赖                                           |
-| `install-release.ts`                          | 从同一目录安装本地发行包                                            |
 | `resources/locales/{zh-CN,en}/inventory.json` | 设置说明与应用错误词典                                              |
 
 `Database.init` 自建 Storage 的提交元数据表。应用通过 `@themelios/content/schema` 取得 `contentSchemaSql`，与自己的 SQL 一起初始化；这个应用没有时间域映射需求，因此无需加载 time 表。
@@ -48,10 +47,15 @@ Content 的采用操作同时保留顶层材料，应用无需为每条库存行
 
 在 Themelios 仓库运行 `bun run pack:packages -- core runtime storage content transports`。将本示例目录复制到仓库外的空目录。
 
-在消费目录运行以下命令。将 `/ABS/RELEASE/packages` 换成 `.tgz` 文件所在目录，例如构建仓库的 `artifacts/packages`。
+在 Themelios 仓库运行，指定消费目录：
 
 ```sh
-bun run install-release.ts /ABS/RELEASE/packages
+bun scripts/install-packages.ts ./artifacts/packages /ABS/CONSUMER
+```
+
+进入消费目录，初始化实例：
+
+```sh
 bun run main.ts --installation ./demo instance init
 ```
 

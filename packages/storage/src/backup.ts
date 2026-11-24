@@ -1,14 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { constants } from "node:fs";
-import {
-  copyFile,
-  link,
-  mkdir,
-  readFile,
-  rename,
-  unlink,
-  writeFile,
-} from "node:fs/promises";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import {
   basename,
   dirname,
@@ -18,14 +9,30 @@ import {
   resolve,
   sep,
 } from "node:path";
-import { AppError, commitPointSchema } from "@themelios/core";
+import {
+  AppError,
+  appError,
+  commitPointSchema,
+  errorCode,
+  throwIfAborted,
+} from "@themelios/core";
+import {
+  publishNewFile,
+  stageFile,
+  tryExclusiveFileLock,
+} from "@themelios/core/files";
 import { instantSchema } from "@themelios/core/time";
 import { z } from "zod";
-import { copyConfiguration, existing, removeStaging } from "./backup-files.js";
+import {
+  copyBackupFile,
+  copyConfiguration,
+  defaultBackupPaths,
+  existing,
+  removeStaging,
+} from "./backup-files.js";
 import { Cas } from "./cas.js";
 import { Database } from "./database.js";
-import { fileErrorCode, storageError } from "./errors.js";
-import { stageFile, syncParent, writeChunk } from "./files.js";
+import { syncParent, writeChunk } from "./files.js";
 import {
   readInventory,
   verifyDatabase,
@@ -57,9 +64,9 @@ const manifestSchema = z.strictObject({
   formatId: z.string().min(1),
   cut: commitPointSchema,
   createdAt: instantSchema,
-  artifacts: z.int().nonnegative(),
   blobs: z.int().nonnegative(),
   bytes: z.int().nonnegative(),
+  instancePaths: z.array(z.string()),
   installationConfig: installationConfigSchema,
 });
 
@@ -74,7 +81,9 @@ export interface BackupOptions {
   formatId: string;
   instanceRoot: string;
   installationConfigPath?: string;
-  paths?: string[];
+  /** Explicit instance-relative configuration paths under config/. */
+  paths?: readonly string[];
+  signal?: AbortSignal;
 }
 
 export interface RestoreOptions {
@@ -83,40 +92,52 @@ export interface RestoreOptions {
   applicationId: string;
   formatId: string;
   installationConfigPath?: string;
+  signal?: AbortSignal;
 }
 
 function digest(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
-async function readRegular(path: string): Promise<Buffer | undefined> {
+async function readRegular(
+  path: string,
+  signal?: AbortSignal,
+): Promise<Buffer | undefined> {
+  throwIfAborted(signal);
   const info = await existing(path);
   if (!info) return undefined;
   if (!info.isFile())
-    throw storageError("storage.backup_invalid", {
-      path,
-      reason: "expected a regular file",
+    throw appError("storage.backup_invalid", {
+      details: {
+        path,
+        reason: "expected a regular file",
+      },
     });
-  return readFile(path);
+  return readFile(path, signal ? { signal } : undefined);
 }
 
-async function readRecord<T>(path: string, schema: z.ZodType<T>): Promise<T> {
-  const data = await readRegular(path);
+async function readRecord<T>(
+  path: string,
+  schema: z.ZodType<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  const data = await readRegular(path, signal);
   if (data === undefined)
-    throw storageError("storage.backup_invalid", {
-      path,
-      reason: "required metadata file is missing",
+    throw appError("storage.backup_invalid", {
+      details: {
+        path,
+        reason: "required metadata file is missing",
+      },
     });
   try {
     return schema.parse(
       JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(data)),
     );
   } catch (error) {
-    throw storageError(
-      "storage.backup_invalid",
-      { path, reason: String(error) },
-      error,
-    );
+    throw appError("storage.backup_invalid", {
+      details: { path, reason: String(error) },
+      cause: error,
+    });
   }
 }
 
@@ -125,22 +146,28 @@ function checkIdentity(
   expected: { instanceId: string; applicationId: string; formatId: string },
 ): void {
   if (actual.applicationId !== expected.applicationId) {
-    throw storageError("runtime.application_mismatch", {
-      expected: expected.applicationId,
-      actual: actual.applicationId,
+    throw appError("runtime.application_mismatch", {
+      details: {
+        expected: expected.applicationId,
+        actual: actual.applicationId,
+      },
     });
   }
   if (actual.formatId !== expected.formatId) {
-    throw storageError("storage.format_mismatch", {
-      expected: expected.formatId,
-      actual: actual.formatId,
+    throw appError("storage.format_mismatch", {
+      details: {
+        expected: expected.formatId,
+        actual: actual.formatId,
+      },
     });
   }
   if (actual.id !== expected.instanceId) {
-    throw storageError("storage.backup_invalid", {
-      expected: expected.instanceId,
-      actual: actual.id,
-      reason: "instance identity mismatch",
+    throw appError("storage.backup_invalid", {
+      details: {
+        expected: expected.instanceId,
+        actual: actual.id,
+        reason: "instance identity mismatch",
+      },
     });
   }
 }
@@ -150,9 +177,11 @@ async function requireNew(
   operation: string,
 ): Promise<void> {
   if (await existing(destination))
-    throw storageError("storage.already_exists", {
-      operation,
-      path: destination,
+    throw appError("storage.already_exists", {
+      details: {
+        operation,
+        path: destination,
+      },
     });
 }
 
@@ -166,10 +195,12 @@ function separateTrees(
     !path ||
     (!isAbsolute(path) && path !== ".." && !path.startsWith(`..${sep}`))
   ) {
-    throw storageError("storage.backup_invalid", {
-      operation,
-      path: destination,
-      reason: "destination overlaps the source directory",
+    throw appError("storage.backup_invalid", {
+      details: {
+        operation,
+        path: destination,
+        reason: "destination overlaps the source directory",
+      },
     });
   }
 }
@@ -192,9 +223,11 @@ async function publish(
   staging: string,
   destination: string,
   operation: string,
+  signal?: AbortSignal,
 ): Promise<void> {
   for (let attempt = 0; ; attempt += 1) {
     await requireNew(destination, operation);
+    throwIfAborted(signal);
     try {
       await rename(staging, destination);
       return;
@@ -203,7 +236,7 @@ async function publish(
       // Windows can briefly deny renaming a just-written tree even after our handles are closed.
       if (
         process.platform !== "win32" ||
-        fileErrorCode(error) !== "EPERM" ||
+        errorCode(error) !== "EPERM" ||
         attempt === 5
       )
         throw error;
@@ -217,10 +250,14 @@ export async function backupStorage(
   options: BackupOptions,
 ): Promise<BackupManifest> {
   const destination = resolve(options.destination);
+  const { signal } = options;
+  throwIfAborted(signal);
   separateTrees(options.instanceRoot, destination, "backup");
+  let staging: string | undefined;
   try {
-    const staging = await workspace(destination, "backup");
+    staging = await workspace(destination, "backup");
     await mkdir(join(staging, "state"));
+    throwIfAborted(signal);
     options.database.snapshot(join(staging, databaseFile));
     const snapshot = Database.open({
       path: join(staging, databaseFile),
@@ -229,17 +266,23 @@ export async function backupStorage(
     });
     let captured: ReturnType<typeof readInventory>;
     try {
-      captured = readInventory(snapshot);
       verifyDatabase(snapshot);
+      captured = readInventory(snapshot);
     } finally {
       snapshot.close();
     }
     for (const record of captured.records)
-      await verifyObject(options.cas, record, join(staging, "objects"));
-    await copyConfiguration(options.instanceRoot, staging, options.paths);
+      await verifyObject(options.cas, record, signal, join(staging, "objects"));
+    const instancePaths = await copyConfiguration(
+      options.instanceRoot,
+      staging,
+      options.paths ?? defaultBackupPaths,
+      { required: options.paths !== undefined, ...(signal ? { signal } : {}) },
+    );
     const identity = await readRecord(
       join(staging, instanceFile),
       instanceSchema,
+      signal,
     );
     checkIdentity(identity, options);
     const stats: BackupInfo = {
@@ -247,18 +290,21 @@ export async function backupStorage(
       createdAt: new Date().toISOString(),
     };
     const installation = options.installationConfigPath
-      ? await readRegular(options.installationConfigPath)
+      ? await readRegular(options.installationConfigPath, signal)
       : undefined;
     if (installation)
       await writeFile(join(staging, installationFile), installation, {
         flag: "wx",
         mode: 0o600,
+        flush: true,
+        ...(signal ? { signal } : {}),
       });
     const manifest: BackupManifest = {
       ...stats,
       format: "themelios.backup",
       applicationId: options.applicationId,
       instanceId: options.instanceId,
+      instancePaths,
       installationConfig: installation
         ? { present: true, sha256: digest(installation) }
         : { present: false },
@@ -266,11 +312,13 @@ export async function backupStorage(
     await writeFile(
       join(staging, manifestFile),
       `${JSON.stringify(manifest, null, 2)}\n`,
-      { flag: "wx", mode: 0o600 },
+      { flag: "wx", mode: 0o600, flush: true, ...(signal ? { signal } : {}) },
     );
-    await publish(staging, destination, "backup");
+    await publish(staging, destination, "backup", signal);
     return manifest;
   } catch (error) {
+    if (staging) await removeStaging(staging).catch(() => undefined);
+    throwIfAborted(signal);
     throw maintenanceError("backup", destination, error);
   }
 }
@@ -279,17 +327,24 @@ async function copyData(
   backup: string,
   staging: string,
   manifest: BackupManifest,
+  signal?: AbortSignal,
 ): Promise<void> {
   const original = join(backup, databaseFile);
   const state = await existing(join(backup, "state"));
   if (!state?.isDirectory() || !(await existing(original))?.isFile()) {
-    throw storageError("storage.backup_invalid", {
-      path: original,
-      reason: "required database file is missing",
+    throw appError("storage.backup_invalid", {
+      details: {
+        path: original,
+        reason: "required database file is missing",
+      },
     });
   }
+  await mkdir(join(staging, "state"));
+  const copied = join(staging, databaseFile);
+  await copyBackupFile(original, copied, signal);
+  throwIfAborted(signal);
   const snapshot = Database.open({
-    path: original,
+    path: copied,
     formatId: manifest.formatId,
     readonly: true,
   });
@@ -300,85 +355,133 @@ async function copyData(
   } finally {
     snapshot.close();
   }
-  for (const field of ["cut", "artifacts", "blobs", "bytes"] as const) {
+  for (const field of ["cut", "blobs", "bytes"] as const) {
     if (captured.inventory[field] !== manifest[field]) {
-      throw storageError("storage.backup_invalid", {
-        field,
-        expected: manifest[field],
-        actual: captured.inventory[field],
+      throw appError("storage.backup_invalid", {
+        details: {
+          field,
+          expected: manifest[field],
+          actual: captured.inventory[field],
+        },
       });
     }
   }
-  await mkdir(join(staging, "state"));
-  await copyFile(
-    original,
-    join(staging, databaseFile),
-    constants.COPYFILE_EXCL,
-  );
   const source = await Cas.open(join(backup, "objects"));
   try {
     for (const record of captured.records)
-      await verifyObject(source, record, join(staging, "objects"));
+      await verifyObject(source, record, signal, join(staging, "objects"));
   } finally {
     await source.close();
   }
 }
 
-async function installationConfig(
+async function readArchivedConfig(
   backup: string,
   manifest: BackupManifest,
-  destination?: string,
-): Promise<(() => Promise<void>) | undefined> {
-  const archived = await readRegular(join(backup, installationFile));
-  const expected = manifest.installationConfig;
-  if (
-    expected.present !== (archived !== undefined) ||
-    (expected.present && expected.sha256 !== digest(archived!))
-  ) {
-    throw storageError("storage.backup_invalid", {
-      path: join(backup, installationFile),
-      reason: "installation configuration does not match the manifest",
+  signal?: AbortSignal,
+): Promise<Buffer | undefined> {
+  const path = join(backup, installationFile);
+  const archived = await readRegular(path, signal);
+  const expected = manifest.installationConfig.present
+    ? manifest.installationConfig.sha256
+    : undefined;
+  if (expected !== (archived === undefined ? undefined : digest(archived))) {
+    throw appError("storage.backup_invalid", {
+      details: {
+        path,
+        reason: "installation configuration does not match the manifest",
+      },
     });
   }
-  const current = destination ? await readRegular(destination) : undefined;
-  if (current) {
-    if (archived && current.equals(archived)) return undefined;
-    throw storageError("config.invalid", {
-      path: destination!,
-      reason: "installation configuration differs from the backup",
-    });
-  }
-  if (!archived) return undefined;
-  if (!destination)
-    throw storageError("config.invalid", {
-      reason: "specify the destination installation configuration path",
-    });
+  return archived;
+}
 
-  await mkdir(dirname(destination), { recursive: true });
-  await stageFile(
-    dirname(destination),
-    async (file) => {
-      await writeChunk(file, archived);
-    },
-    async (path) => {
-      try {
-        await link(path, destination);
-      } catch (error) {
-        if (fileErrorCode(error) === "EEXIST")
-          throw storageError("config.invalid", {
-            path: destination,
-            reason: "installation configuration appeared during restore",
-          });
-        throw error;
-      }
-      await syncParent(destination);
-    },
-  );
-  return async () => {
-    if ((await readRegular(destination))?.equals(archived)) {
-      await unlink(destination);
+function requireMatchingConfig(
+  path: string,
+  archived: Buffer | undefined,
+  current: Buffer,
+): void {
+  if (!archived?.equals(current))
+    throw appError("config.invalid", {
+      details: {
+        path,
+        reason: "installation configuration differs from the backup",
+      },
+    });
+}
+
+async function publishRestoredInstance(
+  staging: string,
+  destination: string,
+  archived: Buffer | undefined,
+  configureAt: string | undefined,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (!configureAt) {
+    if (archived) {
+      throw appError("config.invalid", {
+        details: {
+          reason: "specify the destination installation configuration path",
+        },
+      });
     }
-  };
+    return publish(staging, destination, "restore", signal);
+  }
+  const path = resolve(configureAt);
+  const directory = dirname(path);
+  const lockPath = join(directory, `.${basename(path)}.restore.lock`);
+  const preexisting = await readRegular(path, signal);
+  // A configuration created by restore always has a persistent coordination file.
+  if (preexisting && !(await existing(lockPath))) {
+    requireMatchingConfig(path, archived, preexisting);
+    return publish(staging, destination, "restore", signal);
+  }
+
+  await mkdir(directory, { recursive: true });
+  const release = await waitForRestoreLock(lockPath, signal);
+  try {
+    const current = await readRegular(path, signal);
+    if (current) requireMatchingConfig(path, archived, current);
+    if (!archived || current)
+      return await publish(staging, destination, "restore", signal);
+
+    await stageFile(
+      directory,
+      (file) => writeChunk(file, archived, signal),
+      (temporary) => {
+        throwIfAborted(signal);
+        publishNewFile(temporary, path);
+      },
+    );
+    try {
+      await syncParent(path);
+      await publish(staging, destination, "restore", signal);
+    } catch (cause) {
+      await removeUnchangedConfig(path, archived).catch(() => undefined);
+      throw cause;
+    }
+  } finally {
+    release();
+  }
+}
+
+async function waitForRestoreLock(
+  path: string,
+  signal?: AbortSignal,
+): Promise<() => void> {
+  for (;;) {
+    throwIfAborted(signal);
+    const release = tryExclusiveFileLock(path);
+    if (release) return release;
+    await Bun.sleep(25);
+  }
+}
+
+async function removeUnchangedConfig(
+  path: string,
+  archived: Buffer,
+): Promise<void> {
+  if ((await readRegular(path))?.equals(archived)) await unlink(path);
 }
 
 /** Verifies the backup before publishing a new instance directory or altering installation configuration. */
@@ -387,41 +490,47 @@ export async function restoreStorage(
 ): Promise<BackupManifest> {
   const destination = resolve(options.destination);
   const backup = resolve(options.backup);
+  const { signal } = options;
+  throwIfAborted(signal);
   separateTrees(backup, destination, "restore");
   let staging: string | undefined;
-  let rollbackConfig: (() => Promise<void>) | undefined;
   try {
     await requireNew(destination, "restore");
     const manifest = await readRecord(
       join(backup, manifestFile),
       manifestSchema,
+      signal,
     );
     const identity = await readRecord(
       join(backup, instanceFile),
       instanceSchema,
+      signal,
     );
     checkIdentity(identity, { ...options, instanceId: manifest.instanceId });
     checkIdentity(
       { ...manifest, id: manifest.instanceId },
       { ...options, instanceId: identity.id },
     );
+    const archivedConfig = await readArchivedConfig(backup, manifest, signal);
     staging = await workspace(destination, "restore");
-    await copyData(backup, staging, manifest);
-    await copyConfiguration(backup, staging);
+    await copyData(backup, staging, manifest, signal);
+    await copyConfiguration(backup, staging, manifest.instancePaths, {
+      required: true,
+      ...(signal ? { signal } : {}),
+    });
     for (const name of ["cache", "logs", "run", "objects"])
       await mkdir(join(staging, name), { recursive: true });
-    rollbackConfig = await installationConfig(
-      backup,
-      manifest,
+    await publishRestoredInstance(
+      staging,
+      destination,
+      archivedConfig,
       options.installationConfigPath,
+      signal,
     );
-    await publish(staging, destination, "restore");
     return manifest;
   } catch (error) {
-    await Promise.allSettled([
-      rollbackConfig?.(),
-      staging && removeStaging(staging),
-    ]);
+    if (staging) await removeStaging(staging).catch(() => undefined);
+    throwIfAborted(signal);
     throw maintenanceError("restore", destination, error);
   }
 }
@@ -433,9 +542,8 @@ function maintenanceError(
 ): AppError {
   return error instanceof AppError
     ? error
-    : storageError(
-        "storage.write_failed",
-        { operation, path, reason: String(error) },
-        error,
-      );
+    : appError("storage.write_failed", {
+        details: { operation, path, reason: String(error) },
+        cause: error,
+      });
 }

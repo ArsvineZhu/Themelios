@@ -11,6 +11,7 @@ import {
   type InlineMaterial,
   type InputUse,
   type Json,
+  type Material,
   type Producer,
   type SavedFile,
   type SavedResult,
@@ -29,13 +30,7 @@ import {
   type SourceLink,
 } from "./artifacts.js";
 import { captureImport, importArtifact, type ImportLimits } from "./imports.js";
-import {
-  captureResult,
-  resultLinks,
-  selectOutput,
-  type CapturedMaterial,
-  type CapturedResult,
-} from "./result-graph.js";
+import { captureResult, resultLinks, selectOutput } from "./result-graph.js";
 import {
   rawBytes,
   resultMediaType,
@@ -132,7 +127,10 @@ export function createResults(
     database.requireWritable(operation);
     const scope = openCall(operation, options);
     try {
-      const captured = captureResult(completed, limits.maxInlineBytes);
+      const captured = captureResult(
+        completed,
+        Math.min(limits.maxInlineBytes, limits.maxImportBytes),
+      );
       scope.throwIfAborted();
       const plan = await buildPlan(
         database,
@@ -222,12 +220,12 @@ async function buildPlan(
   database: Database,
   cas: Cas,
   limits: ImportLimits,
-  captured: CapturedResult,
+  captured: Completed,
   signal: AbortSignal,
 ) {
   const newArtifacts = new Map<ArtifactRef, PlannedArtifact>();
   const inlines = new WeakMap<InlineMaterial, ArtifactRef>();
-  const results = new WeakMap<CapturedResult, SavedResult>();
+  const results = new WeakMap<Completed, SavedResult>();
   const representations: Representation[] = [];
   const existingResults = new Map<ArtifactRef, SavedResult>();
   const lookup = (ref: ArtifactRef): ArtifactDraft =>
@@ -235,7 +233,7 @@ async function buildPlan(
     database.read((tx) => storedArtifact(tx.sql, ref));
 
   async function resolve(
-    material: CapturedMaterial,
+    material: Material,
     upstreamResults: Set<ArtifactRef>,
   ): Promise<Selection> {
     if ("bytes" in material) {
@@ -256,10 +254,10 @@ async function buildPlan(
       return material;
     }
     let result: SavedResult;
-    if ("ref" in material.result) {
+    if (typeof material.result === "string") {
       result =
-        existingResults.get(material.result.ref) ??
-        (await loadResult(database, cas, material.result.ref, signal));
+        existingResults.get(material.result) ??
+        (await loadResult(database, cas, material.result, signal));
       existingResults.set(result.ref, result);
     } else {
       result = await build(material.result);
@@ -268,7 +266,7 @@ async function buildPlan(
     return selectOutput(result.ref, result.files, material.output);
   }
 
-  async function build(node: CapturedResult): Promise<SavedResult> {
+  async function build(node: Completed): Promise<SavedResult> {
     const reused = results.get(node);
     if (reused) return reused;
     const upstream = new Set<ArtifactRef>();
@@ -278,7 +276,7 @@ async function buildPlan(
       const delivered: Selection[] = [];
       for (const material of use.delivered)
         delivered.push(await resolve(material, upstream));
-      inputs.push({ source, delivered, role: use.role });
+      inputs.push({ ...use, source, delivered });
     }
     const files: Record<string, SavedFile> = Object.create(null) as Record<
       string,
@@ -288,6 +286,7 @@ async function buildPlan(
       files[file.name] = {
         material: await resolve(file.material, upstream),
         sourceIndices: file.sourceIndices,
+        ...(file.coverage === undefined ? {} : { coverage: file.coverage }),
       };
     }
     const { value, producer } = node;

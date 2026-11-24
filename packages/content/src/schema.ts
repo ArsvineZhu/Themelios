@@ -4,11 +4,7 @@ CREATE TABLE artifacts (
   agent_code TEXT NOT NULL UNIQUE,
   kind TEXT NOT NULL CHECK (kind IN ('material', 'result')),
   media_type TEXT NOT NULL,
-  blob_ref TEXT NOT NULL CHECK (
-    length(blob_ref) = 71 AND substr(blob_ref, 1, 7) = 'sha256:'
-    AND substr(blob_ref, 8) NOT GLOB '*[^0-9a-f]*'
-  ),
-  size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+  blob_ref TEXT NOT NULL REFERENCES blobs(ref),
   name TEXT,
   extent_json TEXT NOT NULL CHECK (json_valid(extent_json)),
   origin_json TEXT CHECK (origin_json IS NULL OR json_valid(origin_json)),

@@ -22,6 +22,25 @@ export interface Flow<T> extends AsyncIterable<FlowEvent<T>> {
   cancel(reason?: string): void;
 }
 
+/** Transforms the final value without starting a second call or owning the source's deadline. */
+export function mapFlowResult<T, U>(
+  source: Flow<T>,
+  map: (value: T) => U | Promise<U>,
+): Flow<U> {
+  return {
+    cancel: (reason) => source.cancel(reason),
+    async *[Symbol.asyncIterator]() {
+      for await (const event of source) {
+        if (event.type === "result") {
+          yield { type: "result", value: await map(event.value) };
+          return;
+        }
+        yield event;
+      }
+    },
+  };
+}
+
 export interface CallScope {
   readonly signal: AbortSignal;
   remainingMs(): number;
@@ -233,4 +252,37 @@ export function createFlow<T>(
       };
     },
   };
+}
+
+/** Iterates input bytes and releases the owned stream reader on completion or cancellation. */
+export async function* streamChunks(
+  source: Uint8Array | ReadableStream<Uint8Array>,
+  signal?: AbortSignal,
+): AsyncGenerator<Uint8Array> {
+  if (source instanceof Uint8Array) {
+    throwIfAborted(signal);
+    yield source;
+    return;
+  }
+  const reader = source.getReader();
+  let cancellation: Promise<void> | undefined;
+  const cancel = () => {
+    cancellation ??= reader.cancel(signal?.reason).catch(() => undefined);
+  };
+  signal?.addEventListener("abort", cancel, { once: true });
+  let done = false;
+  try {
+    while (!done) {
+      throwIfAborted(signal);
+      const next = await reader.read();
+      done = next.done;
+      throwIfAborted(signal);
+      if (!next.done) yield next.value;
+    }
+  } finally {
+    signal?.removeEventListener("abort", cancel);
+    if (!done) cancel();
+    await cancellation;
+    reader.releaseLock();
+  }
 }

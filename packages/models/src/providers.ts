@@ -164,38 +164,50 @@ export function sdkMessages(messages: readonly ModelMessage[]): SdkMessage[] {
   });
 }
 
+export function mergeModelParameters(
+  base?: ModelParameters,
+  override?: ModelParameters,
+): ModelParameters | undefined {
+  if (!base || !override) return override ?? base;
+  const providerOptions = new Map(Object.entries(base.providerOptions ?? {}));
+  for (const [provider, fields] of Object.entries(
+    override.providerOptions ?? {},
+  )) {
+    providerOptions.set(provider, {
+      ...providerOptions.get(provider),
+      ...fields,
+    });
+  }
+  return {
+    ...base,
+    ...override,
+    ...(providerOptions.size
+      ? { providerOptions: Object.fromEntries(providerOptions) }
+      : {}),
+  };
+}
+
 function providerOptions(
   model: BoundModel,
-  parameters?: ModelParameters,
+  options: ModelParameters["providerOptions"],
 ): ProviderOptions {
   const key = model.connection.protocol;
   const result: ProviderOptions = {};
-  for (const options of [
-    model.binding.parameters?.providerOptions,
-    parameters?.providerOptions,
-  ]) {
-    if (options === undefined) continue;
-    for (const [name, value] of Object.entries(options)) {
-      if (
-        name !== key ||
-        !value ||
-        typeof value !== "object" ||
-        Array.isArray(value)
-      ) {
-        throw appError("model.invalid_request", {
-          details: {
-            binding: model.identity.binding,
-            issues: [
-              {
-                path: ["providerOptions", name],
-                reason: "Expected options for " + key,
-              },
-            ],
-          },
-        });
-      }
-      result[name] = { ...result[name], ...value };
+  for (const [name, value] of Object.entries(options ?? {})) {
+    if (name !== key) {
+      throw appError("model.invalid_request", {
+        details: {
+          binding: model.identity.binding,
+          issues: [
+            {
+              path: ["providerOptions", name],
+              reason: "Expected options for " + key,
+            },
+          ],
+        },
+      });
     }
+    result[name] = { ...value };
   }
   return result;
 }
@@ -326,10 +338,13 @@ export function requestParameters(
   model: BoundModel,
   override?: ModelParameters,
 ) {
-  const { temperature, topP, maxOutputTokens, seed } = {
-    ...model.binding.parameters,
-    ...override,
-  };
+  const {
+    temperature,
+    topP,
+    maxOutputTokens,
+    seed,
+    providerOptions: options,
+  } = mergeModelParameters(model.binding.parameters, override) ?? {};
   const max = model.binding.capabilities.limits?.maxOutputTokens;
   if (
     max !== undefined &&
@@ -348,7 +363,7 @@ export function requestParameters(
       },
     });
   }
-  const provider = providerOptions(model, override);
+  const provider = providerOptions(model, options);
   const openaiApi = provider.openai?.api;
   if (
     openaiApi !== undefined &&

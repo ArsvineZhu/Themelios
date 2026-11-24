@@ -3,9 +3,10 @@
   "entry": ["scripts/portable/launch.mjs"],
   "supportEntry": [
     "scripts/harness/run.mjs",
+    "scripts/install-packages.ts",
     "examples/embedded/embedded-summary.ts",
-    "examples/inventory/install-release.ts",
     "examples/inventory/main.ts",
+    "examples/sdk/*.ts",
     "tests/integration/transports/stdio-host.ts",
     "tests/platform/runtime/held-instance.ts"
   ],
@@ -17,13 +18,14 @@
     "@themelios/application",
     "@themelios/content",
     "@themelios/core",
+    "@themelios/media",
     "@themelios/models",
     "@themelios/pdf",
     "@themelios/runtime",
     "@themelios/storage",
     "@themelios/transports"
   ],
-  "ignoreDependencies": ["@ast-grep/cli"],
+  "ignoreDependencies": ["@ast-grep/cli", "@bufbuild/protoc-gen-es"],
   "cache": {
     "dir": "temp/cache/fallow"
   }

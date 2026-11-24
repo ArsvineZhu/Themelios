@@ -6,7 +6,12 @@
     "noEmit": true,
     "types": ["bun"]
   },
-  "include": ["scripts/**/*.mjs", "scripts/**/*.ts", "tests/**/*.ts"],
+  "include": [
+    "scripts/**/*.mjs",
+    "scripts/**/*.ts",
+    "tests/**/*.ts",
+    "examples/sdk/*.ts"
+  ],
   "references": [
     { "path": "./packages/core" },
     { "path": "./packages/runtime" },
@@ -14,6 +19,7 @@
     { "path": "./packages/content" },
     { "path": "./packages/models" },
     { "path": "./packages/application" },
+    { "path": "./extensions/media" },
     { "path": "./extensions/pdf" },
     { "path": "./packages/transports" },
     { "path": "./apps/workbench" }

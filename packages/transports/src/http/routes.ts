@@ -2,6 +2,7 @@ import type { Context } from "hono";
 import { MIMEType } from "node:util";
 import type {
   AnyOperation,
+  HttpMethod,
   HttpRouteSpec,
   OperationContext,
 } from "@themelios/runtime/operations";
@@ -9,7 +10,10 @@ import { transportError } from "../errors.js";
 import { readJson } from "../json.js";
 
 export type HttpEnvironment = {
-  Bindings: { operation: OperationContext & { maxJsonBytes: number } };
+  Bindings: {
+    operation: OperationContext & { maxJsonBytes: number };
+    setIdleTimeout?: (seconds: number) => void;
+  };
 };
 export type HttpContext = Context<HttpEnvironment>;
 
@@ -60,8 +64,8 @@ function stringQuery(ctx: HttpContext, keys?: readonly string[]) {
   return result;
 }
 
-function mediaType(header: string | undefined): string {
-  if (!header) return "application/octet-stream";
+function mediaType(header: string | undefined): string | undefined {
+  if (!header) return undefined;
   try {
     return new MIMEType(header).essence;
   } catch (cause) {
@@ -70,11 +74,11 @@ function mediaType(header: string | undefined): string {
 }
 
 export interface CompiledRoute<App = any> {
-  readonly method: "GET" | "POST";
+  readonly method: HttpMethod;
   readonly path: string;
   readonly operation: AnyOperation<App>;
   readonly status?: number;
-  readonly binaryInput?: HttpRouteSpec["binaryInput"];
+  readonly binaryBody?: boolean;
   extractInput(ctx: HttpContext): unknown | Promise<unknown>;
 }
 
@@ -95,35 +99,39 @@ function objectBody(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+function rawBody(ctx: HttpContext) {
+  const { body } = ctx.req.raw;
+  if (!body)
+    throw transportError("transport.invalid_request", {
+      reason: "body_required",
+    });
+  const declared = mediaType(ctx.req.header("content-type"));
+  return { body, ...(declared === undefined ? {} : { mediaType: declared }) };
+}
+
+function assertPathIdentity(
+  data: Record<string, unknown>,
+  paramMap: HttpRouteSpec["paramMap"],
+) {
+  for (const target of Object.values(paramMap ?? {})) {
+    if (Object.hasOwn(data, target))
+      throw transportError("transport.invalid_request", {
+        reason: `${target}_path_identity`,
+      });
+  }
+}
+
 async function readRoute(
   ctx: HttpContext,
   spec: HttpRouteSpec,
 ): Promise<unknown> {
   const fields = routeFields(ctx, spec);
-  if (spec.binaryInput) {
-    const { body } = ctx.req.raw;
-    if (!body)
-      throw transportError("transport.invalid_request", {
-        reason: "body_required",
-      });
-    return {
-      ...fields,
-      body,
-      mediaType: mediaType(ctx.req.header("content-type")),
-    };
-  }
-  if (spec.method === "GET") return fields;
+  if (spec.binaryBody) return { ...fields, ...rawBody(ctx) };
+  if (spec.method === "GET" || spec.method === "HEAD") return fields;
   const value = await jsonBody(ctx);
   if (!spec.mergeParamsIntoBody && !Object.keys(fields).length) return value;
   const data = objectBody(value);
-  if (spec.mergeParamsIntoBody)
-    for (const target of Object.values(spec.paramMap ?? {})) {
-      if (Object.hasOwn(data, target)) {
-        throw transportError("transport.invalid_request", {
-          reason: `${target}_path_identity`,
-        });
-      }
-    }
+  if (spec.mergeParamsIntoBody) assertPathIdentity(data, spec.paramMap);
   return { ...data, ...fields };
 }
 
@@ -135,10 +143,20 @@ function fromSpec<App>(
     method: spec.method,
     path: spec.path,
     operation,
-    ...(spec.binaryInput ? { binaryInput: spec.binaryInput } : {}),
+    ...(spec.binaryBody ? { binaryBody: true } : {}),
     ...(spec.status === undefined ? {} : { status: spec.status }),
     extractInput: (ctx) => readRoute(ctx, spec),
   };
+}
+
+/** Resolves explicit and default routes for both registration and discovery. */
+export function httpRouteSpecs(
+  operation: Pick<AnyOperation, "id" | "http">,
+): readonly HttpRouteSpec[] {
+  if (operation.http === false) return [];
+  if (operation.http === undefined)
+    return [{ method: "POST", path: `/operations/${operation.id}` }];
+  return [operation.http].flat();
 }
 
 export function compileHttpRoutes<App>(
@@ -146,20 +164,7 @@ export function compileHttpRoutes<App>(
 ): CompiledRoute<App>[] {
   const compiled: CompiledRoute<App>[] = [];
   for (const operation of operations) {
-    if (operation.http === false) continue;
-    if (!operation.http) {
-      compiled.push(
-        fromSpec(operation, {
-          method: "POST",
-          path: `/operations/${operation.id}`,
-        }),
-      );
-      continue;
-    }
-    const specs = Array.isArray(operation.http)
-      ? operation.http
-      : [operation.http];
-    for (const spec of specs) {
+    for (const spec of httpRouteSpecs(operation)) {
       compiled.push(fromSpec(operation, spec));
     }
   }

@@ -6,23 +6,15 @@
       "default": "zh-CN",
       "descriptionKey": "tasks.mediaDescription.fields.language",
       "type": "string",
-      "enum": [
-        "zh-CN",
-        "en"
-      ],
-      "description": "输出语言，zh-CN 或 en，默认 zh-CN。"
+      "minLength": 1,
+      "description": "输出语言，可填语言名称或标签，例如日语或 ja。默认使用简体中文。"
     },
     "instructions": {
       "default": null,
       "descriptionKey": "tasks.mediaDescription.fields.instructions",
-      "anyOf": [
-        {
-          "type": "string",
-          "maxLength": 4000
-        },
-        {
-          "type": "null"
-        }
+      "type": [
+        "string",
+        "null"
       ],
       "description": "本次描述重点，最多 4000 字符；null 或省略时采用完整材料描述。"
     }

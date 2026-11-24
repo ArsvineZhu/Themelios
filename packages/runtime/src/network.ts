@@ -1,9 +1,9 @@
 import { readFile } from "node:fs/promises";
 import { getCACertificates } from "node:tls";
-import { AppError, type CallScope } from "@themelios/core";
+import { appError, errorCode, AppError, type CallScope } from "@themelios/core";
+import { z } from "zod";
 import type { Closable } from "./execution.js";
 import type { Diagnostics } from "./diagnostics.js";
-import { errno, failure } from "./failure.js";
 import { createSecrets, type CredentialRef, type Secrets } from "./secrets.js";
 
 export interface Network extends Closable {
@@ -16,11 +16,35 @@ export interface Network extends Closable {
 export interface NetworkOptions {
   timeoutMs?: number;
   proxy?: string;
+  noProxy?: readonly string[];
   proxyAuthorization?: CredentialRef;
   caFile?: string;
   secrets?: Secrets;
   diagnostics?: Diagnostics;
 }
+
+function proxyHost(value: string): string | undefined {
+  if (value === "*") return value;
+  const tail = value.startsWith(".") || value.startsWith("*.");
+  const host = tail ? value.slice(value.indexOf(".") + 1) : value;
+  if (!/^[^\s/\\?#@*%:]+$/.test(host) && !/^\[[a-f\d:.]+\]$/i.test(host))
+    return undefined;
+  try {
+    const normalized = new URL(`http://${host}`).hostname.replace(/\.$/, "");
+    return tail ? `.${normalized}` : normalized;
+  } catch {
+    return undefined;
+  }
+}
+
+export const noProxySchema = z.array(
+  z.string().refine((value) => proxyHost(value) !== undefined),
+);
+export const networkTimeoutSchema = z
+  .int()
+  .positive()
+  .max(2_147_483_647)
+  .default(60_000);
 
 const transient = new Set([
   "ECONNRESET",
@@ -61,27 +85,39 @@ export async function createSessionNetwork(
   options: NetworkOptions,
   current: () => RequestContext | undefined,
 ): Promise<Network> {
-  const defaultTimeout = options.timeoutMs ?? 60000;
-  if (
-    !Number.isSafeInteger(defaultTimeout) ||
-    defaultTimeout < 1 ||
-    defaultTimeout > 3600000
-  ) {
-    throw failure("config.invalid", {
-      issues: [
-        { path: "/network/timeoutMs", messageKey: "config.invalid_value" },
-      ],
+  const timeout = networkTimeoutSchema.safeParse(options.timeoutMs);
+  if (!timeout.success) {
+    throw appError("config.invalid", {
+      details: {
+        issues: [
+          { path: "/network/timeoutMs", messageKey: "config.invalid_value" },
+        ],
+      },
     });
   }
+  const defaultTimeout = timeout.data;
   const proxy = options.proxy && proxyUrl(options.proxy);
+  const bypass = noProxySchema.safeParse(options.noProxy ?? []);
+  if (!bypass.success)
+    throw appError("config.invalid", {
+      details: {
+        issues: [
+          { path: "/network/noProxy", messageKey: "config.invalid_value" },
+        ],
+      },
+      cause: bypass.error,
+    });
+  const directHosts = bypass.data.map((host) => proxyHost(host)!);
   if (options.proxyAuthorization && !proxy) {
-    throw failure("config.invalid", {
-      issues: [
-        {
-          path: "/network/proxyAuthorization",
-          messageKey: "config.requires_proxy",
-        },
-      ],
+    throw appError("config.invalid", {
+      details: {
+        issues: [
+          {
+            path: "/network/proxyAuthorization",
+            messageKey: "config.requires_proxy",
+          },
+        ],
+      },
     });
   }
   const tls = options.caFile
@@ -90,15 +126,14 @@ export async function createSessionNetwork(
           ca: [...getCACertificates("default"), ca],
         }))
         .catch((error) => {
-          throw failure(
-            "network.failed",
-            { method: "GET", origin: "", phase: "read_ca" },
-            error,
-          );
+          throw appError("network.failed", {
+            details: { method: "GET", origin: "", phase: "read_ca" },
+            cause: error,
+          });
         })
     : undefined;
   const session = new Bun.FetchSession({
-    proxy: proxy ? { url: proxy, respectNoProxy: false } : false,
+    proxy: false,
     tls,
   });
   const secrets = options.secrets ?? createSecrets({ baseDir: process.cwd() });
@@ -109,10 +144,12 @@ export async function createSessionNetwork(
     input: string | URL | Request,
     init?: RequestInit,
   ): Promise<Response> {
-    if (closing) throw failure("runtime.closed", { state: "closing" });
+    if (closing)
+      throw appError("runtime.closed", { details: { state: "closing" } });
     const request = input instanceof Request ? input : undefined;
     const method = init?.method ?? request?.method ?? "GET";
-    const origin = requestOrigin(method, request?.url ?? String(input));
+    const url = requestUrl(method, request?.url ?? String(input));
+    const origin = url.origin;
     const {
       call,
       timeoutMs,
@@ -127,24 +164,47 @@ export async function createSessionNetwork(
     );
     const { signal, failed } = lifetime;
     active.add(lifetime);
+    let sentBytes: number | undefined;
+    let receivedBytes: number | undefined;
     const finish = () => {
+      if (!active.delete(lifetime)) return;
       lifetime.finish();
-      active.delete(lifetime);
+      for (const [direction, size] of [
+        ["sent", sentBytes],
+        ["received", receivedBytes],
+      ] as const) {
+        if (size !== undefined)
+          observeNetwork(() =>
+            diagnostics?.recordNetworkBytes?.(direction, size),
+          );
+      }
     };
     try {
       call?.throwIfAborted("network");
       signal.throwIfAborted();
       const ref = options.proxyAuthorization;
-      const proxyAuth =
-        proxy && ref
+      const host = url.hostname.replace(/\.$/, "");
+      const direct = directHosts.some(
+        (rule) =>
+          rule === "*" ||
+          rule === host ||
+          (rule.startsWith(".") &&
+            (host.endsWith(rule) || host === rule.slice(1))),
+      );
+      const route =
+        proxy && !direct
           ? {
-              proxy: {
-                url: proxy,
-                respectNoProxy: false,
-                headers: { "Proxy-Authorization": await secrets.resolve(ref) },
-              },
+              url: proxy,
+              respectNoProxy: false,
+              ...(ref
+                ? {
+                    headers: {
+                      "Proxy-Authorization": await secrets.resolve(ref),
+                    },
+                  }
+                : {}),
             }
-          : {};
+          : false;
       signal.throwIfAborted();
       // Connection policy belongs to this FetchSession, including when a caller shares Bun-specific fetch options.
       const requestInit = Object.fromEntries(
@@ -155,24 +215,27 @@ export async function createSessionNetwork(
       const response = await session.fetch(input, {
         ...requestInit,
         signal,
-        ...proxyAuth,
+        proxy: route,
       });
-      recordSentBytes(diagnostics, init?.body);
+      sentBytes = bodyByteLength(init?.body);
       if (!response.body) {
         finish();
         return response;
       }
-      return wrapBody(response, signal, finish, failed, (bytes) =>
-        diagnostics?.recordNetworkBytes?.("received", bytes),
-      );
+      receivedBytes = 0;
+      return wrapBody(response, signal, finish, failed, (bytes) => {
+        receivedBytes = (receivedBytes ?? 0) + bytes;
+      });
     } catch (error) {
       finish();
       const mapped = failed(error, "headers");
-      diagnostics?.log("debug", "network.request.failed", {
-        method,
-        origin,
-        code: mapped.code,
-      });
+      observeNetwork(() =>
+        diagnostics?.log("debug", "network.request.failed", {
+          method,
+          origin,
+          code: mapped.code,
+        }),
+      );
       throw mapped;
     }
   }
@@ -182,7 +245,11 @@ export async function createSessionNetwork(
     close() {
       closing ??= (async () => {
         for (const request of active)
-          request.stop(failure("call.cancelled", { reason: "network_closed" }));
+          request.stop(
+            appError("call.cancelled", {
+              details: { reason: "network_closed" },
+            }),
+          );
         await Promise.all([...active].map((request) => request.done));
         session.close();
       })();
@@ -191,15 +258,14 @@ export async function createSessionNetwork(
   };
 }
 
-function requestOrigin(method: string, address: string): string {
+function requestUrl(method: string, address: string): URL {
   try {
-    return new URL(address).origin;
+    return new URL(address);
   } catch (error) {
-    throw failure(
-      "network.failed",
-      { method, origin: "", phase: "url" },
-      error,
-    );
+    throw appError("network.failed", {
+      details: { method, origin: "", phase: "url" },
+      cause: error,
+    });
   }
 }
 
@@ -222,12 +288,10 @@ function requestLifetime(
       }
     }
     controller.abort(
-      failure(
-        "network.timeout",
-        { ...route, timeoutMs: budget },
-        undefined,
-        true,
-      ),
+      appError("network.timeout", {
+        details: { ...route, timeoutMs: budget },
+        retryable: true,
+      }),
     );
   }, Math.ceil(budget));
   timer.unref();
@@ -248,33 +312,35 @@ function requestLifetime(
       if (signal.aborted) {
         return signal.reason instanceof AppError
           ? signal.reason
-          : failure("call.cancelled", undefined, signal.reason);
+          : appError("call.cancelled", { cause: signal.reason });
       }
       return cause instanceof AppError
         ? cause
-        : failure(
-            "network.failed",
-            { ...route, phase },
-            cause,
-            transient.has(errno(cause) ?? ""),
-          );
+        : appError("network.failed", {
+            details: { ...route, phase },
+            cause: cause,
+            retryable: transient.has(errorCode(cause) ?? ""),
+          });
     },
   };
 }
 
-function recordSentBytes(
-  diagnostics: Diagnostics | undefined,
-  body: RequestInit["body"],
-): void {
-  const size =
-    typeof body === "string"
-      ? Buffer.byteLength(body)
-      : body instanceof Blob
-        ? body.size
-        : body instanceof ArrayBuffer || ArrayBuffer.isView(body)
-          ? body.byteLength
-          : undefined;
-  if (size !== undefined) diagnostics?.recordNetworkBytes?.("sent", size);
+function bodyByteLength(body: RequestInit["body"]): number | undefined {
+  return typeof body === "string"
+    ? Buffer.byteLength(body)
+    : body instanceof Blob
+      ? body.size
+      : body instanceof ArrayBuffer || ArrayBuffer.isView(body)
+        ? body.byteLength
+        : undefined;
+}
+
+function observeNetwork(report: () => void): void {
+  try {
+    report();
+  } catch {
+    // Diagnostics must not affect delivery or cancellation of a response.
+  }
 }
 
 function proxyUrl(value: string): string {
@@ -288,15 +354,14 @@ function proxyUrl(value: string): string {
       throw new Error("Invalid proxy URL");
     return url.href;
   } catch (error) {
-    throw failure(
-      "config.invalid",
-      {
+    throw appError("config.invalid", {
+      details: {
         issues: [
           { path: "/network/proxy", messageKey: "config.invalid_value" },
         ],
       },
-      error,
-    );
+      cause: error,
+    });
   }
 }
 

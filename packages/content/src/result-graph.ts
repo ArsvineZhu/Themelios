@@ -1,10 +1,8 @@
 import {
-  artifactRefSchema,
   completedSchema,
   type ArtifactRef,
   type Completed,
   type InlineMaterial,
-  type InputUse,
   type Material,
   type SavedFile,
   type SavedResult,
@@ -13,67 +11,50 @@ import {
 import type { SourceLink } from "./artifacts.js";
 import { contentError, pointer, validated } from "./validation.js";
 
-export type CapturedOutput = {
-  result: CapturedResult | { ref: ArtifactRef };
-  output?: string;
-};
-export type CapturedMaterial = InlineMaterial | Selection | CapturedOutput;
-export type CapturedResult = Omit<Completed, "inputs" | "files"> & {
-  inputs: readonly InputUse<CapturedMaterial>[];
-  files: readonly {
-    name: string;
-    material: InlineMaterial | Selection;
-    sourceIndices: readonly number[];
-  }[];
-};
-
 /** Snapshots mutable caller values before preparing bytes, keeping shared graph identities. */
 export function captureResult(
   root: Completed,
   maxInlineBytes: number,
-): CapturedResult {
+): Completed {
   const active = new WeakSet<Completed>();
-  const captured = new WeakMap<Completed, CapturedResult>();
+  const captured = new WeakMap<Completed, Completed>();
   const inlines = new WeakMap<Material, InlineMaterial>();
+
+  function copyInline(
+    original: Material,
+    material: InlineMaterial,
+  ): InlineMaterial {
+    const reused = inlines.get(original);
+    if (reused) return reused;
+    if (material.bytes.byteLength > maxInlineBytes) {
+      throw contentError("storage.limit_exceeded", {
+        maxBytes: maxInlineBytes,
+        sizeBytes: material.bytes.byteLength,
+      });
+    }
+    const inline = { ...material, bytes: new Uint8Array(material.bytes) };
+    inlines.set(original, inline);
+    return inline;
+  }
 
   function copyMaterial(
     original: Material,
     material: Material,
     path: (string | number)[],
-  ): CapturedMaterial {
-    if ("bytes" in material) {
-      const reused = inlines.get(original);
-      if (reused) return reused;
-      if (material.bytes.byteLength > maxInlineBytes) {
-        throw contentError("storage.limit_exceeded", {
-          maxBytes: maxInlineBytes,
-          sizeBytes: material.bytes.byteLength,
-        });
-      }
-      const inline = { ...material, bytes: new Uint8Array(material.bytes) };
-      inlines.set(original, inline);
-      return inline;
-    }
-    if ("ref" in material) return material;
-    const result =
-      "ref" in material.result
-        ? {
-            ref: validated(artifactRefSchema, material.result.ref, [
-              ...path,
-              "result",
-              "ref",
-            ]),
-          }
-        : copyResult(material.result, [...path, "result"]);
-    return material.output === undefined
-      ? { result }
-      : { result, output: material.output };
+  ): Material {
+    if ("bytes" in material) return copyInline(original, material);
+    if ("ref" in material || typeof material.result === "string")
+      return material;
+    return {
+      ...material,
+      result: copyResult(material.result, [...path, "result"]),
+    };
   }
 
   function copyResult(
     original: Completed,
     path: (string | number)[],
-  ): CapturedResult {
+  ): Completed {
     if (active.has(original))
       throw contentError("content.result_cycle", { path: pointer(path) });
     const reused = captured.get(original);
@@ -85,10 +66,10 @@ export function captureResult(
         original,
         path,
       );
-      const result: CapturedResult = {
+      const result: Completed = {
         ...structuredClone(manifest),
-        inputs: inputs.map(({ source, delivered, role }, index) => ({
-          role,
+        inputs: inputs.map(({ source, delivered, ...metadata }, index) => ({
+          ...metadata,
           source: copyMaterial(original.inputs[index]!.source, source, [
             ...path,
             "inputs",
@@ -105,15 +86,12 @@ export function captureResult(
             ]),
           ),
         })),
-        files: files.map(({ name, material, sourceIndices }, index) => ({
-          name,
-          material: copyMaterial(original.files[index]!.material, material, [
-            ...path,
-            "files",
-            index,
-            "material",
-          ]) as InlineMaterial | Selection,
-          sourceIndices,
+        files: files.map(({ material, ...metadata }, index) => ({
+          ...metadata,
+          material:
+            "bytes" in material
+              ? copyInline(original.files[index]!.material, material)
+              : material,
         })),
       };
       captured.set(original, result);

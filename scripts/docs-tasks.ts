@@ -46,7 +46,7 @@ for (const task of await workbenchTaskDescriptions("zh-CN")) {
     "变量 Schema 见 [输入合同](" +
       task.id +
       ".input.schema.json)。本次来源以 `S1`、`S2` 等键按输入排序。" +
-      "模板能读取名称、类型、角色和实际交付范围，程序随后追加正文或媒体。",
+      "模板能读取名称、类型、角色、原件范围、请求选区和实际交付，程序随后追加正文或媒体。",
     code(task.sourcesSchema),
     "## 输出",
     "",
@@ -60,15 +60,13 @@ for (const task of await workbenchTaskDescriptions("zh-CN")) {
     "",
     templates,
     "",
-    "内置模板位于工作台 `resources/tasks/" +
-      task.id +
-      "/`。用下列命令编辑当前实例的用户模板。",
+    "导出当前用户模板，编辑后写入实例覆盖。`request.json` 使用工作台指南中的任务请求格式。",
     "",
     "```sh",
     "themelios prompt read " + task.id + " --part user > edited.liquid",
     "themelios prompt edit " + task.id + " --part user --file edited.liquid",
-    "themelios task preview " + task.id + " --input request.json",
-    "themelios task run " + task.id + " --input request.json --save",
+    "themelios task preview --input request.json --json",
+    "themelios task run --input request.json --save",
     "```",
     "",
     ...task.examples.flatMap((example) => [

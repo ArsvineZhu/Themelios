@@ -10,7 +10,8 @@
 角色：{{ source.role }}
 媒体类型：{{ source.mediaType }}
 原件范围：{{ source.originalExtent }}
-实际交付范围：{{ source.deliveredExtent | join: '；' }}
+请求选区：{{ source.requestedRange }}
+实际交付：{% if source.deliveredExtent.size == 0 %}准备中{% else %}{{ source.deliveredExtent | join: '；' }}{% endif %}
 {% endfor %}
 
 各来源的实际内容由程序按同一顺序附加在本消息之后。

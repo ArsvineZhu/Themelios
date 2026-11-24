@@ -6,31 +6,23 @@
       "default": "zh-CN",
       "descriptionKey": "tasks.summary.fields.language",
       "type": "string",
-      "enum": [
-        "zh-CN",
-        "en"
-      ],
-      "description": "输出语言。省略时使用简体中文；en 使用英语。"
+      "minLength": 1,
+      "description": "输出语言，可填语言名称或标签，例如日语或 ja。默认使用简体中文。"
     },
     "maxSections": {
       "default": 6,
       "descriptionKey": "tasks.summary.fields.maxSections",
       "type": "integer",
       "minimum": 1,
-      "maximum": 12,
+      "maximum": 9007199254740991,
       "description": "最多分节数，1 至 12，默认 6。材料没有可总结内容时允许零节。"
     },
     "focus": {
       "default": null,
       "descriptionKey": "tasks.summary.fields.focus",
-      "anyOf": [
-        {
-          "type": "string",
-          "maxLength": 2000
-        },
-        {
-          "type": "null"
-        }
+      "type": [
+        "string",
+        "null"
       ],
       "description": "本次关注重点，最多 2000 个字符；null 或省略表示按材料本身组织。"
     }

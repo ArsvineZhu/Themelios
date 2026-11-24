@@ -15,6 +15,8 @@
 
 当后缀必须是无空格的裸字符串，且人类认读不是目标时，六个三字母单元连续拼接也是固定长度方案：18 个 ASCII 字符、60 位，六种 tokenizer 的样本平均为 6.43–7.46 token。
 
+对于固定 24 字符、无空格的 Agent 后缀，可以直接从普通 token 选取四字母单元，保留词表中的原始拼写。用同一选表方法比较时，允许大小写的候选表在六种 tokenizer 中都比限定小写的候选表更省 token。两张候选表的比较见[可读短引用的大小写](#可读短引用的大小写)。
+
 对照使用的 Proquint 后缀包含 48 位随机数，分为三个 CVCVC 单元，每个单元编码 16 位，见 [Proquint 原始论文](https://arxiv.org/abs/0901.4016)。
 
 ## 格式与取舍
@@ -27,7 +29,7 @@
 lawswakeborncoopfeedante
 ```
 
-按四字符边界可还原为 `laws wake born coop feed ante`。词表按英文频率、发音词典和 tokenizer 过滤，但仍包含专名、缩写和低频项；正式用于面向人的界面前应结合语境审核。英语词频只用于筛选词表，生成时各项等概率。
+按四字符边界可还原为 `laws wake born coop feed ante`。这张词表按英文频率、发音词典和 tokenizer 过滤，采用全小写，仍包含专名、缩写和低频项；正式用于面向人的界面前应结合语境审核。英语词频只用于筛选词表，生成时各项等概率。
 
 ### 仅追求 token 效率
 
@@ -62,6 +64,36 @@ Unicode 方案在本次样本中的 95 分位数：o200k 和 DeepSeek 为 4，cl
 实测 tokenizer 为 `tiktoken==0.12.0` 的 o200k_base、cl100k_base，以及 `tokenizers==0.22.1` 加载的 [Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B)、[Mistral-7B-v0.1](https://huggingface.co/mistralai/Mistral-7B-v0.1)、[Seed-OSS-36B-Instruct](https://huggingface.co/ByteDance-Seed/Seed-OSS-36B-Instruct) 和 [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) 官方 tokenizer。Hugging Face 测量关闭额外 special tokens，不套用 chat template。[DeepSeek-V3](https://huggingface.co/deepseek-ai/DeepSeek-V3)、[V3.2](https://huggingface.co/deepseek-ai/DeepSeek-V3.2)、[V4-Pro](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro) 和 [V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) 对可读方案样本得到与表中相同的 token 数分布。
 
 所用 Hugging Face 资源修订：Qwen3 `b968826d9c46dd6066d109eabc6255188de91218`，Mistral `27d67f1b5f57dc0953326b2601d68371d40ea8da`，Seed-OSS `1f44e2ee2b9d3b6a953c88afb2c84b4110635e73`，DeepSeek V4.1-Flash-1017 `1bae0e1088993b9b82de08f59de5be5a34e42170`。模型实际复制或选择后缀的准确率尚未测量。
+
+### 可读短引用的大小写
+
+用 Python `Random(20261105).getrandbits(60)` 生成 10,000 个值，按可读词表编码。同一个值的五种写法使用相同的六个单元和顺序；混合写法用独立的 `Random(20261124).getrandbits(1)` 为每个单元决定是否将首字母大写。使用上文的 tokenizer 版本和修订，统计完整 `art_` 引用的平均 token 数。
+
+| Tokenizer | 全小写 | 仅首字母大写 | 每个单元首字母大写 | 全大写 | 混合 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| o200k | 8.58 | 8.92 | 9.42 | 11.29 | 8.97 |
+| cl100k | 8.56 | 8.92 | 10.10 | 11.31 | 9.27 |
+| DeepSeek V4.1 | 9.34 | 9.50 | 10.60 | 12.61 | 9.92 |
+| Qwen3 | 8.56 | 8.92 | 10.10 | 11.31 | 9.27 |
+| Seed-OSS | 9.01 | 9.23 | 10.37 | 12.10 | 9.64 |
+| Mistral 7B | 10.56 | 10.86 | 12.37 | 13.76 | 11.43 |
+
+单独测后缀或将完整引用放入 `{"ref":"…"}` 时，把小写可读词表的单元改写为大写平均也会增加成本。个别序列的大写边界有利于分词，例如 o200k 中，每个单元首字母大写让 1,584 个完整引用变短，也让 5,931 个变长。
+
+从 token 选表时，四字母单元应以其在词表中的原始拼写参与比较。旧 Nous 的 `fixed65` 实现使用这里的 `fixed_first` 和 `fixed_rest` 两张原表。首表的 1,024 项中有 393 项含大写，后续表的 2,048 项中有 682 项含大写。首表中的 `port`、`Port` 和 `PORT` 是三个独立单元。将首表和后续表统一转为小写，分别只剩 685 和 1,527 种拼写，原编码的多个值会得到同一输出。旧 Nous 按其原始空格布局抽样时，六种 tokenizer 的后缀平均成本均为 6 token。
+
+对无空格的 `art_` 引用，从 o200k 普通 token 中提取四个 ASCII 字母的词面，并使用上文可读词表的屏蔽名单。用六种 tokenizer 对每个候选单元在 `art_` 和大小写相邻单元等八种上下文中的 token 数排序，以 o200k token ID 打破平局。分别从全小写候选和保留原拼写的候选中取前 1,024 项。两组均使用六个连续单元，长度为 24 字符，编码空间为 60 位。用种子 `4298848` 为每种格式抽取相同的 10,000 组位序，并统计完整引用。
+
+| Tokenizer | 按英文词频筛选的可读词表 | 从 token 选表，仅小写 | 从 token 选表，保留原拼写 |
+| --- | ---: | ---: | ---: |
+| o200k | 8.60 | 8.14 | 7.90 |
+| cl100k | 8.56 | 8.15 | 7.88 |
+| DeepSeek V4.1 | 9.35 | 8.39 | 8.31 |
+| Qwen3 | 8.56 | 8.15 | 7.88 |
+| Seed-OSS | 9.01 | 8.30 | 8.09 |
+| Mistral 7B | 10.56 | 8.61 | 8.27 |
+
+Themelios 的 Agent 短引用采用上表保留原拼写的码表，定义于 `packages/core/src/agent-id.ts`。该表含 324 个带大写的单元；全部转为小写时只剩 812 种拼写。显示、传输、解析和查找均需保留大小写。该实验测量分词成本，模型精确复制与选取标识符的准确率尚未测量。
 
 ## 词表与控制 token
 

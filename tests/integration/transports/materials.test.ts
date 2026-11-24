@@ -15,6 +15,7 @@ import {
 } from "@themelios/application";
 import { Installation } from "@themelios/runtime";
 import { createSecrets } from "@themelios/runtime/secrets";
+import { artifactRefSchema } from "@themelios/core";
 import {
   createHttpHandler,
   type RemoteTransportOptions,
@@ -39,11 +40,7 @@ test("HTTP, MCP HTTP, and MCP Stdio share operations, permissions, and Agent rea
   process.env.THEMELIOS_TEST_PROTOCOL_WRITE = writeToken;
   process.env.THEMELIOS_TEST_PROTOCOL_READ = readToken;
 
-  const customEcho = defineOperation<
-    ApplicationApi<ApplicationSettings>,
-    { text: string },
-    { echoed: string; appId: string }
-  >({
+  const customEcho = defineOperation<ApplicationApi<ApplicationSettings>>()({
     id: "custom.echo",
     description: "Echo a string along with the instance application id.",
     permission: "read",
@@ -54,6 +51,18 @@ test("HTTP, MCP HTTP, and MCP Stdio share operations, permissions, and Agent rea
       appId: api.info().applicationId,
     }),
   });
+  const subject = z.discriminatedUnion("kind", [
+    z.strictObject({ kind: z.literal("material"), value: artifactRefSchema }),
+    z.strictObject({ kind: z.literal("note"), value: z.string() }),
+  ]);
+  const echoSubject = defineOperation<object>()({
+    id: "custom.subject",
+    description: "Echo a material reference or a note.",
+    permission: "read",
+    input: subject,
+    output: subject,
+    execute: (_app, input) => input,
+  });
 
   const options: RemoteTransportOptions<ApplicationApi<ApplicationSettings>> = {
     enableMcp: true,
@@ -62,7 +71,7 @@ test("HTTP, MCP HTTP, and MCP Stdio share operations, permissions, and Agent rea
       template: "themelios://materials/{ref}",
       operation: "materials.read",
     },
-    operations: [...standardOperations(), customEcho],
+    operations: [...standardOperations(), customEcho, echoSubject],
     agentRefs: (app: typeof session.api) => ({
       resolveRef: app.materials.resolve,
       formatRef: app.materials.agentRef,
@@ -229,7 +238,6 @@ test("HTTP, MCP HTTP, and MCP Stdio share operations, permissions, and Agent rea
       }
     ).result;
     agentRef = inspectedResult.ref;
-    expect(agentRef).toMatch(/^art_[a-z]{24}$/);
     expect(agentRef).not.toBe(adopted.ref);
     expect(inspectedResult.name).toBe("original.txt");
 
@@ -256,6 +264,25 @@ test("HTTP, MCP HTTP, and MCP Stdio share operations, permissions, and Agent rea
     expect(echoMcp.structuredContent).toEqual({
       result: { echoed: agentRef, appId: "test.protocols" },
     });
+    for (const value of [agentRef, adopted.ref]) {
+      const input = { kind: "note", value };
+      expect(
+        (
+          await mcpClient.callTool({
+            name: "custom_subject",
+            arguments: input,
+          })
+        ).structuredContent,
+      ).toEqual({ result: input });
+    }
+    expect(
+      (
+        await mcpClient.callTool({
+          name: "custom_subject",
+          arguments: { kind: "material", value: agentRef },
+        })
+      ).structuredContent,
+    ).toEqual({ result: { kind: "material", value: agentRef } });
   } finally {
     await mcpClient.close();
     await endpoint.close();

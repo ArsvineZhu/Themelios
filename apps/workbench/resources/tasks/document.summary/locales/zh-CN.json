@@ -1,7 +1,7 @@
 {
   "tasks.summary.title": "材料摘要",
   "tasks.summary.purpose": "联合阅读本次主要材料，使用背景材料辅助理解，输出带材料级来源的分节摘要。",
-  "tasks.summary.fields.language": "输出语言。省略时使用简体中文；en 使用英语。",
+  "tasks.summary.fields.language": "输出语言，可填语言名称或标签，例如日语或 ja。默认使用简体中文。",
   "tasks.summary.fields.maxSections": "最多分节数，1 至 12，默认 6。材料没有可总结内容时允许零节。",
   "tasks.summary.fields.focus": "本次关注重点，最多 2000 个字符；null 或省略表示按材料本身组织。",
   "tasks.summary.fields.title": "摘要标题，1 至 200 个字符。",

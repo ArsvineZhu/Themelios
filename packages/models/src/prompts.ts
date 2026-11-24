@@ -1,12 +1,14 @@
-import { mkdir, readFile, realpath, rm, stat } from "node:fs/promises";
+import { mkdir, readFile, realpath, rm } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { appError, type Json, parseJson, parseValue } from "@themelios/core";
 import { Liquid, type FS, type Template } from "liquidjs";
 import PQueue from "p-queue";
 import writeFileAtomic from "write-file-atomic";
 import { z } from "zod";
+import { extentDescription } from "./delivery.js";
+import { rangeDescription } from "./media-input.js";
 import { modelNameSchema, sourceEntrySchema } from "./schema.js";
-import { inputVariables, taskInputJsonSchema } from "./tasks.js";
+import { inputVariables, taskInputJsonSchema } from "./task-definition.js";
 import type {
   CompiledPrompt,
   PromptDescription,
@@ -16,6 +18,7 @@ import type {
   PromptTemplates,
   SourceDirectory,
   TaskDefinition,
+  TaskTemplates,
 } from "./types.js";
 
 export * from "./types.js";
@@ -24,6 +27,7 @@ export { sourceEntrySchema };
 type Role = PromptFileInfo["role"];
 const roles = ["system", "user"] as const;
 type Task<I extends Json, O extends Json, RawI> = TaskDefinition<I, O, RawI>;
+type PromptOwner = { readonly id: string; readonly templates: TaskTemplates };
 
 interface CachedParse {
   readonly text: string;
@@ -105,16 +109,20 @@ function templateVariables<I extends Json, O extends Json, RawI>(
     });
   }
   const entries = sources.entries.map(
-    ({ key, mediaType, name, originalExtent, deliveredExtent, role: r }) => ({
-      key,
-      mediaType,
-      ...(name === undefined ? {} : { name }),
-      originalExtent,
-      deliveredExtent: [...deliveredExtent],
-      role: r,
+    ({ originalExtent, requestedRange, delivered, ...source }) => ({
+      ...source,
+      originalExtent: extentDescription(originalExtent),
+      requestedRange: rangeDescription(
+        requestedRange ? { range: requestedRange } : {},
+      ),
+      deliveredExtent: delivered.map(
+        ({ sourceRange, extent, mediaType, name }) =>
+          `${name ?? mediaType}: ${sourceRange?.kind === "timePoint" ? `frame at ${sourceRange.atMs} ms` : rangeDescription(sourceRange ? { range: sourceRange } : {})} (${mediaType}, ${extentDescription(extent)})`,
+      ),
+      coverage: { originalExtent, requestedRange, delivered },
     }),
   );
-  return { ...variables, sources: entries };
+  return { ...variables, sources: parseJson(entries) };
 }
 
 export function createPrompts(
@@ -137,10 +145,13 @@ export function createPrompts(
   const inlineCache = new Map<string, Template[]>();
   const engines = new Map<string, Liquid>();
 
-  function roots(id: string) {
+  function roots({ id, templates }: PromptOwner) {
     parseValue(modelNameSchema, id, "input.invalid");
+    const declaredRoot =
+      "resourceRoot" in templates ? templates.resourceRoot : undefined;
+    const selectedRoot = declaredRoot ? resolve(declaredRoot) : resourceRoot;
     return {
-      base: resourceRoot ? join(resourceRoot, id) : undefined,
+      base: selectedRoot ? join(selectedRoot, id) : undefined,
       override: overrideRoot ? join(overrideRoot, id) : undefined,
     };
   }
@@ -157,27 +168,16 @@ export function createPrompts(
     return contains(directory, target) && contains(parent, directory);
   }
 
-  function engineFor(id: string): Liquid {
-    const existing = engines.get(id);
+  function engineFor(task: PromptOwner): Liquid {
+    const { base, override } = roots(task);
+    const key = `${task.id}\0${base ?? ""}`;
+    const existing = engines.get(key);
     if (existing) return existing;
-    const { base, override } = roots(id);
     const searchRoots = [override, base].filter(
       (root): root is string => root !== undefined,
     );
     const rootFor = (path: string) =>
       searchRoots.find((root) => contains(root, path));
-    const loads = new Map<
-      string,
-      { mtimeMs: number; ctimeMs: number; size: number; text: string }
-    >();
-    const partials = new Map<
-      string,
-      Promise<{
-        templates: Template[];
-        file?: string;
-        stamp?: typeof loads extends Map<string, infer T> ? T : never;
-      }>
-    >();
     const fs: FS = {
       async exists(path) {
         const root = rootFor(path);
@@ -187,23 +187,7 @@ export function createPrompts(
       async readFile(path) {
         if (!(await fs.exists(path)))
           throw new Error("Template resource unavailable");
-        const info = await stat(path);
-        const cached = loads.get(path);
-        if (
-          cached &&
-          cached.mtimeMs === info.mtimeMs &&
-          cached.ctimeMs === info.ctimeMs &&
-          cached.size === info.size
-        )
-          return cached.text;
-        const text = await readFile(path, "utf8");
-        loads.set(path, {
-          mtimeMs: info.mtimeMs,
-          ctimeMs: info.ctimeMs,
-          size: info.size,
-          text,
-        });
-        return text;
+        return readFile(path, "utf8");
       },
       readFileSync: () => {
         throw new Error("Use asynchronous template rendering");
@@ -223,40 +207,8 @@ export function createPrompts(
       strictFilters: true,
       ownPropertyOnly: true,
       lenientIf: true,
-      cache: {
-        write(key, value) {
-          const entry = Promise.resolve(value).then((templates) => {
-            const file = templates[0]?.token.file;
-            const stamp = file ? loads.get(file) : undefined;
-            return { templates, ...(file && stamp ? { file, stamp } : {}) };
-          });
-          void entry.catch(() => undefined);
-          partials.set(key, entry);
-        },
-        async read(key) {
-          const entry = await partials.get(key);
-          if (!entry?.file || !entry.stamp || !(await fs.exists(entry.file)))
-            return undefined;
-          if (
-            !key.includes(",") &&
-            base &&
-            override &&
-            contains(base, entry.file)
-          ) {
-            const candidate = join(override, relative(base, entry.file));
-            if (await fs.exists(candidate)) return undefined;
-          }
-          await fs.readFile(entry.file);
-          return loads.get(entry.file) === entry.stamp
-            ? entry.templates
-            : undefined;
-        },
-        remove(key) {
-          partials.delete(key);
-        },
-      },
     });
-    engines.set(id, engine);
+    engines.set(key, engine);
     return engine;
   }
 
@@ -277,8 +229,8 @@ export function createPrompts(
   async function load<I extends Json, O extends Json, RawI>(
     task: Task<I, O, RawI>,
   ) {
-    const { base, override } = roots(task.id);
-    const engine = engineFor(task.id);
+    const { base, override } = roots(task);
+    const engine = engineFor(task);
     const files = task.templates as { system: string; user: string };
     const names = roles.map((role) => files[role]);
     const [builtin, overrides] = await Promise.all([
@@ -312,7 +264,7 @@ export function createPrompts(
       });
       return { system, user: task.templates.user, files };
     }
-    const { base, override } = roots(task.id);
+    const { base, override } = roots(task);
     const spec = task.templates as { system: string; user: string };
     const pick = (role: Role, useOverride = true) => {
       const name = spec[role];
@@ -408,7 +360,7 @@ export function createPrompts(
         },
       });
     }
-    const { override } = roots(task.id);
+    const { override } = roots(task);
     if (!override)
       throw appError("runtime.read_only", {
         details: { operation: "prompts.update" },
@@ -455,7 +407,7 @@ export function createPrompts(
         ? {
             builtin: new Map<string, string>(),
             overrides: new Map<string, string>(),
-            engine: engineFor(task.id),
+            engine: engineFor(task),
           }
         : await load(task);
       const resolved = resolveFileTemplates(task, loaded);
@@ -489,7 +441,7 @@ export function createPrompts(
           builtin: resolved[file.role],
         }));
       }
-      const { base, override } = roots(task.id);
+      const { base, override } = roots(task);
       const snapshot = await load(task);
       const spec = task.templates as { system: string; user: string };
       return roles.map((role) => {
@@ -513,7 +465,7 @@ export function createPrompts(
       return edits.add(async () => {
         const { root, templates } = requireFileOverride(task);
         const path = templatePath(root, templates[role]);
-        const engine = engineFor(task.id);
+        const engine = engineFor(task);
         let parsed: Template[];
         try {
           parsed = engine.parse(template, path);

@@ -5,12 +5,10 @@
     "title": {
       "type": "string",
       "minLength": 1,
-      "maxLength": 200,
       "descriptionKey": "tasks.summary.fields.title",
       "description": "摘要标题，1 至 200 个字符。"
     },
     "sections": {
-      "maxItems": 12,
       "type": "array",
       "items": {
         "type": "object",
@@ -18,20 +16,17 @@
           "heading": {
             "type": "string",
             "minLength": 1,
-            "maxLength": 160,
             "descriptionKey": "tasks.summary.fields.heading",
             "description": "本节标题，1 至 160 个字符。"
           },
           "markdown": {
             "type": "string",
             "minLength": 1,
-            "maxLength": 20000,
             "descriptionKey": "tasks.summary.fields.markdown",
             "description": "本节自由正文，1 至 20000 个字符，使用 Markdown。"
           },
           "sourceKeys": {
             "minItems": 1,
-            "maxItems": 64,
             "type": "array",
             "items": {
               "type": "string",
@@ -53,7 +48,6 @@
     },
     "notes": {
       "type": "string",
-      "maxLength": 4000,
       "descriptionKey": "tasks.summary.fields.notes",
       "description": "需要读者了解的材料缺失、原始分歧或处理说明；没有说明时为空字符串，最多 4000 个字符。"
     }

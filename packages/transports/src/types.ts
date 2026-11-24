@@ -40,18 +40,29 @@ export interface McpResourceSpec {
   readonly linksFrom?: readonly string[];
 }
 
-export interface RemoteTransportOptions<App = any> {
+export interface RemoteOperationOptions<App = unknown> {
   readonly policy: () => Readonly<TransportPolicy>;
   readonly secrets: Secrets;
   readonly authenticate?: Authenticate;
   readonly translate?: Translate;
   readonly operations: readonly AnyOperation<App>[];
   readonly allowOperations?: readonly string[];
+  readonly locale?: () => string | undefined;
+  readonly languages?: readonly string[];
+}
+
+export interface RemoteTransportOptions<
+  App = unknown,
+> extends RemoteOperationOptions<App> {
   readonly agentRefs?: (app: App) => AgentRefBridge;
   readonly name?: string;
   readonly resource?: McpResourceSpec;
   readonly enableMcp?: boolean;
-  readonly locale?: () => string | undefined;
+}
+
+export interface GrpcListener {
+  readonly address: { readonly host: string; readonly port: number };
+  readonly tls?: { readonly key: CredentialRef; readonly cert: CredentialRef };
 }
 
 export interface McpStdioOptions<App = any> {
@@ -67,6 +78,9 @@ export interface McpStdioOptions<App = any> {
 }
 
 export interface HttpEndpoint {
-  fetch(request: Request): Promise<Response>;
+  fetch(
+    request: Request,
+    setIdleTimeout?: (seconds: number) => void,
+  ): Promise<Response>;
   close(): Promise<void>;
 }

@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
+  appError,
   AppError,
   attachTraceId,
   createFlow,
@@ -17,7 +18,6 @@ import {
   type RuntimeDiagnostics,
   type TraceFrame,
 } from "./diagnostics.js";
-import { failure } from "./failure.js";
 import type { Network } from "./network.js";
 import type { Secrets } from "./secrets.js";
 import type { RuntimeSettings } from "./settings.js";
@@ -34,12 +34,12 @@ export interface TaskHandle<T> {
 export interface Execution {
   run<T>(
     name: string,
-    work: (signal: AbortSignal) => Promise<T>,
+    work: (signal: AbortSignal, call: CallScope) => Promise<T>,
     options?: CallOptions,
   ): Promise<T>;
   start<T>(
     name: string,
-    work: (signal: AbortSignal) => Promise<T>,
+    work: (signal: AbortSignal, call: CallScope) => Promise<T>,
     options?: CallOptions,
   ): TaskHandle<T>;
   flow<T>(
@@ -65,10 +65,14 @@ export interface OperationResources<S> extends ResourceContext<S> {
   hold(): () => void;
 }
 
+type ExecutionScope<S> = {
+  call: CallScope;
+  resources: OperationResources<S>;
+  active: boolean;
+};
+
 type FrameStore<S> = {
-  call?: CallScope;
-  resources?: OperationResources<S>;
-  active?: boolean;
+  execution?: ExecutionScope<S>;
   trace: TraceFrame;
 };
 
@@ -83,6 +87,34 @@ interface OperationLease {
   withContext<T>(work: () => T): T;
   end(error?: unknown): void;
   failure(error: unknown): AppError;
+  cleanupFailed(error: AppError): void;
+}
+
+async function finalizeFlow<T>(
+  context: OperationLease,
+  unfinished: Flow<T> | undefined,
+  iterator: AsyncIterator<FlowEvent<T>> | undefined,
+  cause: AppError | undefined,
+) {
+  try {
+    try {
+      unfinished?.cancel("operation cancelled");
+    } finally {
+      await context.withContext(() => iterator?.return?.());
+    }
+  } catch (error) {
+    const cleanup = context.failure(error);
+    if (!cause) {
+      cause = cleanup;
+      throw cleanup;
+    }
+    context.cleanupFailed(cleanup);
+  } finally {
+    context.end(
+      cause ??
+        (context.call.signal.aborted ? context.call.signal.reason : undefined),
+    );
+  }
 }
 
 /** Captures resources, budget, and trace context in a single AsyncLocalStorage across async calls and streams. */
@@ -97,36 +129,36 @@ export class SessionExecution<S> implements Execution {
     | {
         call: CallScope;
         resources: OperationResources<S>;
-        active: boolean;
         trace: TraceFrame;
       }
     | undefined {
     const context = this.#local.getStore();
-    return context?.active && context.call && context.resources
+    const execution = context?.execution;
+    return context && execution?.active
       ? {
-          call: context.call,
-          resources: context.resources,
-          active: true,
+          call: execution.call,
+          resources: execution.resources,
           trace: context.trace,
         }
       : undefined;
   }
 
   currentTrace(): TraceFrame | undefined {
-    return this.#local.getStore()?.trace;
+    const store = this.#local.getStore();
+    return store?.execution?.active === false ? undefined : store?.trace;
   }
 
   enterTrace<T>(frame: TraceFrame, work: () => Promise<T>): Promise<T> {
-    const store = this.#local.getStore();
+    const execution = this.#local.getStore()?.execution;
     return this.#local.run(
-      store ? { ...store, trace: frame } : { trace: frame },
+      execution?.active ? { execution, trace: frame } : { trace: frame },
       work,
     );
   }
 
   run<T>(
     name: string,
-    work: (signal: AbortSignal) => Promise<T>,
+    work: (signal: AbortSignal, call: CallScope) => Promise<T>,
     options?: CallOptions,
   ): Promise<T> {
     return this.start(name, work, options).result;
@@ -134,7 +166,7 @@ export class SessionExecution<S> implements Execution {
 
   start<T>(
     name: string,
-    work: (signal: AbortSignal) => Promise<T>,
+    work: (signal: AbortSignal, call: CallScope) => Promise<T>,
     options?: CallOptions,
   ): TaskHandle<T> {
     let context: OperationLease;
@@ -147,7 +179,7 @@ export class SessionExecution<S> implements Execution {
       .withContext(async () => {
         try {
           context.call.throwIfAborted();
-          return await work(context.call.signal);
+          return await work(context.call.signal, context.call);
         } catch (error) {
           throw context.failure(error);
         }
@@ -194,7 +226,7 @@ export class SessionExecution<S> implements Execution {
         let inner: Flow<T> | undefined;
         let iterator: AsyncIterator<FlowEvent<T>> | undefined;
         let finished = false;
-        let cause: unknown;
+        let cause: AppError | undefined;
         try {
           context.call.throwIfAborted();
           inner = context.withContext(() => create(context.call.signal));
@@ -202,9 +234,11 @@ export class SessionExecution<S> implements Execution {
           while (true) {
             const next = await context.withContext(() => iterator!.next());
             if (next.done)
-              throw failure("call.invalid_state", {
-                operation: name,
-                state: "missing_result",
+              throw appError("call.invalid_state", {
+                details: {
+                  operation: name,
+                  state: "missing_result",
+                },
               });
             if (next.value.type === "result") {
               finished = true;
@@ -220,17 +254,12 @@ export class SessionExecution<S> implements Execution {
           throw cause;
         } finally {
           context.call.signal.removeEventListener("abort", abort);
-          if (!finished) inner?.cancel("operation cancelled");
-          try {
-            await context.withContext(() => iterator?.return?.());
-          } finally {
-            context.end(
-              cause ??
-                (context.call.signal.aborted
-                  ? context.call.signal.reason
-                  : undefined),
-            );
-          }
+          await finalizeFlow(
+            context,
+            finished ? undefined : inner,
+            iterator,
+            cause,
+          );
         }
       },
       { ...request, signal },
@@ -279,7 +308,7 @@ export class SessionExecution<S> implements Execution {
     parent = this.current(),
   ): OperationLease {
     if (!parent && this.#closing)
-      throw failure("runtime.closed", { state: "closing" });
+      throw appError("runtime.closed", { details: { state: "closing" } });
     const resources = parent?.resources ?? this.getResources();
     const budget = Math.min(
       options.timeoutMs ?? Infinity,
@@ -310,12 +339,8 @@ export class SessionExecution<S> implements Execution {
     };
     const isRoot = !parentTrace;
     const startedAt = performance.now();
-    const context: FrameStore<S> = {
-      call,
-      resources,
-      active: true,
-      trace,
-    };
+    const execution = { call, resources, active: true };
+    const context = { execution, trace };
     const release = resources.hold();
     const workDone = Promise.withResolvers<void>();
     const item: ActiveOperation = { name, call, done: workDone.promise };
@@ -349,7 +374,7 @@ export class SessionExecution<S> implements Execution {
           }
         } finally {
           call.close();
-          context.active = false;
+          execution.active = false;
           release();
           this.#operations.delete(item);
           workDone.resolve();
@@ -360,6 +385,16 @@ export class SessionExecution<S> implements Execution {
         attachTraceId(mapped, trace.traceId);
         return mapped;
       },
+      cleanupFailed: (error) =>
+        resources.diagnostics.log(
+          "warn",
+          "operation.cleanup_failed",
+          {
+            stage: name,
+            code: error.code,
+          },
+          trace,
+        ),
     };
   }
 }

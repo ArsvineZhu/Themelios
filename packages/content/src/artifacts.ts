@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import {
   artifactRefSchema,
   blobRefSchema,
+  extentSchema,
   formatAgentArtifactRef,
   generateReadable60,
   instantSchema,
@@ -12,8 +13,8 @@ import {
   type ArtifactRef,
   type BlobRef,
   type CommitPoint,
+  type Extent,
   type Instant,
-  type Json,
   type Selection,
 } from "@themelios/core";
 import type {
@@ -24,19 +25,13 @@ import type {
 import { z } from "zod";
 import { contentError, jsonValue, validated } from "./validation.js";
 
-export interface Origin {
-  kind: "file" | "url" | "application";
-  locator?: string;
-  capturedAt: Instant;
-  metadata?: Json;
-}
-
-export type Extent =
-  | { kind: "text"; bytes: number }
-  | { kind: "image"; width: number; height: number; frames: number }
-  | { kind: "pages"; pages: number }
-  | { kind: "time"; durationMs: number }
-  | { kind: "unknown" };
+export const originSchema = z.strictObject({
+  kind: z.enum(["file", "url", "application"]),
+  locator: z.string().min(1).optional(),
+  capturedAt: instantSchema,
+  metadata: jsonSchema.optional(),
+});
+export type Origin = z.infer<typeof originSchema>;
 
 export interface ArtifactInfo {
   ref: ArtifactRef;
@@ -60,40 +55,6 @@ export interface SourceLink {
 }
 
 const size = z.int().nonnegative();
-export const mediaTypeSchema = z
-  .string()
-  .regex(/^[\w!#$&^.+-]+\/[\w!#$&^.+-]+$/)
-  .transform((mime) => mime.toLowerCase());
-export const originSchema: z.ZodType<Origin> = z
-  .strictObject({
-    kind: z.enum(["file", "url", "application"]),
-    locator: z.string().min(1).optional(),
-    capturedAt: instantSchema,
-    metadata: jsonSchema.optional(),
-  })
-  .transform(({ kind, capturedAt, locator, metadata }): Origin => ({
-    kind,
-    capturedAt,
-    ...(locator === undefined ? {} : { locator }),
-    ...(metadata === undefined ? {} : { metadata }),
-  }));
-
-export const extentSchema: z.ZodType<Extent> = z.discriminatedUnion("kind", [
-  z.strictObject({ kind: z.literal("text"), bytes: size }),
-  z.strictObject({
-    kind: z.literal("image"),
-    width: z.int().positive(),
-    height: z.int().positive(),
-    frames: z.int().positive(),
-  }),
-  z.strictObject({ kind: z.literal("pages"), pages: size }),
-  z.strictObject({
-    kind: z.literal("time"),
-    durationMs: z.number().nonnegative(),
-  }),
-  z.strictObject({ kind: z.literal("unknown") }),
-]);
-
 interface StoredArtifact {
   ref: string;
   agent_code: string;
@@ -148,7 +109,7 @@ export function storedArtifact(
   validated(artifactRefSchema, ref);
   const row = sql
     .query<StoredArtifact, [ArtifactRef]>(
-      "SELECT * FROM artifacts WHERE ref = ?",
+      "SELECT a.*, b.size_bytes FROM artifacts a JOIN blobs b ON b.ref = a.blob_ref WHERE a.ref = ?",
     )
     .get(ref);
   if (!row || (kind && row.kind !== kind))
@@ -208,20 +169,23 @@ export function addArtifact(
   const origin =
     artifact.origin === undefined ? null : JSON.stringify(artifact.origin);
   const extent = JSON.stringify(artifact.extent);
+  const blob = tx.registerBlob({
+    ref: artifact.blob,
+    sizeBytes: artifact.sizeBytes,
+  });
   for (let attempt = 0; ; attempt += 1) {
     const agentCode = generateReadable60();
     try {
       const changes = tx.sql.run(
         `
-        INSERT INTO artifacts (ref, agent_code, kind, media_type, blob_ref, size_bytes, name, extent_json, origin_json, created_seq, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(ref) DO NOTHING
+        INSERT INTO artifacts (ref, agent_code, kind, media_type, blob_ref, name, extent_json, origin_json, created_seq, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(ref) DO NOTHING
       `,
         artifact.ref,
         agentCode,
         artifact.kind,
         artifact.mediaType,
-        artifact.blob,
-        artifact.sizeBytes,
+        blob,
         artifact.name ?? null,
         extent,
         origin,
@@ -236,13 +200,14 @@ export function addArtifact(
     }
   }
   const row = tx.sql
-    .query<StoredArtifact>("SELECT * FROM artifacts WHERE ref = ?")
+    .query<Omit<StoredArtifact, "size_bytes">>(
+      "SELECT * FROM artifacts WHERE ref = ?",
+    )
     .get(artifact.ref)!;
   if (
     row.kind !== artifact.kind ||
     row.media_type !== artifact.mediaType ||
     row.blob_ref !== artifact.blob ||
-    row.size_bytes !== BigInt(artifact.sizeBytes) ||
     row.name !== (artifact.name ?? null) ||
     row.extent_json !== extent ||
     row.origin_json !== origin
@@ -303,7 +268,8 @@ export function listArtifacts(
   return tx.sql
     .query<StoredArtifact>(
       `
-    SELECT a.* FROM artifact_roots r JOIN artifacts a ON a.ref = r.artifact_ref
+    SELECT a.*, b.size_bytes FROM artifact_roots r JOIN artifacts a ON a.ref = r.artifact_ref
+    JOIN blobs b ON b.ref = a.blob_ref
     WHERE r.retained_seq <= ? AND (r.released_seq IS NULL OR r.released_seq > ?) AND r.artifact_ref > ?
     ORDER BY r.artifact_ref LIMIT ?
   `,

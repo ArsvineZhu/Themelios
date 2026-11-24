@@ -1,27 +1,30 @@
 import { join } from "node:path";
-import { verifyContent } from "@themelios/content";
+import { collectContent, verifyContent } from "@themelios/content";
 import { appError, throwIfAborted } from "@themelios/core";
 import { Installation, withOfflineInstance } from "@themelios/runtime";
 import {
   backupStorage,
   Cas,
-  collectStorage,
   Database,
   restoreStorage,
   verifyStorage,
 } from "@themelios/storage";
 import type { OfflineRequest } from "@themelios/transports";
-import { workbenchApplication as application } from "./definition.js";
+import type { createApplicationModule } from "@themelios/application";
 
-export function maintain(installationRoot: string, request: OfflineRequest) {
+export function maintain(
+  installationRoot: string,
+  request: OfflineRequest,
+  application: ReturnType<typeof createApplicationModule>,
+) {
   const root = request.installation ?? installationRoot;
   const installation = Installation.at(root, application);
   const instance = installation.instance(request.instance);
   const formatId = application.formatId;
   const applicationId = application.id;
   const installationConfigPath = join(root, "config", "installation.toml");
-  const signal = request.signal;
-  throwIfAborted(signal);
+  const signalOptions = request.signal ? { signal: request.signal } : {};
+  throwIfAborted(request.signal);
   if (request.action === "restore") {
     const backup = request.path;
     if (backup === undefined)
@@ -34,12 +37,13 @@ export function maintain(installationRoot: string, request: OfflineRequest) {
       applicationId,
       formatId,
       installationConfigPath,
+      ...signalOptions,
     });
   }
   return withOfflineInstance(
     instance,
     async (info) => {
-      throwIfAborted(signal);
+      throwIfAborted(request.signal);
       const database = Database.open({
         path: join(info.paths.state, "main.sqlite"),
         formatId,
@@ -63,18 +67,18 @@ export function maintain(installationRoot: string, request: OfflineRequest) {
               instanceId: info.id,
               instanceRoot: info.paths.root,
               installationConfigPath,
+              ...signalOptions,
             });
           }
           if (request.action === "collect")
-            return await collectStorage(
-              database,
-              cas,
-              request.retainSince === undefined
+            return await collectContent(database, cas, {
+              ...signalOptions,
+              ...(request.retainSince === undefined
                 ? {}
-                : { retainSince: request.retainSince },
-            );
-          const storage = await verifyStorage(database, cas);
-          await verifyContent(database, cas);
+                : { retainSince: request.retainSince }),
+            });
+          const storage = await verifyStorage(database, cas, signalOptions);
+          await verifyContent(database, cas, signalOptions);
           return storage;
         } finally {
           await cas.close();
@@ -83,6 +87,6 @@ export function maintain(installationRoot: string, request: OfflineRequest) {
         database.close();
       }
     },
-    signal === undefined ? {} : { signal },
+    signalOptions,
   );
 }

@@ -1,7 +1,7 @@
+import { appError, errorCode } from "@themelios/core";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { z } from "zod";
-import { errno, failure } from "./failure.js";
 
 export type CredentialRef = `env:${string}` | `file:${string}`;
 export const credentialSchema = z
@@ -20,9 +20,11 @@ export function createSecrets(options: { baseDir: string }): Secrets {
   const baseDir = resolve(options.baseDir);
   const read = async (ref: CredentialRef): Promise<string> => {
     if (!credentialSchema.safeParse(ref).success) {
-      throw failure("secret.unavailable", {
-        reference: String(ref),
-        reason: "invalid_reference",
+      throw appError("secret.unavailable", {
+        details: {
+          reference: String(ref),
+          reason: "invalid_reference",
+        },
       });
     }
     let value: string | undefined;
@@ -34,16 +36,17 @@ export function createSecrets(options: { baseDir: string }): Secrets {
             "",
           );
     } catch (error) {
-      throw failure(
-        "secret.unavailable",
-        { reference: ref, reason: errno(error) ?? "read_failed" },
-        error,
-      );
+      throw appError("secret.unavailable", {
+        details: { reference: ref, reason: errorCode(error) ?? "read_failed" },
+        cause: error,
+      });
     }
     if (!value)
-      throw failure("secret.unavailable", {
-        reference: ref,
-        reason: value === undefined ? "missing" : "empty",
+      throw appError("secret.unavailable", {
+        details: {
+          reference: ref,
+          reason: value === undefined ? "missing" : "empty",
+        },
       });
     return value;
   };

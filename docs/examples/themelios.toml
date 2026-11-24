@@ -34,8 +34,9 @@ streaming = true
 [models.tasks."document.summary"]
 model = "summary"
 
-[models.tasks."document.summary".parameters]
-maxOutputTokens = 4096
+# 要覆盖模型自己的输出预算时再启用以下设置。
+# [models.tasks."document.summary".parameters]
+# maxOutputTokens = 4096
 
 # 以上配置可处理文字；PDF 文字输入由应用装配时注册的 pdf.text 扩展准备。
 # 下方为可选的图像描述路线。需要它时，取消整段注释并填入真实视觉模型 ID。

@@ -1,0 +1,60 @@
+syntax = "proto3";
+
+package themelios;
+
+import "google/protobuf/struct.proto";
+
+// Dispatch uses the application operation IDs and schemas published by the host.
+service Operations {
+  rpc Invoke(OperationRequest) returns (OperationReply);
+  rpc Stream(OperationRequest) returns (stream OperationEvent);
+  rpc Upload(stream UploadFrame) returns (stream OperationEvent);
+}
+
+message OperationRequest {
+  string operation = 1;
+  google.protobuf.Value input = 2;
+}
+
+message OperationReply {
+  google.protobuf.Value result = 1;
+}
+
+message UploadFrame {
+  oneof part {
+    OperationRequest request = 1;
+    bytes chunk = 2;
+  }
+}
+
+message OperationEvent {
+  oneof event {
+    Progress progress = 1;
+    string text_delta = 2;
+    google.protobuf.Value result = 3;
+    DownloadInfo download = 4;
+    bytes chunk = 5;
+  }
+}
+
+message Progress {
+  string stage = 1;
+  optional double completed = 2;
+  optional double total = 3;
+  optional string unit = 4;
+}
+
+message DownloadInfo {
+  string media_type = 1;
+  uint64 size_bytes = 2;
+  optional string ref = 3;
+  optional string name = 4;
+}
+
+message Failure {
+  string code = 1;
+  string message = 2;
+  bool retryable = 3;
+  google.protobuf.Value details = 4;
+  optional string trace_id = 5;
+}

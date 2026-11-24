@@ -30,8 +30,6 @@ import {
   type ModelTelemetry,
 } from "./model-telemetry.js";
 
-type CallDefaults = Required<NonNullable<ModelsOptions["defaults"]>>;
-
 /** Track actual permits through finally, including while a consumer pauses an upstream reader. */
 export class ModelCalls {
   readonly #queue: PQueue;
@@ -40,7 +38,7 @@ export class ModelCalls {
   readonly attempts: number;
 
   constructor(
-    defaults: CallDefaults,
+    defaults: Required<NonNullable<ModelsOptions["defaults"]>>,
     private readonly diagnostics?: Diagnostics,
   ) {
     this.#queue = new PQueue({ concurrency: defaults.concurrency });
@@ -154,6 +152,14 @@ export function providerFailure(
   if (cause instanceof AppError) return cause;
   if (APICallError.isInstance(cause))
     return providerHttpFailure(cause, model.connection);
+  if (
+    NoObjectGeneratedError.isInstance(cause) &&
+    cause.finishReason === "length"
+  )
+    return appError("model.output_truncated", {
+      details: { binding: model.binding, finishReason: cause.finishReason },
+      cause,
+    });
   if (
     TypeValidationError.isInstance(cause) ||
     JSONParseError.isInstance(cause) ||
@@ -294,6 +300,6 @@ function providerHttpFailure(
     retryable:
       statusCode === undefined
         ? cause.isRetryable
-        : [408, 502, 503, 504].includes(statusCode),
+        : [408, 500, 502, 503, 504].includes(statusCode),
   });
 }

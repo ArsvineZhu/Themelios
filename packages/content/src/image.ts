@@ -1,69 +1,22 @@
 import {
-  AppError,
   appError,
+  mediaDecodeError,
   openCall,
+  parseValue,
+  rangeSchema,
+  readMediaBytes,
   type CallOptions,
   type CallScope,
-  type Completed,
+  type MediaInput,
   type Json,
-  type Material,
-  type ProducedFile,
-  type Range,
+  type RepresentationAdapter,
+  type RepresentationFile,
 } from "@themelios/core";
 import sharp, { type Metadata, type Sharp } from "sharp";
 import { z } from "zod";
-import type { Extent } from "./artifacts.js";
-
-export interface ImageMediaInput {
-  readonly source: Material;
-  readonly info: {
-    readonly mediaType: string;
-    readonly sizeBytes: number;
-    readonly name?: string;
-    readonly extent: Extent;
-  };
-  readonly range?: Range;
-  open(options?: { signal?: AbortSignal }): Promise<ReadableStream<Uint8Array>>;
-}
-
 export interface ImageAdapterOptions {
   maxPixels?: number;
   maxBytes?: number;
-}
-
-export interface ImageRecipeDescription {
-  readonly id: string;
-  readonly version: string;
-  readonly inputMimeTypes: readonly string[];
-  readonly outputMimeTypes: readonly string[];
-  readonly supplies: readonly ("text" | "visual" | "speech" | "motion")[];
-  readonly parameters: z.ZodType<Json>;
-  readonly priority: number;
-  readonly titleKey: string;
-}
-
-export interface PreparedImageResult {
-  readonly result: Completed;
-  readonly outputs: readonly string[];
-}
-
-export interface ImageAdapter {
-  readonly description: ImageRecipeDescription;
-  available(): Promise<{
-    readonly available: boolean;
-    readonly missing: readonly string[];
-  }>;
-  probe(input: ImageMediaInput, options?: CallOptions): Promise<Extent>;
-  parametersForModel(
-    inputMime: string,
-    acceptedMime: (mediaType: string) => boolean,
-    parameters: Json,
-  ): Json;
-  prepare(
-    input: ImageMediaInput,
-    parameters: Json,
-    options?: CallOptions,
-  ): Promise<PreparedImageResult>;
 }
 
 const id = "image.normalize";
@@ -78,93 +31,24 @@ const parametersSchema = z
     format: z.enum(["source", ...formats]).default("source"),
     maxWidth: z.int().positive().optional(),
     maxHeight: z.int().positive().optional(),
-    quality: z.int().min(1).max(100).default(90),
+    quality: z.int().min(1).max(100).optional(),
     background: z.string().min(1).optional(),
   })
-  .transform(({ maxWidth, maxHeight, background, ...settings }): Json => ({
+  .transform(({ maxWidth, maxHeight, quality, background, ...settings }) => ({
     ...settings,
     ...(maxWidth === undefined ? {} : { maxWidth }),
     ...(maxHeight === undefined ? {} : { maxHeight }),
+    ...(quality === undefined ? {} : { quality }),
     ...(background === undefined ? {} : { background }),
   }));
 
-async function readStreamBytes(
-  input: ImageMediaInput,
-  options: CallOptions | undefined,
-  maxBytes: number,
-): Promise<Uint8Array> {
-  const scope = openCall("content.image_read", options);
-  const oversized = (actual: number): never => {
-    throw appError("model.input_too_large", {
-      details: {
-        name: input.info.name ?? null,
-        mediaType: input.info.mediaType,
-        maxBytes,
-        actualBytes: actual,
-      },
-    });
-  };
-  try {
-    scope.throwIfAborted();
-    if (input.info.sizeBytes > maxBytes) oversized(input.info.sizeBytes);
-    const body = await input.open({ signal: scope.signal });
-    const reader = body.getReader();
-    const abort = () => {
-      void reader.cancel(scope.signal.reason).catch(() => undefined);
-    };
-    scope.signal.addEventListener("abort", abort, { once: true });
-    const chunks: Uint8Array[] = [];
-    let size = 0;
-    let done = false;
-    try {
-      while (!done) {
-        scope.throwIfAborted();
-        const next = await reader.read();
-        done = next.done;
-        scope.throwIfAborted();
-        if (!next.done) {
-          size += next.value.byteLength;
-          if (size > maxBytes) oversized(size);
-          chunks.push(next.value);
-        }
-      }
-    } finally {
-      scope.signal.removeEventListener("abort", abort);
-      if (!done) abort();
-      reader.releaseLock();
-    }
-    if (chunks.length === 1) return chunks[0]!;
-    const out = new Uint8Array(size);
-    let offset = 0;
-    for (const chunk of chunks) {
-      out.set(chunk, offset);
-      offset += chunk.byteLength;
-    }
-    return out;
-  } finally {
-    scope.close();
-  }
-}
-
-function imageError(input: ImageMediaInput, reason: unknown): AppError {
-  return appError("content.decode_failed", {
-    details: {
-      mediaType: input.info.mediaType,
-      name: input.info.name ?? null,
-      ...("ref" in input.source ? { ref: input.source.ref } : {}),
-      reason: String(reason),
-    },
-    cause: reason,
-  });
-}
-
 async function loadedImage(
-  input: ImageMediaInput,
+  input: MediaInput,
   maxPixels: number,
   options: CallOptions,
   maxBytes = 67_108_864,
 ) {
-  const bytes = await readStreamBytes(input, options, maxBytes);
+  const bytes = await readMediaBytes(input, options, maxBytes);
   const metadata = await sharp(bytes, { limitInputPixels: false }).metadata();
   const format = formats.find((candidate) => candidate === metadata.format);
   if (format === undefined || imageType(format) !== input.info.mediaType) {
@@ -196,7 +80,7 @@ async function loadedImage(
 type CapturedImage = Awaited<ReturnType<typeof loadedImage>>;
 
 async function withImage<T>(
-  input: ImageMediaInput,
+  input: MediaInput,
   maxPixels: number,
   maxBytes: number | undefined,
   options: CallOptions | undefined,
@@ -216,14 +100,13 @@ async function withImage<T>(
     return output;
   } catch (error) {
     scope.throwIfAborted();
-    if (error instanceof AppError) throw error;
-    throw imageError(input, error);
+    throw mediaDecodeError(input, error);
   } finally {
     scope.close();
   }
 }
 
-function requireSingleFrame(input: ImageMediaInput, frames: number): void {
+function requireSingleFrame(input: MediaInput, frames: number): void {
   if (frames === 1) return;
   throw appError("input.capability_missing", {
     details: {
@@ -233,32 +116,15 @@ function requireSingleFrame(input: ImageMediaInput, frames: number): void {
   });
 }
 
-export function imageNeedsOrientation(
-  input: ImageMediaInput,
-  maxPixels = defaultMaxPixels,
-  options?: CallOptions,
-  maxBytes?: number,
-): Promise<boolean> {
-  return withImage(input, maxPixels, maxBytes, options, (image) => {
-    requireSingleFrame(input, image.frames);
-    return image.rotate;
-  });
-}
-
-function checkRange(input: ImageMediaInput, width: number, height: number) {
+function checkRange(input: MediaInput, width: number, height: number) {
   const range = input.range;
   if (!range) return undefined;
+  const parsed = rangeSchema.safeParse(range);
   if (
-    range.kind !== "image" ||
-    range.x + range.width > width ||
-    range.y + range.height > height ||
-    ![range.x, range.y, range.width, range.height].every(
-      Number.isSafeInteger,
-    ) ||
-    range.x < 0 ||
-    range.y < 0 ||
-    range.width <= 0 ||
-    range.height <= 0
+    !parsed.success ||
+    parsed.data.kind !== "image" ||
+    parsed.data.x + parsed.data.width > width ||
+    parsed.data.y + parsed.data.height > height
   ) {
     throw appError("content.range_invalid", {
       details: {
@@ -270,11 +136,12 @@ function checkRange(input: ImageMediaInput, width: number, height: number) {
       },
     });
   }
+  const { x, y, width: cropWidth, height: cropHeight } = parsed.data;
   return {
-    left: range.x,
-    top: range.y,
-    width: range.width,
-    height: range.height,
+    left: x,
+    top: y,
+    width: cropWidth,
+    height: cropHeight,
   };
 }
 
@@ -298,11 +165,12 @@ async function orient(
 function encode(
   image: Sharp,
   format: Format,
-  parameters: { quality: number; background?: string },
+  parameters: { quality?: number; background?: string },
   hasAlpha: boolean,
 ): Sharp {
   if (format === "png") return image.png();
-  if (format === "webp") return image.webp({ quality: parameters.quality });
+  const quality = parameters.quality ?? 90;
+  if (format === "webp") return image.webp({ quality });
   if (hasAlpha) {
     if (!parameters.background)
       throw appError("input.invalid", {
@@ -318,13 +186,13 @@ function encode(
       });
     image.flatten({ background: parameters.background });
   }
-  return image.jpeg({ quality: parameters.quality });
+  return image.jpeg({ quality });
 }
 
 export function createImageAdapter({
   maxPixels = defaultMaxPixels,
   maxBytes,
-}: ImageAdapterOptions = {}): ImageAdapter {
+}: ImageAdapterOptions = {}): RepresentationAdapter {
   return {
     description: {
       id,
@@ -358,10 +226,23 @@ export function createImageAdapter({
         }),
       );
     },
+    requiresNormalization(input, options) {
+      return withImage(input, maxPixels, maxBytes, options, (image) => {
+        requireSingleFrame(input, image.frames);
+        return image.rotate;
+      });
+    },
+    cacheIdentity: () => ({
+      libraries: Object.entries(sharp.versions).map(([library, version]) => [
+        library,
+        version ?? null,
+      ]),
+      maxPixels,
+    }),
     parametersForModel(inputMime, acceptedMime, parameters) {
       const parsed = parametersSchema.safeParse(parameters);
       if (!parsed.success || acceptedMime(inputMime)) return parameters;
-      const value = parsed.data as Record<string, Json>;
+      const value = parsed.data;
       if (value.format !== "source") return parameters;
       const format = formats.find((candidate) =>
         acceptedMime(imageType(candidate)),
@@ -369,23 +250,7 @@ export function createImageAdapter({
       return format ? { ...value, format } : value;
     },
     async prepare(input, raw, options) {
-      const checked = parametersSchema.safeParse(raw);
-      if (!checked.success)
-        throw appError("input.invalid", {
-          details: {
-            issues: checked.error.issues.map((issue) => ({
-              path: issue.path.map(String),
-              reason: issue.message,
-            })),
-          },
-        });
-      const parameters = checked.data as {
-        format: "source" | Format;
-        maxWidth?: number;
-        maxHeight?: number;
-        quality: number;
-        background?: string;
-      };
+      const parameters = parseValue(parametersSchema, raw, "input.invalid");
       return withImage(
         input,
         maxPixels,
@@ -412,10 +277,7 @@ export function createImageAdapter({
             (crop?.height ?? height) > (parameters.maxHeight ?? Infinity);
           const reencode =
             format !== originalFormat ||
-            (format !== "png" &&
-              typeof raw === "object" &&
-              raw !== null &&
-              Object.hasOwn(raw, "quality"));
+            (format !== "png" && parameters.quality !== undefined);
           let output = { bytes, width, height };
           if (rotate || crop || resize || reencode) {
             const image = await orient(bytes, metadata, maxPixels);
@@ -440,10 +302,19 @@ export function createImageAdapter({
             libraryVersion: sharp.versions.sharp,
             parameters,
           };
-          const files: ProducedFile[] = [
+          const files: RepresentationFile[] = [
             {
               name: "image",
               sourceIndices: [0],
+              coverage: {
+                sourceRange: input.range ?? null,
+                extent: {
+                  kind: "image",
+                  width: output.width,
+                  height: output.height,
+                  frames,
+                },
+              },
               material: {
                 bytes: output.bytes,
                 mediaType: imageType(format),

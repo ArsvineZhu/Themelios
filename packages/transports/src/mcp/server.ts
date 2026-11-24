@@ -31,8 +31,13 @@ export function createMcpEndpoint<App>(
   return {
     fetch(request) {
       const defaultLocale = options.locale?.();
-      return runProtectedHttp(request, tracker, options, defaultLocale, (ctx) =>
-        handleMcp(request, ctx),
+      return runProtectedHttp(
+        request,
+        tracker,
+        options,
+        defaultLocale,
+        "GET, POST, DELETE, OPTIONS",
+        (ctx) => handleMcp(request, ctx),
       );
     },
     close: () => tracker.close(),

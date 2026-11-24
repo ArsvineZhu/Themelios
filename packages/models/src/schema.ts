@@ -3,6 +3,7 @@ import {
   jsonSchema,
   parseJson,
   parseValue,
+  sourceCoverageSchema,
   type Json,
 } from "@themelios/core";
 import { z } from "zod";
@@ -108,9 +109,48 @@ export const modelBindingSchema = z.strictObject({
   embeddingSpace: embeddingSpaceSchema.optional(),
 }) as z.ZodType<ModelBinding>;
 
+export const modelAttemptsSchema = z.int().positive();
+
+export const preparationPolicySchema = z
+  .strictObject({
+    representations: z
+      .array(
+        z.strictObject({
+          mediaType: mimePatternSchema,
+          recipe: modelNameSchema,
+          parameters: jsonSchema.optional(),
+        }),
+      )
+      .readonly()
+      .optional(),
+    models: z
+      .array(
+        z.strictObject({
+          mediaType: mimePatternSchema,
+          recipe: z.enum(["media.describe", "speech.transcribe"]),
+          model: modelNameSchema,
+        }),
+      )
+      .readonly()
+      .optional(),
+  })
+  .readonly();
+
+export const taskRouteSchema = z
+  .strictObject({
+    model: modelNameSchema,
+    fallback: z.array(modelNameSchema).readonly().optional(),
+    parameters: modelParametersSchema.optional(),
+    preparation: preparationPolicySchema.optional(),
+    variables: z.record(z.string(), jsonSchema).readonly().optional(),
+    timeoutMs: z.int().positive().optional(),
+    maxAttempts: modelAttemptsSchema.optional(),
+  })
+  .readonly();
+
 export const modelDefaultsSchema = z.strictObject({
   timeoutMs: z.int().positive().default(120_000),
-  maxAttempts: z.int().min(1).max(8).default(1),
+  maxAttempts: modelAttemptsSchema.default(1),
   concurrency: z.int().positive().default(4),
 });
 
@@ -146,7 +186,7 @@ export function validateOutput<O extends Json>(
   return result.data;
 }
 
-export const sourceEntrySchema: z.ZodType<SourceEntry> = z.strictObject({
+export const sourceEntrySchema = sourceCoverageSchema.extend({
   key: z
     .string()
     .regex(/^S[1-9]\d*$/)
@@ -156,16 +196,10 @@ export const sourceEntrySchema: z.ZodType<SourceEntry> = z.strictObject({
     .string()
     .optional()
     .describe("Display name of the original material, when known."),
-  originalExtent: z
-    .string()
-    .describe("Range of the original material selected for this call."),
-  deliveredExtent: z
-    .array(z.string())
-    .describe("Actual representations or ranges passed to the task."),
   role: z
     .enum(["primary", "context"])
     .describe("Material being processed or auxiliary context."),
-}) as z.ZodType<SourceEntry>;
+});
 
 const directorySchema = z.array(sourceEntrySchema);
 
@@ -176,7 +210,18 @@ export function createSourceDirectory(
     parseValue(directorySchema, input, "input.invalid").map((entry) =>
       Object.freeze({
         ...entry,
-        deliveredExtent: Object.freeze([...entry.deliveredExtent]),
+        originalExtent: Object.freeze(entry.originalExtent),
+        requestedRange:
+          entry.requestedRange && Object.freeze(entry.requestedRange),
+        delivered: Object.freeze(
+          entry.delivered.map((item) =>
+            Object.freeze({
+              ...item,
+              extent: Object.freeze(item.extent),
+              sourceRange: item.sourceRange && Object.freeze(item.sourceRange),
+            }),
+          ),
+        ),
       }),
     ),
   );

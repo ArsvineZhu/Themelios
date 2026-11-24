@@ -1,10 +1,12 @@
 export type {
   Authenticate,
   AuthTokenDefinition,
+  GrpcListener,
   HttpEndpoint,
   McpResourceSpec,
   McpStdioOptions,
   RemoteTransportOptions,
+  RemoteOperationOptions,
   Translate,
   TransportLimits,
   TransportPolicy,
@@ -24,4 +26,4 @@ export {
   type CliOptions,
   type OfflineRequest,
 } from "./cli/index.js";
-export { serveApplication } from "./host.js";
+export { serveApplication, type ApplicationListeners } from "./host.js";

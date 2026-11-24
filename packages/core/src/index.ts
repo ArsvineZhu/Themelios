@@ -3,5 +3,7 @@ export * from "./completion.js";
 export * from "./errors.js";
 export * from "./flow.js";
 export * from "./json.js";
+export * from "./media.js";
+export * from "./media-type.js";
 export * from "./selection.js";
 export * from "./time.js";

@@ -1,5 +1,5 @@
 import { resolve } from "node:path";
-import { appError, parseJson, type Json } from "@themelios/core";
+import { appError, parseJson, streamChunks, type Json } from "@themelios/core";
 import { InvalidArgumentError } from "commander";
 
 export function nonnegativeInt(value: string): number {
@@ -43,27 +43,16 @@ export async function readCliInput(
     }
     return jsonCliInput(await file.text());
   }
-  const reader = Bun.stdin.stream().getReader();
   const chunks: Uint8Array[] = [];
   let size = 0;
-  try {
-    for (;;) {
-      const item = await reader.read();
-      if (item.done) break;
-      size += item.value.byteLength;
-      if (size > maxBytes) {
-        throw appError("transport.request_too_large", {
-          details: { maxJsonBytes: maxBytes },
-        });
-      }
-      chunks.push(item.value);
+  for await (const chunk of streamChunks(Bun.stdin.stream())) {
+    size += chunk.byteLength;
+    if (size > maxBytes) {
+      throw appError("transport.request_too_large", {
+        details: { maxJsonBytes: maxBytes },
+      });
     }
-  } finally {
-    try {
-      await reader.cancel();
-    } finally {
-      reader.releaseLock();
-    }
+    chunks.push(new Uint8Array(chunk));
   }
   return jsonCliInput(Buffer.concat(chunks, size).toString("utf8"));
 }

@@ -84,7 +84,7 @@ export function providerOutputSchema(schema: z.ZodType<Json>): Json {
   return sent;
 }
 
-export function prepareGeneration<O extends Json>(
+export function validateGeneration<O extends Json>(
   model: BoundModel,
   request: GenerateRequest<O>,
   streaming = false,
@@ -100,13 +100,6 @@ export function prepareGeneration<O extends Json>(
     "generate",
     request.messages.flatMap((message) => message.parts),
   );
-  const captured = new WeakMap<Uint8Array, Uint8Array>();
-  const messages = sdkMessages(
-    request.messages.map((message) => ({
-      role: message.role,
-      parts: captureParts(message.parts, captured),
-    })),
-  );
   const { openaiApi, ...parameters } = requestParameters(
     model,
     request.parameters === undefined
@@ -120,11 +113,28 @@ export function prepareGeneration<O extends Json>(
   const schema = request.output;
   const sentSchema =
     schema === "text" ? undefined : providerOutputSchema(schema);
+  return { parameters, schema, sentSchema, openaiApi };
+}
+
+export function prepareGeneration<O extends Json>(
+  model: BoundModel,
+  request: GenerateRequest<O>,
+  streaming = false,
+) {
+  const validated = validateGeneration(model, request, streaming);
+  const captured = new WeakMap<Uint8Array, Uint8Array>();
+  const messages = sdkMessages(
+    request.messages.map((message) => ({
+      role: message.role,
+      parts: captureParts(message.parts, captured),
+    })),
+  );
+  const { sentSchema } = validated;
   const output =
     sentSchema === undefined
       ? Output.text()
       : Output.object({ schema: jsonSchema(sentSchema as JSONSchema7) });
-  return { messages, parameters, schema, sentSchema, output, openaiApi };
+  return { ...validated, messages, output };
 }
 
 type Generation<O extends Json> = ReturnType<typeof prepareGeneration<O>>;

@@ -10,7 +10,12 @@ import {
   type Permission,
   type Principal,
 } from "@themelios/runtime/operations";
-import { appError, type CallOptions, type Flow } from "@themelios/core";
+import {
+  appError,
+  openCall,
+  type CallOptions,
+  type Flow,
+} from "@themelios/core";
 import type { Installation, Session } from "@themelios/runtime";
 import { Command, CommanderError } from "commander";
 import { resolveDirectory } from "../directory.js";
@@ -45,7 +50,7 @@ export interface CliWiring<App> {
   isJson(): boolean;
   baseLimit(): number;
   emit(value: unknown, max?: number): Promise<void>;
-  permission(id: string, permission: Permission): void;
+  permission(id: string): void;
   session<T>(
     work: (
       api: App,
@@ -77,6 +82,7 @@ export interface CliOptions<App = unknown, S = unknown> {
   readonly limits?: () => Readonly<TransportLimits>;
   readonly useInstallation?: (path: string) => Installation<App, S>;
   readonly configure?: (wiring: CliWiring<App>) => void;
+  readonly mountOperationCommands?: boolean;
   readonly offline?: (request: OfflineRequest) => Promise<unknown>;
   readonly serve?: (
     session: Session<App, S>,
@@ -242,7 +248,12 @@ export async function runApplicationCli<App, S>(
     isJson: () => Boolean(flags().json),
     baseLimit,
     emit,
-    permission,
+    permission(id) {
+      const operation = directory.get(id);
+      if (!operation)
+        throw appError("transport.not_found", { details: { operation: id } });
+      assertOperationPermission(operation, options.principal);
+    },
     session: (work) => runSession((api, ctx) => work(api, ctx)),
     unary,
   };
@@ -255,7 +266,6 @@ export async function runApplicationCli<App, S>(
       await emit(await current().init());
     });
   options.configure?.(wiring);
-  mountCustomOperations(program, directory, cwd, unary);
 
   if (options.offline) {
     const storage = program
@@ -268,16 +278,20 @@ export async function runApplicationCli<App, S>(
     ) => {
       permission("storage." + action, "admin");
       const root = flags().installation;
-      await emit(
-        await options.offline!({
+      const call = openCall("storage." + action, localOptions());
+      try {
+        const result = await options.offline!({
           action,
           instance: flags().instance,
           ...(root === undefined ? {} : { installation: resolve(cwd, root) }),
           ...(path === undefined ? {} : { path: resolve(cwd, path) }),
           ...(retainSince === undefined ? {} : { retainSince }),
-          ...(options.signal === undefined ? {} : { signal: options.signal }),
-        }),
-      );
+          signal: call.signal,
+        });
+        await emit(result);
+      } finally {
+        call.close();
+      }
     };
     storage.command("backup <destination>").action((p) => offline("backup", p));
     storage.command("restore <backup>").action((p) => offline("restore", p));
@@ -302,7 +316,42 @@ export async function runApplicationCli<App, S>(
     }
   }
 
+  if (options.mountOperationCommands !== false) {
+    try {
+      mountCustomOperations(program, directory, cwd, unary);
+    } catch (error) {
+      try {
+        program.parseOptions([...argv]);
+      } catch {
+        // Report the configuration error that prevented command registration.
+      }
+      return reportFailure(program, error, errorPresentation);
+    }
+  }
+
   return dispatch(program, argv, () => errorPresentation);
+}
+
+function registerOperationCommand(
+  parent: Command,
+  declaration: string,
+  operation: string,
+): Command {
+  const name = declaration.trim().split(/\s+/, 1)[0]!;
+  if (
+    parent.commands.some(
+      (command) => command.name() === name || command.aliases().includes(name),
+    )
+  ) {
+    throw appError("config.invalid", {
+      details: {
+        reason: "duplicate_cli_command",
+        command: parent.parent ? `${parent.name()} ${name}` : name,
+        operation,
+      },
+    });
+  }
+  return parent.command(declaration);
 }
 
 function mountCustomOperations<App>(
@@ -315,14 +364,18 @@ function mountCustomOperations<App>(
   ) => Promise<void>,
 ) {
   const groups = new Map(
-    program.commands.map((command) => [command.name(), command]),
+    program.commands
+      .filter((command) => command.commands.length)
+      .map((command) => [command.name(), command]),
   );
   for (const op of directory.values()) {
     if (op.cli === false) continue;
     if (op.cli) {
-      const cmd = program
-        .command(op.cli.command)
-        .description(op.cli.description ?? op.description);
+      const cmd = registerOperationCommand(
+        program,
+        op.cli.command,
+        op.id,
+      ).description(op.cli.description ?? op.description);
       for (const opt of op.cli.options ?? []) {
         cmd.option(opt.flags, opt.description);
       }
@@ -349,11 +402,10 @@ function mountCustomOperations<App>(
     if (!groupName || !actionName) continue;
     let group = groups.get(groupName);
     if (!group) {
-      group = program.command(groupName);
+      group = registerOperationCommand(program, groupName, op.id);
       groups.set(groupName, group);
     }
-    group
-      .command(actionName)
+    registerOperationCommand(group, actionName, op.id)
       .description(op.description)
       .option("--input <file|->")
       .action((opts) =>

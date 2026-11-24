@@ -1,7 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-import type { Json } from "@themelios/core";
-import { errno, failure } from "../failure.js";
+import { appError, errorCode, type Json } from "@themelios/core";
 import type { SettingContribution } from "../settings.js";
 import { invalid, type SettingFields } from "./definition.js";
 import {
@@ -13,6 +12,7 @@ import {
   merge,
   pointer,
   setAt,
+  type SettingValues,
 } from "./path.js";
 
 export interface ConfigurationFiles {
@@ -21,9 +21,7 @@ export interface ConfigurationFiles {
   managed: string;
 }
 
-type FileLayer = "installation" | "instance" | "managed";
-type ObjectValue = Record<string, Json>;
-export type Layers = Record<FileLayer, ObjectValue>;
+export type Layers = Record<keyof ConfigurationFiles, SettingValues>;
 export type Candidate<S> = {
   value: Readonly<S>;
   layers: Layers;
@@ -39,18 +37,18 @@ export async function readLayers(files: ConfigurationFiles): Promise<Layers> {
   return { installation, instance, managed };
 }
 
-async function readToml(file: string): Promise<ObjectValue> {
+async function readToml(file: string): Promise<SettingValues> {
   let source: string;
   try {
     source = await readFile(file, "utf8");
   } catch (error) {
-    if (errno(error) === "ENOENT") return {};
+    if (errorCode(error) === "ENOENT") return {};
     throw invalid(
       [
         {
           path: "",
           messageKey: "config.read_failed",
-          params: { file, reason: errno(error) ?? "read_failed" },
+          params: { file, reason: errorCode(error) ?? "read_failed" },
         },
       ],
       error,
@@ -126,7 +124,7 @@ export function loadCandidate<S>(
     layers.managed,
   );
   const defaults = asJson(definition.schema.safeParse({}).data);
-  const parsed = definition.schema.safeParse(raw);
+  const parsed = definition.schema.safeParse(structuredClone(raw));
   if (!parsed.success) {
     throw invalid(
       parsed.error.issues.map((issue) => {
@@ -157,7 +155,7 @@ export function loadCandidate<S>(
 }
 
 function resolveSettingPaths<S>(
-  normalized: ObjectValue,
+  normalized: SettingValues,
   fields: SettingFields<S>,
   files: ConfigurationFiles,
   layers: Layers,
@@ -182,13 +180,13 @@ function resolveSettingPaths<S>(
 }
 
 export function editLayer(
-  layer: ObjectValue,
+  layer: SettingValues,
   path: string[],
   value: Json | undefined,
 ): void {
   if (value !== undefined) assertValues(value, path);
   if (value !== undefined && !path.length) {
-    throw failure("config.unknown_setting", { path: "" });
+    throw appError("config.unknown_setting", { details: { path: "" } });
   }
   setAt(layer, path, value);
 }

@@ -1,8 +1,10 @@
 # 开发检查
 
-先按[根目录说明](../../README.md)配置开发环境。长度检查支持 TypeScript、JavaScript、Python 和 Rust，扫描目录和阈值在 [config/check.toml](config/check.toml)。
+先按[根目录说明](../../README.md)配置开发环境。长度检查支持 TypeScript、JavaScript、Python 和 Rust，扫描目录和阈值在 [config/check.toml](config/check.toml)。检查 Python 时使用 uv 提供的 `uvx` 运行锁定版本的 Ruff。
 
 `bun run check:repo` 构建包并运行类型、格式、代码长度、包边界和行为检查。指定一个包名可缩小范围，例如 `bun run check:repo -- storage`。
+
+追查某条业务路径时可直接运行对应测试，例如 `bun test --agent tests/integration/transports/materials.test.ts`。需要公共输入、输出和路径映射时，运行 `bun run operations:describe -- tasks.preview`。
 
 ```powershell
 pwsh -File ./scripts/check/run.ps1 length

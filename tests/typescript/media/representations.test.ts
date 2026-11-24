@@ -3,16 +3,15 @@ import { mkdtemp, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { createContent, createImageAdapter } from "@themelios/content";
 import { contentSchemaSql } from "@themelios/content/schema";
-import { parseJson } from "@themelios/core";
 import {
-  createPreparation,
+  parseJson,
   type MediaInput,
-  type ModelCapabilities,
   type RepresentationAdapter,
-} from "@themelios/models";
+} from "@themelios/core";
+import { createPreparation, type ModelCapabilities } from "@themelios/models";
 import { createPdfAdapters } from "@themelios/pdf";
 import { Cas, Database } from "@themelios/storage";
-import { PDFDocument, rgb } from "pdf-lib";
+import { PDFDocument, PDFName, PDFPageLeaf, rgb } from "pdf-lib";
 import sharp from "sharp";
 
 function material(
@@ -84,10 +83,21 @@ test("JPEG is oriented before selecting pixels and resizing for a PNG representa
 
 test("PDF text, selected PDF bytes, and PNG rendering agree on original page numbers", async () => {
   const document = await PDFDocument.create();
-  document.addPage([150, 200]).drawText("First page");
-  document
-    .addPage([150, 200])
-    .drawText("Résumé 2", { x: 12, y: 120, color: rgb(0, 0, 0), size: 16 });
+  const outside = document.addPage([150, 200]);
+  outside.drawText("First page");
+  const second = document.addPage([150, 200]);
+  second.drawText("Résumé 2", { x: 12, y: 120, color: rgb(0, 0, 0), size: 16 });
+  second.node.set(
+    PDFName.Annots,
+    document.context.obj([
+      {
+        Type: "Annot",
+        Subtype: "Link",
+        Rect: [12, 100, 30, 140],
+        Dest: [outside.ref, "Fit"],
+      },
+    ]),
+  );
   document.addPage([150, 200]);
   const pdf = await document.save();
   const [text, pages, render] = createPdfAdapters();
@@ -110,7 +120,12 @@ test("PDF text, selected PDF bytes, and PNG rendering agree on original page num
 
   const selected = await pages!.prepare(source, {});
   expect(selected.result.value).toEqual({ pages: [2, 3] });
-  expect((await PDFDocument.load(bytesFrom(selected))).getPageCount()).toBe(2);
+  const exported = await PDFDocument.load(bytesFrom(selected));
+  expect(
+    exported.context
+      .enumerateIndirectObjects()
+      .filter(([, object]) => object instanceof PDFPageLeaf),
+  ).toHaveLength(2);
   const selectedText = await text!.prepare(
     material(bytesFrom(selected), "application/pdf"),
     {},
@@ -154,6 +169,7 @@ test("Preparation reuses stored representations without re-running the adapter",
     });
 
     let prepareCalls = 0;
+    const excerpt = new TextEncoder().encode("cached extracted text");
     const baseAdapter = createPdfAdapters()[0]!;
     const adapter: RepresentationAdapter = {
       description: {
@@ -183,11 +199,15 @@ test("Preparation reuses stored representations without re-running the adapter",
               {
                 name: "extracted.txt",
                 material: {
-                  bytes: new TextEncoder().encode("cached extracted text"),
+                  bytes: excerpt,
                   mediaType: "text/plain",
                   name: "extracted.txt",
                 },
                 sourceIndices: [0],
+                coverage: {
+                  sourceRange: null,
+                  extent: { kind: "text", bytes: excerpt.byteLength },
+                },
               },
             ],
             producer: {
@@ -251,6 +271,7 @@ test("Preparation reuses stored representations without re-running the adapter",
       kind: "text",
       text: "cached extracted text",
     });
+    expect(second.sources.entries[0]).toEqual(first.sources.entries[0]);
   } finally {
     await cas.close();
     database.close();

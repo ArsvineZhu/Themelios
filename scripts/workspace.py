@@ -1,4 +1,4 @@
-"""Prepare the workspace search tools and Agent Harness integrations."""
+"""Install the project toolchain and optionally prepare Agent search tools."""
 
 from __future__ import annotations
 
@@ -18,28 +18,12 @@ HARNESS_DIR = ROOT / "scripts" / "harness"
 if str(HARNESS_DIR) not in sys.path:
     sys.path.insert(0, str(HARNESS_DIR))
 
-from manage import (
-    build_mcp_servers,
-    sync_mcp,
-)
-from manage import (
-    load_config as load_harness_config,
-)
-from manage import (
-    print_status as print_harness_status,
-)
-
 TOOLS = ROOT / "temp" / "tools"
 BUN_TOOLS = Path(
     os.environ.get("THEMELIOS_BUN_DIR", TOOLS / f"bun-{platform.system().lower()}")
 )
-BUN = (
-    BUN_TOOLS
-    / "node_modules"
-    / "bun"
-    / "bin"
-    / ("bun.exe" if os.name == "nt" else "bun")
-)
+# The npm package registers bin/bun.exe on every host, including Linux.
+BUN = BUN_TOOLS / "node_modules" / "bun" / "bin" / "bun.exe"
 ZG_BIN = TOOLS / "zvec-grep" / "node_modules" / "@zvec" / "zvec-grep" / "bin"
 ZG = ZG_BIN / ("zg.exe" if os.name == "nt" else "zg")
 AST_GREP_MCP = (
@@ -84,6 +68,19 @@ def run(*args: str, env: dict[str, str] | None = None) -> None:
 
 
 def install(prefix: Path, package: str) -> None:
+    name, _, version = package.rpartition("@")
+    prefix.mkdir(parents=True, exist_ok=True)
+    (prefix / "package.json").write_text(
+        json.dumps(
+            {
+                "private": True,
+                "dependencies": {name: version},
+                "allowScripts": {package: True},
+            },
+            indent=2,
+        ) + "\n",
+        encoding="utf-8",
+    )
     env = os.environ.copy()
     env["ZG_INSTALL_ACCELERATOR"] = "cpu"
     env["ZG_INSTALL_SKIP_AGENT_UPGRADE"] = "1"
@@ -92,9 +89,9 @@ def install(prefix: Path, package: str) -> None:
         "install",
         "--prefix",
         str(prefix),
+        "--no-package-lock",
         "--no-audit",
         "--no-fund",
-        package,
         env=env,
     )
 
@@ -121,17 +118,11 @@ def prepare_toolchain() -> None:
         except OSError:
             pass
     if installed != version:
-        run(
-            executable("npm"),
-            "install",
-            "--prefix",
-            str(BUN_TOOLS),
-            "--no-save",
-            "--no-package-lock",
-            "--no-audit",
-            "--no-fund",
-            manager,
-        )
+        install(BUN_TOOLS, manager)
+        if not BUN.is_file():
+            run(executable("npm"), "rebuild", "--prefix", str(BUN_TOOLS), "bun")
+        if not BUN.is_file():
+            raise RuntimeError(f"npm 未生成当前平台的 Bun 可执行文件：{BUN}")
     run(str(BUN), "install", "--frozen-lockfile")
 
 
@@ -215,6 +206,8 @@ def prepare_ast_grep_mcp(environment: dict[str, str]) -> None:
 
 
 def init() -> None:
+    from manage import build_mcp_servers, load_config, sync_mcp
+
     prepare_toolchain()
     prepare_git_hook()
     graph = shutil.which("codegraph")
@@ -266,7 +259,7 @@ def init() -> None:
         graph_command, graph_args = graph, ["serve", "--mcp"]
     prepare_ast_grep_mcp(environment)
     servers = build_mcp_servers(
-        load_harness_config(),
+        load_config(),
         graph_command=graph_command,
         graph_args=graph_args,
         zg_path=zg,
@@ -279,20 +272,23 @@ def init() -> None:
 
 
 def status() -> None:
+    from manage import print_status
+
     run(str(BUN), "--version")
     run(executable("codegraph"), "status")
     zg = zvec_executable()
     if not zg:
         raise RuntimeError("找不到 zg，请先初始化工作区。")
     run(zg, "--status", "--mode", "direct")
-    print_harness_status("all")
+    print_status("all")
 
 
 if __name__ == "__main__":
     try:
-        if len(sys.argv) != 2 or sys.argv[1] not in ("init", "status"):
-            raise RuntimeError("用法：workspace init|status")
-        (init if sys.argv[1] == "init" else status)()
+        actions = {"bootstrap": prepare_toolchain, "init": init, "status": status}
+        if len(sys.argv) != 2 or sys.argv[1] not in actions:
+            raise RuntimeError("用法：workspace bootstrap|init|status")
+        actions[sys.argv[1]]()
     except (
         OSError,
         RuntimeError,

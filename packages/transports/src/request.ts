@@ -1,17 +1,23 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import type { Principal } from "@themelios/runtime/operations";
-import { appError, throwIfAborted, type CallOptions } from "@themelios/core";
+import {
+  appError,
+  openCall,
+  throwIfAborted,
+  type CallOptions,
+  type CallScope,
+} from "@themelios/core";
 import {
   errorLocale,
   httpStatus,
   localizedError,
   transportError,
 } from "./errors.js";
-import type { RemoteTransportOptions, TransportPolicy } from "./types.js";
+import type { RemoteOperationOptions, TransportPolicy } from "./types.js";
 
-async function authenticateRequest(
+export async function authenticateRequest(
   headers: Headers,
-  options: RemoteTransportOptions,
+  options: Pick<RemoteOperationOptions, "authenticate" | "secrets">,
   policy: Readonly<TransportPolicy>,
   signal: AbortSignal,
 ): Promise<Principal> {
@@ -45,7 +51,7 @@ function digest(value: string): Buffer {
   return createHash("sha256").update(value).digest();
 }
 
-function validateWebOrigin(
+export function validateWebOrigin(
   request: Request,
   policy: Readonly<TransportPolicy>,
 ): string | null {
@@ -77,7 +83,10 @@ function validateWebOrigin(
   return origin;
 }
 
-function callOptions(headers: Headers, signal: AbortSignal): CallOptions {
+function callOptions(
+  headers: Headers,
+  signal: AbortSignal,
+): CallOptions & { readonly signal: AbortSignal } {
   const value = headers.get("x-themelios-timeout-ms");
   if (value === null) return { signal };
   const timeoutMs = Number(value);
@@ -140,10 +149,12 @@ function retainResponse(
   response: Response,
   lease: RequestLease,
   extra?: Headers,
+  call?: CallScope,
 ): Response {
   const headers = new Headers(response.headers);
   extra?.forEach((value, key) => headers.append(key, value));
   if (!response.body) {
+    call?.close();
     lease.close();
     return new Response(null, {
       status: response.status,
@@ -160,6 +171,7 @@ function retainResponse(
     released = true;
     lease.signal.removeEventListener("abort", abort);
     reader.releaseLock();
+    call?.close();
     lease.close();
   }
   function cancel(reason: unknown) {
@@ -206,12 +218,12 @@ function retainResponse(
   });
 }
 
-function cors(origin: string | null): Headers {
+function cors(origin: string | null, methods: string): Headers {
   return new Headers(
     origin
       ? {
           "access-control-allow-origin": origin,
-          "access-control-allow-methods": "GET, POST, DELETE, OPTIONS",
+          "access-control-allow-methods": methods,
           "access-control-allow-headers":
             "authorization, content-type, accept, mcp-protocol-version, mcp-session-id, last-event-id, x-themelios-timeout-ms",
           "access-control-expose-headers":
@@ -226,22 +238,24 @@ export interface ProtectedHttpContext {
   readonly principal: Principal;
   readonly locale: string;
   readonly maxJsonBytes: number;
-  readonly call: CallOptions;
-  readonly lease: RequestLease;
+  readonly call: ReturnType<typeof callOptions>;
 }
 
 export async function runProtectedHttp(
   request: Request,
   tracker: RequestTracker,
-  options: RemoteTransportOptions<any>,
+  options: RemoteOperationOptions<any>,
   defaultLocale: string | undefined,
+  corsMethods: string,
   handle: (ctx: ProtectedHttpContext) => Promise<Response>,
 ): Promise<Response> {
   let lease: RequestLease | undefined;
+  let call: CallScope | undefined;
   let origin: string | null = null;
   const locale = errorLocale(
     request.headers.get("accept-language"),
     defaultLocale,
+    options.languages,
   );
   try {
     lease = tracker.take(request.signal);
@@ -251,27 +265,32 @@ export async function runProtectedHttp(
       return retainResponse(
         new Response(null, { status: 204 }),
         lease,
-        cors(origin),
+        cors(origin, corsMethods),
       );
     }
+    const requested = callOptions(request.headers, lease.signal);
+    if (requested.timeoutMs !== undefined)
+      call = openCall("transport.http", requested);
     const principal = await authenticateRequest(
       request.headers,
       options,
       policy,
-      lease.signal,
+      call?.signal ?? lease.signal,
     );
     const response = await handle({
       principal,
       locale,
       maxJsonBytes: policy.maxJsonBytes,
-      call: callOptions(request.headers, lease.signal),
-      lease,
+      call: call
+        ? { signal: call.signal, timeoutMs: call.remainingMs() }
+        : requested,
     });
-    return retainResponse(response, lease, cors(origin));
+    return retainResponse(response, lease, cors(origin, corsMethods), call);
   } catch (error) {
+    call?.close();
     lease?.close();
     const info = localizedError(error, locale, options.translate);
-    const headers = cors(origin);
+    const headers = cors(origin, corsMethods);
     if (info.code === "transport.auth_required") {
       headers.set("www-authenticate", "Bearer");
     }

@@ -12,6 +12,7 @@
     "build:portable": "bun scripts/build-portable.ts",
     "check:repo": "bun scripts/check/repo.ts",
     "docs:tasks": "bun scripts/docs-tasks.ts",
+    "operations:describe": "bun scripts/describe-operations.ts",
     "test:live": "bun tests/e2e/live-workbench.ts",
     "test:distribution": "bun tests/e2e/distribution.ts",
     "workbench": "bun --no-install apps/workbench/dist/main.js",

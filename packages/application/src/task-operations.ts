@@ -1,10 +1,6 @@
-import type { Materials, Results } from "@themelios/content";
 import {
-  appError,
-  createFlow,
+  mapFlowResult,
   jsonSchema,
-  toErrorInfo,
-  type ArtifactRef,
   type CallOptions,
   type Completed,
   type ErrorInfo,
@@ -26,14 +22,14 @@ import {
   type AnyOperation,
 } from "@themelios/runtime/operations";
 import {
-  createWireCodec,
+  encodeCompleted,
+  encodePreview,
   decodeTaskMaterials,
   wirePreviewInputSchema,
   wirePreviewSchema,
   wireResultSchema,
   wireRunTaskSchema,
   type WireBatchItemResult,
-  type WireCodec,
   type WireRunTaskInput,
   type WireTaskResult,
 } from "./wire.js";
@@ -60,18 +56,20 @@ export interface ApplicationTasks {
     input: TaskRequest<Json> & { readonly task: string },
     options?: CallOptions,
   ): Promise<Preview>;
-  describe(task: string): Promise<TaskDescription>;
-  list(): readonly {
+  describe(task: string, locale?: string): Promise<TaskDescription>;
+  list(locale?: string): readonly {
     readonly id: string;
     readonly title: string;
     readonly purpose: string;
   }[];
-  present?(task: string, result: Pick<Completed, "value" | "inputs">): string;
+  present?(
+    task: string,
+    result: Pick<TaskResult | WireTaskResult, "value" | "inputs">,
+    locale?: string,
+  ): string;
 }
 
 export interface TaskOperationTarget {
-  readonly materials: Materials;
-  readonly results: Results;
   readonly tasks: ApplicationTasks;
   readonly prompts: ApplicationPrompts;
 }
@@ -144,34 +142,18 @@ const batchSchema = z.array(
   ]),
 );
 
-function encodeTaskResult(codec: WireCodec, value: TaskResult): WireTaskResult {
-  return "ref" in value ? value : codec.encodeCompleted(value);
+function encodeTaskResult(value: TaskResult): WireTaskResult {
+  return "ref" in value ? value : encodeCompleted(value);
 }
 
-async function decodeRunTask(
-  app: TaskOperationTarget,
-  wire: WireRunTaskInput,
-  options?: CallOptions,
-): Promise<{ codec: WireCodec; input: RunTaskInput }> {
-  const codec = createWireCodec(
-    {
-      resolve: (ref) => app.materials.resolve(ref),
-      readResult: (ref: ArtifactRef, opts?: CallOptions) =>
-        app.results.read(ref, opts),
-    },
-    options,
-  );
-  const materials = await decodeTaskMaterials(codec, wire.materials);
+function decodeRunTask(wire: WireRunTaskInput): RunTaskInput {
   return {
-    codec,
-    input: {
-      task: wire.task,
-      variables: wire.variables ?? {},
-      materials,
-      ...(wire.model === undefined ? {} : { model: wire.model }),
-      ...(wire.parameters === undefined ? {} : { parameters: wire.parameters }),
-      ...(wire.persist === undefined ? {} : { persist: wire.persist }),
-    },
+    task: wire.task,
+    variables: wire.variables ?? {},
+    materials: decodeTaskMaterials(wire.materials),
+    ...(wire.model === undefined ? {} : { model: wire.model }),
+    ...(wire.parameters === undefined ? {} : { parameters: wire.parameters }),
+    ...(wire.persist === undefined ? {} : { persist: wire.persist }),
   };
 }
 
@@ -179,7 +161,7 @@ export function taskOperations<
   App extends TaskOperationTarget,
 >(): readonly AnyOperation<App>[] {
   return [
-    defineOperation<App, Record<string, never>, unknown>({
+    defineOperation<App>()({
       id: "tasks.list",
       description: "List registered tasks.",
       permission: "read",
@@ -193,9 +175,9 @@ export function taskOperations<
       ),
       mcp: { readOnlyHint: true, idempotentHint: true },
       http: { method: "GET", path: "/tasks" },
-      execute: (app) => app.tasks.list(),
+      execute: (app, _input, context) => app.tasks.list(context.locale),
     }),
-    defineOperation<App, { task: string }, unknown>({
+    defineOperation<App>()({
       id: "tasks.describe",
       description:
         "Describe variables, output, requirements and templates of a task.",
@@ -204,9 +186,10 @@ export function taskOperations<
       output: taskDescriptionSchema,
       mcp: { readOnlyHint: true, idempotentHint: true },
       http: { method: "GET", path: "/tasks/:id", paramMap: { id: "task" } },
-      execute: (app, { task }) => app.tasks.describe(task),
+      execute: (app, { task }, context) =>
+        app.tasks.describe(task, context.locale),
     }),
-    defineOperation<App, z.infer<typeof wirePreviewInputSchema>, unknown>({
+    defineOperation<App>()({
       id: "tasks.preview",
       description: "Compile the prompt and show planned media preparation.",
       permission: "read",
@@ -220,17 +203,12 @@ export function taskOperations<
         mergeParamsIntoBody: true,
       },
       async execute(app, wire, context) {
-        const { codec, input } = await decodeRunTask(
-          app,
-          wire,
-          context.options,
-        );
-        return codec.encodePreview(
-          await app.tasks.preview(input, context.options),
+        return encodePreview(
+          await app.tasks.preview(decodeRunTask(wire), context.options),
         );
       },
     }),
-    defineOperation<App, WireRunTaskInput, WireTaskResult>({
+    defineOperation<App>()({
       id: "tasks.run",
       description: "Run a task on a group of materials; optionally save it.",
       permission: "write",
@@ -242,69 +220,45 @@ export function taskOperations<
         paramMap: { id: "task" },
         mergeParamsIntoBody: true,
       },
-      present(output, app) {
+      present(output, app, context) {
         if (app.tasks.present) {
           return app.tasks.present(
             output.producer.name,
-            output as Pick<Completed, "value" | "inputs">,
+            output,
+            context.locale,
           );
         }
         return JSON.stringify(output, null, 2);
       },
       async execute(app, wire, context) {
-        const { codec, input } = await decodeRunTask(
-          app,
-          wire,
-          context.options,
-        );
         return encodeTaskResult(
-          codec,
-          await app.tasks.run(input, context.options),
+          await app.tasks.run(decodeRunTask(wire), context.options),
         );
       },
     }),
-    defineOperation<App, { inputs: WireRunTaskInput[] }, WireBatchItemResult[]>(
-      {
-        id: "tasks.runMany",
-        description:
-          "Run independent requests in order, with item-level errors.",
-        permission: "write",
-        input: z.strictObject({ inputs: z.array(wireRunTaskSchema) }),
-        output: batchSchema,
-        http: { method: "POST", path: "/tasks/run-many" },
-        async execute(app, { inputs }, context) {
-          const decoded = await Promise.all(
-            inputs.map(async (wire) => {
-              try {
-                return await decodeRunTask(app, wire, context.options);
-              } catch (error) {
-                return { error: toErrorInfo(error) };
+    defineOperation<App>()({
+      id: "tasks.runMany",
+      description: "Run independent requests in order, with item-level errors.",
+      permission: "write",
+      input: z.strictObject({ inputs: z.array(wireRunTaskSchema) }),
+      output: batchSchema,
+      http: { method: "POST", path: "/tasks/run-many" },
+      async execute(app, { inputs }, context) {
+        const outcomes = await app.tasks.runMany(
+          inputs.map(decodeRunTask),
+          context.options,
+        );
+        return outcomes.map((outcome): WireBatchItemResult => {
+          return outcome.ok
+            ? {
+                ok: true,
+                result: encodeTaskResult(outcome.result),
               }
-            }),
-          );
-          const valid = decoded.flatMap((item) =>
-            "input" in item ? [item] : [],
-          );
-          const outcomes = (
-            await app.tasks.runMany(
-              valid.map((item) => item.input),
-              context.options,
-            )
-          )[Symbol.iterator]();
-          return decoded.map((item): WireBatchItemResult => {
-            if ("error" in item) return { ok: false, error: item.error };
-            const outcome = outcomes.next().value!;
-            return outcome.ok
-              ? {
-                  ok: true,
-                  result: encodeTaskResult(item.codec, outcome.result),
-                }
-              : outcome;
-          });
-        },
+            : outcome;
+        });
       },
-    ),
-    defineOperation<App, WireRunTaskInput, WireTaskResult>({
+    }),
+    defineOperation<App>()({
       id: "tasks.stream",
       description: "Stream progress, text and the final task result.",
       permission: "write",
@@ -319,27 +273,13 @@ export function taskOperations<
         mergeParamsIntoBody: true,
       },
       execute(app, wire, context) {
-        return createFlow(
-          "tasks.stream",
-          async function* (call) {
-            const options = { signal: call.signal };
-            const { codec, input } = await decodeRunTask(app, wire, options);
-            for await (const event of app.tasks.stream(input, options)) {
-              if (event.type === "result") {
-                const output = encodeTaskResult(codec, event.value);
-                return output;
-              }
-              yield event;
-            }
-            throw appError("model.incomplete", {
-              details: { stage: "stream" },
-            });
-          },
-          context.options,
+        return mapFlowResult(
+          app.tasks.stream(decodeRunTask(wire), context.options),
+          encodeTaskResult,
         );
       },
     }),
-    defineOperation<App, { task: string }, unknown>({
+    defineOperation<App>()({
       id: "prompts.read",
       description: "Read the active system and user templates.",
       permission: "read",
@@ -353,7 +293,7 @@ export function taskOperations<
       },
       execute: (app, { task }) => app.prompts.read(task),
     }),
-    defineOperation<App, { task: string }, unknown>({
+    defineOperation<App>()({
       id: "prompts.describe",
       description: "Describe prompt variables, output and template sources.",
       permission: "read",
@@ -367,7 +307,7 @@ export function taskOperations<
       },
       execute: (app, { task }) => app.prompts.describe(task),
     }),
-    defineOperation<App, { task: string }, unknown>({
+    defineOperation<App>()({
       id: "prompts.diff",
       description: "Get builtin and instance override templates.",
       permission: "read",
@@ -381,11 +321,7 @@ export function taskOperations<
       },
       execute: (app, { task }) => app.prompts.diff(task),
     }),
-    defineOperation<
-      App,
-      { task: string; role: "system" | "user"; template: string },
-      unknown
-    >({
+    defineOperation<App>()({
       id: "prompts.setOverride",
       description: "Compile and save an instance template override.",
       permission: "admin",
@@ -404,11 +340,7 @@ export function taskOperations<
       execute: (app, { task, role, template }) =>
         app.prompts.setOverride(task, { role, template }),
     }),
-    defineOperation<
-      App,
-      { task: string; role?: "system" | "user" | undefined },
-      unknown
-    >({
+    defineOperation<App>()({
       id: "prompts.reset",
       description: "Reset one or both templates to builtin values.",
       permission: "admin",

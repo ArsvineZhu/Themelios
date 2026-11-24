@@ -10,6 +10,7 @@ import {
   matchRange,
   parseAgentArtifactCode,
   pointToUtcIso,
+  timeRangeQuerySchema,
   toInstant,
   utcPoint,
   type ArtifactRef,
@@ -34,6 +35,17 @@ test("multi-domain time values validate precision, ordering, and 3-valued range 
   const u0 = utcPoint("2026-01-01T00:00:00.000Z");
   const u1 = utcPoint("2026-01-01T00:00:05.000Z");
   expect(pointToUtcIso(u0)).toBe("2026-01-01T00:00:00.000Z");
+  const outOfCalendar = { domain: "utc", ticks: "9000000000000000" };
+  expect(() => pointToUtcIso(outOfCalendar)).toThrow(
+    expect.objectContaining({ code: "time.invalid" }),
+  );
+  expect(
+    timeRangeQuerySchema.safeParse({
+      domain: "utc",
+      start: { kind: "known", point: { domain: "utc", ticks: "unknown" } },
+      end: { kind: "known", point: u1 },
+    }).success,
+  ).toBe(false);
   expect(comparePoints(u0, u1, "utc")).toBe(-1);
 
   const storyA = { domain: "story.timeline", ticks: "100" };
@@ -106,16 +118,21 @@ test("readable60 codes roundtrip 60-bit values and AgentRefBook translates bidir
   for (const sample of [
     0n,
     1n,
+    2n,
     0x123456789abcdef0n & ((1n << 60n) - 1n),
     (1n << 60n) - 1n,
   ]) {
     const code = encodeReadable60(sample);
-    expect(code).toMatch(/^[a-z]{24}$/);
     expect(decodeReadable60(code)).toBe(sample);
     const formatted = formatAgentArtifactRef(code);
     expect(agentArtifactRefSchema.safeParse(formatted).success).toBe(true);
     expect(parseAgentArtifactCode(formatted)).toBe(code);
   }
+  const upperUnit = encodeReadable60(1n);
+  const lowerUnit = encodeReadable60(2n);
+  expect(upperUnit).toEndWith("File");
+  expect(lowerUnit).toBe(upperUnit.toLowerCase());
+  expect(decodeReadable60(upperUnit)).not.toBe(decodeReadable60(lowerUnit));
   expect(() => decodeReadable60("zzzzzzzzzzzzzzzzzzzzzzzz")).toThrow(
     expect.objectContaining({ code: "input.invalid" }),
   );

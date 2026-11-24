@@ -1,16 +1,19 @@
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { link, mkdir, open, stat } from "node:fs/promises";
+import { readFileSync, type Stats } from "node:fs";
+import { mkdir, open, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import {
   AppError,
+  appError,
   blobRefSchema,
+  errorCode,
   openCall,
   type BlobRef,
   type CallOptions,
 } from "@themelios/core";
-import { fileErrorCode, storageError } from "./errors.js";
-import { stageFile, streamChunks, syncParent, writeChunk } from "./files.js";
+import { publishNewFile, stageFile } from "@themelios/core/files";
+import { streamChunks } from "@themelios/core";
+import { syncParent, writeChunk } from "./files.js";
 
 export interface BlobInfo {
   ref: BlobRef;
@@ -20,8 +23,16 @@ export interface BlobInfo {
 export function objectPath(root: string, ref: BlobRef): string {
   const parsed = blobRefSchema.safeParse(ref);
   if (!parsed.success)
-    throw storageError("storage.blob_ref_invalid", { blobRef: ref });
+    throw appError("storage.blob_ref_invalid", { details: { blobRef: ref } });
   return join(root, "sha256", ref.slice(7, 9), ref.slice(9));
+}
+
+function objectSize(info: Stats, ref: BlobRef, path: string): number {
+  if (!info.isFile())
+    throw appError("storage.blob_corrupt", {
+      details: { blobRef: ref, path, expected: "file", actual: "non-file" },
+    });
+  return info.size;
 }
 
 /** Publishes immutable exact bytes before any application transaction adopts a reference. */
@@ -76,12 +87,16 @@ export class Cas {
     try {
       scope.throwIfAborted();
       if (!Number.isSafeInteger(maxBytes) || maxBytes < 0)
-        throw storageError("storage.options_invalid", { field: "maxBytes" });
+        throw appError("storage.options_invalid", {
+          details: { field: "maxBytes" },
+        });
       const inline = input instanceof Uint8Array;
       if (inline && input.byteLength > maxBytes)
-        throw storageError("storage.limit_exceeded", {
-          maxBytes,
-          sizeBytes: input.byteLength,
+        throw appError("storage.limit_exceeded", {
+          details: {
+            maxBytes,
+            sizeBytes: input.byteLength,
+          },
         });
       const source = inline ? new Uint8Array(input) : input;
       await mkdir(temporary, { recursive: true });
@@ -94,12 +109,14 @@ export class Cas {
             const bytes = inline ? chunk : new Uint8Array(chunk);
             sizeBytes += bytes.byteLength;
             if (sizeBytes > maxBytes)
-              throw storageError("storage.limit_exceeded", {
-                maxBytes,
-                sizeBytes,
+              throw appError("storage.limit_exceeded", {
+                details: {
+                  maxBytes,
+                  sizeBytes,
+                },
               });
             hash.update(bytes);
-            await writeChunk(handle, bytes);
+            await writeChunk(handle, bytes, scope.signal);
           }
           return { ref: `sha256:${hash.digest("hex")}`, sizeBytes };
         },
@@ -109,28 +126,30 @@ export class Cas {
           await mkdir(dirname(destination), { recursive: true });
           scope.throwIfAborted();
           try {
-            await link(path, destination);
+            publishNewFile(path, destination);
           } catch (error) {
-            if (fileErrorCode(error) !== "EEXIST") throw error;
+            if (errorCode(error) !== "EEXIST") throw error;
             const existing = await this.stat(ref);
             if (existing.sizeBytes !== sizeBytes) {
-              throw storageError("storage.blob_corrupt", {
-                blobRef: ref,
-                expected: sizeBytes,
-                actual: existing.sizeBytes,
+              throw appError("storage.blob_corrupt", {
+                details: {
+                  blobRef: ref,
+                  expected: sizeBytes,
+                  actual: existing.sizeBytes,
+                },
               });
             }
           }
+          await syncParent(destination);
         },
       );
     } catch (error) {
       scope.throwIfAborted();
       if (error instanceof AppError) throw error;
-      throw storageError(
-        "storage.write_failed",
-        { operation: "put", path: temporary, reason: String(error) },
-        error,
-      );
+      throw appError("storage.write_failed", {
+        details: { operation: "put", path: temporary, reason: String(error) },
+        cause: error,
+      });
     } finally {
       scope.close();
     }
@@ -140,15 +159,7 @@ export class Cas {
     if (this.#stopping.signal.aborted) throw this.#stopping.signal.reason;
     const path = objectPath(this.root, ref);
     try {
-      const info = await stat(path);
-      if (!info.isFile())
-        throw storageError("storage.blob_corrupt", {
-          blobRef: ref,
-          path,
-          expected: "file",
-          actual: "non-file",
-        });
-      return { ref, sizeBytes: info.size };
+      return { ref, sizeBytes: objectSize(await stat(path), ref, path) };
     } catch (error) {
       throw this.#readFailure(error, ref, path);
     }
@@ -182,30 +193,22 @@ export class Cas {
     try {
       scope.throwIfAborted();
       handle = await open(path, "r");
-      const { size, isFile } = await handle
-        .stat()
-        .then((info) => ({ size: info.size, isFile: info.isFile() }));
-      if (!isFile)
-        throw storageError("storage.blob_corrupt", {
-          blobRef: ref,
-          path,
-          expected: "file",
-          actual: "non-file",
-        });
+      const size = objectSize(await handle.stat(), ref, path);
       const start = options?.start ?? 0;
       const end = options?.end ?? size;
       if (
-        !Number.isSafeInteger(start) ||
-        !Number.isSafeInteger(end) ||
+        ![start, end].every(Number.isSafeInteger) ||
         start < 0 ||
         end < start ||
         end > size
       ) {
-        throw storageError("storage.range_invalid", {
-          blobRef: ref,
-          start,
-          end,
-          sizeBytes: size,
+        throw appError("storage.range_invalid", {
+          details: {
+            blobRef: ref,
+            start,
+            end,
+            sizeBytes: size,
+          },
         });
       }
       scope.throwIfAborted();
@@ -245,11 +248,13 @@ export class Cas {
               );
               scope.throwIfAborted();
               if (bytesRead === 0)
-                throw storageError("storage.blob_corrupt", {
-                  blobRef: ref,
-                  path,
-                  expected: size,
-                  actual: position,
+                throw appError("storage.blob_corrupt", {
+                  details: {
+                    blobRef: ref,
+                    path,
+                    expected: size,
+                    actual: position,
+                  },
                 });
               position += bytesRead;
               output.enqueue(bytes.subarray(0, bytesRead));
@@ -257,11 +262,10 @@ export class Cas {
               await finish();
               throw error instanceof AppError
                 ? error
-                : storageError(
-                    "storage.read_failed",
-                    { blobRef: ref, path, reason: String(error) },
-                    error,
-                  );
+                : appError("storage.read_failed", {
+                    details: { blobRef: ref, path, reason: String(error) },
+                    cause: error,
+                  });
             }
           },
           cancel: finish,
@@ -298,27 +302,32 @@ export class Cas {
         async (handle) => {
           const body = await this.read(ref, { signal: scope.signal });
           for await (const bytes of streamChunks(body, scope.signal))
-            await writeChunk(handle, bytes);
+            await writeChunk(handle, bytes, scope.signal);
         },
         async (path) => {
           scope.throwIfAborted();
-          await link(path, destination);
+          publishNewFile(path, destination);
           await syncParent(destination);
         },
       );
     } catch (error) {
       scope.throwIfAborted();
       if (error instanceof AppError) throw error;
-      if (fileErrorCode(error) === "EEXIST")
-        throw storageError("storage.already_exists", {
+      if (errorCode(error) === "EEXIST")
+        throw appError("storage.already_exists", {
+          details: {
+            operation: "export",
+            path: destination,
+          },
+        });
+      throw appError("storage.write_failed", {
+        details: {
           operation: "export",
           path: destination,
-        });
-      throw storageError(
-        "storage.write_failed",
-        { operation: "export", path: destination, reason: String(error) },
-        error,
-      );
+          reason: String(error),
+        },
+        cause: error,
+      });
     } finally {
       scope.close();
     }
@@ -329,7 +338,9 @@ export class Cas {
   }
 
   async #close(): Promise<void> {
-    this.#stopping.abort(storageError("runtime.closed", { state: "closed" }));
+    this.#stopping.abort(
+      appError("runtime.closed", { details: { state: "closed" } }),
+    );
     await Promise.allSettled([
       ...this.#pending,
       ...Array.from(this.#streams, (finish) => finish()),
@@ -338,16 +349,14 @@ export class Cas {
 
   #readFailure(error: unknown, ref: BlobRef, path: string): AppError {
     if (error instanceof AppError) return error;
-    if (fileErrorCode(error) === "ENOENT")
-      return storageError(
-        "storage.blob_missing",
-        { blobRef: ref, path },
-        error,
-      );
-    return storageError(
-      "storage.read_failed",
-      { blobRef: ref, path, reason: String(error) },
-      error,
-    );
+    if (errorCode(error) === "ENOENT")
+      return appError("storage.blob_missing", {
+        details: { blobRef: ref, path },
+        cause: error,
+      });
+    return appError("storage.read_failed", {
+      details: { blobRef: ref, path, reason: String(error) },
+      cause: error,
+    });
   }
 }

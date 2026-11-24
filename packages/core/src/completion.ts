@@ -2,6 +2,12 @@ import { z } from "zod";
 import { jsonSchema, type Json } from "./json.js";
 import type { ErrorInfo } from "./errors.js";
 import {
+  representationCoverageSchema,
+  sourceCoverageSchema,
+  type RepresentationCoverage,
+  type SourceCoverage,
+} from "./media.js";
+import {
   artifactRefSchema,
   inlineMaterialSchema,
   selectionSchema,
@@ -11,7 +17,7 @@ import {
 } from "./selection.js";
 
 export interface ResultOutput {
-  result: Completed | SavedResult;
+  result: ArtifactRef | Completed;
   output?: string;
 }
 
@@ -21,19 +27,22 @@ export interface InputUse<S = Material> {
   source: S;
   delivered: readonly S[];
   role: "primary" | "context";
+  coverage?: SourceCoverage | undefined;
 }
 
-export interface Producer {
-  kind: "model" | "transform" | "application";
-  name: string;
-  version?: string;
-  details?: Json;
-}
+export const producerSchema = z.strictObject({
+  kind: z.enum(["model", "transform", "application"]),
+  name: z.string().min(1),
+  version: z.string().min(1).optional(),
+  details: jsonSchema.optional(),
+});
+export type Producer = z.infer<typeof producerSchema>;
 
 export interface ProducedFile {
   name: string;
   material: InlineMaterial | Selection;
   sourceIndices: readonly number[];
+  coverage?: RepresentationCoverage | undefined;
 }
 
 export const preparedRepresentationSchema = z.strictObject({
@@ -56,6 +65,7 @@ export interface Completed<T extends Json = Json> {
 export interface SavedFile {
   material: Selection;
   sourceIndices: readonly number[];
+  coverage?: RepresentationCoverage | undefined;
 }
 
 export interface SavedResult<T extends Json = Json> {
@@ -77,22 +87,10 @@ const fileName = z
     "Expected a file name",
   );
 const sourceIndices = z.array(z.int().nonnegative());
-
-export const producerSchema: z.ZodType<Producer> = z
-  .strictObject({
-    kind: z.enum(["model", "transform", "application"]),
-    name: z.string().min(1),
-    version: z.string().min(1).optional(),
-    details: jsonSchema.optional(),
-  })
-  .transform(({ version, details, ...data }): Producer => ({
-    ...data,
-    ...(version === undefined ? {} : { version }),
-    ...(details === undefined ? {} : { details }),
-  }));
+export const resultOutputNameSchema = z.union([z.literal("$value"), fileName]);
 
 // Content resolves and validates each referenced node during the graph walk, preserving object identity.
-const resultHandle = z.custom<ResultOutput["result"]>(
+const completedHandle = z.custom<Completed>(
   (value) =>
     typeof value === "object" &&
     value !== null &&
@@ -102,8 +100,8 @@ const resultHandle = z.custom<ResultOutput["result"]>(
 
 export const resultOutputSchema: z.ZodType<ResultOutput> = z
   .strictObject({
-    result: resultHandle,
-    output: z.union([z.literal("$value"), fileName]).optional(),
+    result: z.union([artifactRefSchema, completedHandle]),
+    output: resultOutputNameSchema.optional(),
   })
   .transform(({ result, output }): ResultOutput =>
     output === undefined ? { result } : { result, output },
@@ -120,6 +118,7 @@ function inputUseSchema<S>(schema: z.ZodType<S>) {
     source: schema,
     delivered: z.array(schema).min(1),
     role: z.enum(["primary", "context"]),
+    coverage: sourceCoverageSchema.optional(),
   });
 }
 
@@ -131,11 +130,13 @@ const producedFileSchema = z.strictObject({
   name: fileName,
   material: z.union([inlineMaterialSchema, selectionSchema]),
   sourceIndices,
+  coverage: representationCoverageSchema.optional(),
 });
 
 const savedFileSchema = z.strictObject({
   material: selectionSchema,
   sourceIndices,
+  coverage: representationCoverageSchema.optional(),
 });
 const savedFilesSchema = z
   .custom<Record<string, unknown>>((value) => {

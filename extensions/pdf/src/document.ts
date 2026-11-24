@@ -1,9 +1,10 @@
-import { readMediaBytes, type MediaInput } from "@themelios/models/tasks";
 import {
-  AppError,
   appError,
+  mediaDecodeError,
   openCall,
+  readMediaBytes,
   type CallOptions,
+  type MediaInput,
 } from "@themelios/core";
 import {
   getDocument,
@@ -81,15 +82,7 @@ export async function withPdf<T>(
     }
   } catch (error) {
     call.throwIfAborted();
-    if (error instanceof AppError) throw error;
-    throw appError("content.decode_failed", {
-      cause: error,
-      details: {
-        mediaType: input.info.mediaType,
-        reason: String(error),
-        ...("ref" in input.source ? { ref: input.source.ref } : {}),
-      },
-    });
+    throw mediaDecodeError(input, error);
   } finally {
     call.close();
   }

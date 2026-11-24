@@ -2,7 +2,7 @@ import { join } from "node:path";
 import {
   createContent,
   createImageAdapter,
-  imageNeedsOrientation,
+  createWaveAdapter,
   type Materials,
   type Representations,
   type Results,
@@ -10,15 +10,14 @@ import {
 import { contentSchemaSql } from "@themelios/content/schema";
 import {
   appError,
-  createFlow,
-  openCall,
+  mapFlowResult,
   parseJson,
   throwIfAborted,
   toErrorInfo,
   type CallOptions,
   type InputUse,
   type Json,
-  type Material,
+  type RepresentationAdapter,
 } from "@themelios/core";
 import {
   createModels,
@@ -28,15 +27,10 @@ import {
   describeTask,
   type ApplicationPrompts,
   type PreparationStore,
-  type RepresentationAdapter,
   type SourceEntry,
   type TaskDefinition,
-  type TaskRoute,
 } from "@themelios/models";
-import {
-  createSourceDirectory,
-  rangeDescription,
-} from "@themelios/models/tasks";
+import { createSourceDirectory } from "@themelios/models/tasks";
 import type {
   ApplicationModule,
   InstanceInfo,
@@ -56,6 +50,7 @@ import type {
   TaskResult,
 } from "./task-operations.js";
 import type { BinaryReadResult } from "@themelios/runtime/operations";
+import type { WireInputUse } from "./wire.js";
 
 export interface ApplicationApi<S = ApplicationSettings> {
   readonly materials: Materials;
@@ -67,15 +62,27 @@ export interface ApplicationApi<S = ApplicationSettings> {
   info(): InstanceInfo & { readonly paths: InstancePaths };
 }
 
-type RegisteredTask = TaskDefinition<Json, Json, unknown>;
+type RegisteredTask = ApplicationDefinition["tasks"][number];
 type Environment = OpenEnvironment<ApplicationSettings>;
+
+function modelConfiguration({ models }: Readonly<ApplicationSettings>) {
+  const { bindings, connections, timeoutMs, maxAttempts, concurrency } = models;
+  return {
+    bindings,
+    connections,
+    defaults: { timeoutMs, maxAttempts, concurrency },
+  };
+}
 
 export interface ApplicationDefinition {
   id: string;
   formatId: string;
   resourceRoot: string;
-  tasks: readonly { readonly id: string }[];
+  tasks: readonly TaskDefinition<Json, Json, unknown>[];
   adapters?: readonly RepresentationAdapter[];
+  createAdapters?(
+    settings: ApplicationSettings["preparation"],
+  ): readonly RepresentationAdapter[];
   locales?: Dictionaries;
 }
 
@@ -84,20 +91,20 @@ function taskCatalog(
 ): ReadonlyMap<string, RegisteredTask> {
   const byId = new Map<string, RegisteredTask>();
   for (const task of tasks) {
-    if (byId.has(task.id) || !("input" in task) || !("templates" in task)) {
+    if (byId.has(task.id)) {
       throw appError("config.invalid", {
         details: {
           issues: [{ path: task.id, messageKey: "tasks.invalid_definition" }],
         },
       });
     }
-    byId.set(task.id, task as RegisteredTask);
+    byId.set(task.id, task);
   }
   return byId;
 }
 
 function describeUse(
-  use: InputUse,
+  use: InputUse | WireInputUse,
   index: number,
   materials: Materials,
 ): SourceEntry {
@@ -105,43 +112,32 @@ function describeUse(
   const source = use.source;
   const info =
     "ref" in source
-      ? materials.inspect(source.ref)
+      ? materials.inspect(materials.resolve(source.ref))
       : "bytes" in source
         ? {
             mediaType: source.mediaType,
             name: source.name,
             extent: { kind: "text" as const, bytes: source.bytes.byteLength },
           }
-        : {
-            mediaType: "application/json",
-            extent: { kind: "unknown" as const },
-          };
-  const originalExtent =
-    "ref" in source
-      ? rangeDescription({
-          ...("range" in source && source.range !== undefined
-            ? { range: source.range }
-            : {}),
-        })
-      : "bytes" in source
-        ? "全文"
-        : (source.output ?? "result");
-  const deliveredExtent = use.delivered.map((item) => {
-    if ("ref" in item) {
-      return rangeDescription({
-        ...(item.range === undefined ? {} : { range: item.range }),
-      });
-    }
-    return "bytes" in item
-      ? (item.name ?? item.mediaType)
-      : (item.output ?? "result");
-  });
+        : "inline" in source
+          ? {
+              mediaType: source.inline.mediaType,
+              name: source.inline.name,
+              extent: { kind: "unknown" as const },
+            }
+          : {
+              mediaType: "application/json",
+              extent: { kind: "unknown" as const },
+            };
   return {
     key,
     mediaType: info.mediaType,
-    ...(info.name === undefined ? {} : { name: info.name }),
-    originalExtent,
-    deliveredExtent,
+    ...("name" in info && info.name !== undefined ? { name: info.name } : {}),
+    ...(use.coverage ?? {
+      originalExtent: info.extent,
+      requestedRange: "ref" in source ? (source.range ?? null) : null,
+      delivered: [],
+    }),
     role: use.role,
   };
 }
@@ -183,18 +179,16 @@ export function createApplicationModule(
         key: string,
         params?: Record<string, string | number | boolean>,
       ) => env.localize(key, params, locale);
-      const content = env.own(
-        createContent({
-          database,
-          cas,
-          get maxImportBytes() {
-            return env.settings.content.maxImportBytes;
-          },
-          get maxInlineBytes() {
-            return env.settings.content.maxInlineBytes;
-          },
-        }),
-      );
+      const content = createContent({
+        database,
+        cas,
+        get maxImportBytes() {
+          return env.settings.content.maxImportBytes;
+        },
+        get maxInlineBytes() {
+          return env.settings.content.maxInlineBytes;
+        },
+      });
       const store: PreparationStore = {
         inspect: (ref) => content.materials.inspect(ref),
         read: (ref, call) => materials.read(ref, call),
@@ -203,90 +197,66 @@ export function createApplicationModule(
         findRepresentation: (source, purpose, recipe) =>
           content.representations.find(source, purpose, recipe),
       };
-      const resources = await env.bindResource(
-        (settings) =>
-          parseJson({
-            locale: settings.locale,
-            connections: settings.models.connections,
-            bindings: settings.models.bindings,
-            tasks: settings.models.tasks,
-            preparation: settings.preparation,
-            content: settings.content,
-            defaults: {
-              timeoutMs: settings.models.timeoutMs,
-              maxAttempts: settings.models.maxAttempts,
-              concurrency: settings.models.concurrency,
-            },
-          }),
-        async (context) => {
-          const settings = context.settings;
-          const models = createModels({
-            connections: settings.models.connections,
-            bindings: settings.models.bindings,
+      const modelResource = await env.bindResource(
+        (settings) => parseJson(modelConfiguration(settings)),
+        async (context) =>
+          createModels({
+            ...modelConfiguration(context.settings),
             fetch: context.network.fetch,
             diagnostics: context.diagnostics,
             resolveCredential: (ref) => context.secrets.resolve(ref),
-            defaults: {
-              timeoutMs: settings.models.timeoutMs,
-              maxAttempts: settings.models.maxAttempts,
-              concurrency: settings.models.concurrency,
-            },
-          });
-          const prompts = createPrompts({
-            resourceRoot: definition.resourceRoot,
-            overrideRoot: join(env.paths.config, "prompts"),
-            locale: settings.locale,
-          });
-          for (const task of catalog.values()) await prompts.read(task);
-          const imageAdapter = createImageAdapter({
-            maxPixels: settings.preparation.image.maxPixels,
-            maxBytes: settings.preparation.maxMaterialBytes,
-          }) as unknown as RepresentationAdapter;
-          const preparation = createPreparation({
-            store,
-            models,
-            prompts,
-            modelIdentity(name) {
-              const binding = models.describe(name);
-              const connection =
-                settings.models.connections[binding.connection];
-              return parseJson({
-                binding,
-                protocol: connection?.protocol ?? null,
-                baseURL: connection?.baseURL ?? null,
-              });
-            },
-            adapters: [imageAdapter, ...(definition.adapters ?? [])],
-            imageNeedsOrientation: (input, call) =>
-              imageNeedsOrientation(
-                input as unknown as Parameters<typeof imageNeedsOrientation>[0],
-                settings.preparation.image.maxPixels,
-                call,
-                settings.preparation.maxMaterialBytes,
-              ),
-            maxMaterialBytes: settings.preparation.maxMaterialBytes,
-            maxInlineBytes: settings.content.maxInlineBytes,
-          });
-          const tasks = createTasks({
-            models,
-            prompts,
-            preparation,
-            routes: settings.models.tasks as Readonly<
-              Record<string, TaskRoute>
-            >,
-            concurrency: settings.models.concurrency,
-            timeoutMs: settings.models.timeoutMs,
-          });
-          return {
-            models,
-            prompts,
-            tasks,
-            async close() {
-              await models.close();
-            },
-          };
-        },
+          }),
       );
+      const promptStore = createPrompts({
+        resourceRoot: definition.resourceRoot,
+        overrideRoot: join(env.paths.config, "prompts"),
+      });
+      const taskExecutors = new WeakMap<
+        Readonly<ApplicationSettings>,
+        ReturnType<typeof createTasks>
+      >();
+      function taskExecutor() {
+        const settings = env.settings;
+        const existing = taskExecutors.get(settings);
+        if (existing) return existing;
+        const models = modelResource.get();
+        const imageAdapter = createImageAdapter({
+          maxPixels: settings.preparation.image.maxPixels,
+          maxBytes: settings.preparation.maxMaterialBytes,
+        });
+        const preparation = createPreparation({
+          store,
+          models,
+          prompts: promptStore,
+          ...(settings.models.tasks["media.describe"]?.variables === undefined
+            ? {}
+            : {
+                mediaDescriptionDefaults:
+                  settings.models.tasks["media.describe"].variables,
+              }),
+          adapters: [
+            imageAdapter,
+            createWaveAdapter({
+              maxBytes: settings.preparation.maxMaterialBytes,
+            }),
+            ...(definition.adapters ?? []),
+            ...(definition.createAdapters?.(settings.preparation) ?? []),
+          ],
+          maxMaterialBytes: settings.preparation.maxMaterialBytes,
+          maxInlineBytes: settings.content.maxInlineBytes,
+        });
+        const tasks = createTasks({
+          models,
+          prompts: promptStore,
+          preparation,
+          diagnostics: env.diagnostics,
+          routes: settings.models.tasks,
+          concurrency: settings.models.concurrency,
+          timeoutMs: settings.models.timeoutMs,
+        });
+        taskExecutors.set(settings, tasks);
+        return tasks;
+      }
 
       const assertWritable = (operation: string) => {
         if (env.mode === "read-only") {
@@ -296,9 +266,9 @@ export function createApplicationModule(
       const queue = new PQueue({
         concurrency: env.settings.runtime.ioConcurrency,
       });
-      const queueIo = <T>(work: () => Promise<T>) => {
+      const queueIo = <T>(signal: AbortSignal, work: () => Promise<T>) => {
         queue.concurrency = env.settings.runtime.ioConcurrency;
-        return queue.add(work);
+        return queueWork(queue, signal, work);
       };
       const runIo = <T>(
         operation: string,
@@ -307,7 +277,7 @@ export function createApplicationModule(
       ) =>
         env.execution.run(
           operation,
-          (signal) => queueIo(() => work({ signal })),
+          (signal) => queueIo(signal, () => work({ signal })),
           options,
         );
       function read(
@@ -321,7 +291,7 @@ export function createApplicationModule(
         const operation = env.execution.start(
           "materials.read",
           (signal) =>
-            queueIo(async () => {
+            queueIo(signal, async () => {
               throwIfAborted(signal);
               const material = await content.materials.read(ref, { signal });
               const bridge = new TransformStream<Uint8Array, Uint8Array>();
@@ -430,28 +400,39 @@ export function createApplicationModule(
         return task;
       };
       const prompts: ApplicationPrompts = {
-        read: (task) => resources.get().prompts.read(findTask(task)),
-        describe: (task) => resources.get().prompts.describe(findTask(task)),
-        diff: (task) => resources.get().prompts.diff(findTask(task)),
+        read: (task) =>
+          env.execution.run("prompts.read", () =>
+            promptStore.read(findTask(task)),
+          ),
+        describe: (task) =>
+          env.execution.run("prompts.describe", () =>
+            promptStore.describe(findTask(task)),
+          ),
+        diff: (task) =>
+          env.execution.run("prompts.diff", () =>
+            promptStore.diff(findTask(task)),
+          ),
         setOverride(task, change) {
           assertWritable("prompts.setOverride");
           return env.execution.run("prompts.setOverride", () =>
-            resources.get().prompts.setOverride(findTask(task), change),
+            promptStore.setOverride(findTask(task), change),
           );
         },
         reset(task, part) {
           assertWritable("prompts.reset");
           return env.execution.run("prompts.reset", () =>
-            resources.get().prompts.reset(findTask(task), part),
+            promptStore.reset(findTask(task), part),
           );
         },
       };
 
+      taskExecutor();
       const tasks = bindTasks(
         env,
         findTask,
         catalog,
-        resources.get,
+        promptStore,
+        taskExecutor,
         content,
         materials,
         assertWritable,
@@ -482,14 +463,35 @@ export function createApplicationModule(
   };
 }
 
+/** Cancellation removes queued work. Active work holds its slot until cleanup finishes. */
+async function queueWork<T>(
+  queue: PQueue,
+  signal: AbortSignal,
+  work: () => Promise<T>,
+): Promise<T> {
+  signal.throwIfAborted();
+  const admission = new AbortController();
+  const abort = () => admission.abort(signal.reason);
+  signal.addEventListener("abort", abort, { once: true });
+  try {
+    return await queue.add(
+      () => {
+        signal.removeEventListener("abort", abort);
+        return work();
+      },
+      { signal: admission.signal },
+    );
+  } finally {
+    signal.removeEventListener("abort", abort);
+  }
+}
+
 function bindTasks(
   env: Environment,
   findTask: (name: string) => RegisteredTask,
   catalog: ReadonlyMap<string, RegisteredTask>,
-  getResources: () => {
-    prompts: ReturnType<typeof createPrompts>;
-    tasks: ReturnType<typeof createTasks>;
-  },
+  prompts: ReturnType<typeof createPrompts>,
+  getTasks: () => ReturnType<typeof createTasks>,
   content: ReturnType<typeof createContent>,
   materials: Materials,
   assertWritable: (name: string) => void,
@@ -499,102 +501,94 @@ function bindTasks(
     params?: Record<string, string | number | boolean>,
   ) => string,
 ): ApplicationTasks {
-  const timeoutOpts = (opts?: CallOptions): CallOptions => ({
-    timeoutMs: env.configuration.snapshot().models.timeoutMs,
-    ...opts,
-  });
+  const timeoutOpts = (opts?: CallOptions, task?: string): CallOptions => {
+    const { models } = env.settings;
+    const route =
+      task && Object.hasOwn(models.tasks, task)
+        ? models.tasks[task]
+        : undefined;
+    return { timeoutMs: route?.timeoutMs ?? models.timeoutMs, ...opts };
+  };
 
   async function runSingle(
-    input: RunTaskInput,
+    captured: RunTaskInput,
     opts?: CallOptions,
   ): Promise<TaskResult> {
-    parseJson(input.variables);
-    const captured = structuredClone(input);
+    parseJson(captured.variables);
     return env.execution.run(
       "tasks.run",
       async (signal) => {
         if (captured.persist) assertWritable("tasks.run.save");
-        const done = await getResources().tasks.run(
-          findTask(captured.task),
-          captured,
-          {
-            signal,
-            ...(opts?.onProgress ? { onProgress: opts.onProgress } : {}),
-          },
-        );
+        const done = await getTasks().run(findTask(captured.task), captured, {
+          signal,
+          ...(opts?.onProgress ? { onProgress: opts.onProgress } : {}),
+        });
         return captured.persist ? content.results.save(done, { signal }) : done;
       },
-      timeoutOpts(opts),
+      timeoutOpts(opts, captured.task),
     );
   }
 
   return {
-    run: runSingle,
+    run: (input, opts) => runSingle(structuredClone(input), opts),
     stream(input, opts) {
       parseJson(input.variables);
       const captured = structuredClone(input);
-      return env.execution.flow(
+      return env.execution.flow<TaskResult>(
         "tasks.stream",
-        (signal) =>
-          createFlow(
-            "tasks.stream",
-            async function* (call) {
-              if (captured.persist) assertWritable("tasks.stream.save");
-              for await (const event of getResources().tasks.stream(
-                findTask(captured.task),
-                captured,
-                { signal: call.signal },
-              )) {
-                if (event.type === "result") {
-                  return captured.persist
-                    ? content.results.save(event.value, { signal: call.signal })
-                    : event.value;
-                }
-                yield event;
-              }
-              throw appError("model.incomplete", {
-                details: { stage: "stream" },
-              });
-            },
-            { signal },
-          ),
-        timeoutOpts(opts),
+        (signal) => {
+          if (captured.persist) assertWritable("tasks.stream.save");
+          const flow = getTasks().stream(findTask(captured.task), captured, {
+            signal,
+          });
+          return captured.persist
+            ? mapFlowResult(flow, (result) =>
+                content.results.save(result, { signal }),
+              )
+            : flow;
+        },
+        timeoutOpts(opts, captured.task),
       );
     },
     runMany(inputs, opts): Promise<readonly BatchItemResult[]> {
+      const captured = structuredClone(inputs);
       return env.execution.run(
         "tasks.runMany",
         async (signal) => {
-          const call = openCall("tasks.runMany", { signal });
           const queue = new PQueue({
             concurrency: env.configuration.snapshot().models.concurrency,
           });
-          try {
-            const captured = structuredClone(inputs);
-            return await Promise.all(
-              captured.map((input) =>
-                queue.add(async (): Promise<BatchItemResult> => {
-                  try {
-                    call.throwIfAborted("queue");
-                    return {
-                      ok: true,
-                      result: await runSingle(input, { signal: call.signal }),
-                    };
-                  } catch (error) {
-                    const locale = env.configuration.snapshot().locale;
-                    return {
-                      ok: false,
-                      error: toErrorInfo(error, (key, params) =>
-                        localize(locale, key, params),
-                      ),
-                    };
-                  }
-                }),
-              ),
-            );
-          } finally {
-            call.close();
-          }
+          const locale = env.settings.locale;
+          const outcomes = await Promise.all(
+            captured.map(async (input): Promise<BatchItemResult> => {
+              try {
+                const result = await queueWork(queue, signal, () =>
+                  runSingle(input, { signal }),
+                );
+                return { ok: true, result };
+              } catch (error) {
+                return {
+                  ok: false,
+                  error: toErrorInfo(error, (key, params) =>
+                    localize(locale, key, params),
+                  ),
+                };
+              }
+            }),
+          );
+          const succeeded = outcomes.filter((item) => item.ok).length;
+          const failed = outcomes.length - succeeded;
+          env.diagnostics.log("info", "tasks.batch.completed", {
+            outcome:
+              failed === 0
+                ? "complete"
+                : succeeded === 0
+                  ? "all-failed"
+                  : "partial",
+            succeeded,
+            failed,
+          });
+          return outcomes;
         },
         timeoutOpts(opts),
       );
@@ -605,19 +599,20 @@ function bindTasks(
       return env.execution.run(
         "tasks.preview",
         (signal) =>
-          getResources().tasks.preview(findTask(captured.task), captured, {
+          getTasks().preview(findTask(captured.task), captured, {
             signal,
           }),
-        timeoutOpts(opts),
+        timeoutOpts(opts, captured.task),
       );
     },
-    describe: (name) =>
-      describeTask(findTask(name), getResources().prompts, (key) =>
-        localize(env.configuration.snapshot().locale, key),
+    describe: (name, locale) =>
+      env.execution.run("tasks.describe", () =>
+        describeTask(findTask(name), prompts, (key) =>
+          localize(locale ?? env.configuration.snapshot().locale, key),
+        ),
       ),
-    list: () =>
+    list: (locale = env.configuration.snapshot().locale) =>
       [...catalog.values()].map((task) => {
-        const locale = env.configuration.snapshot().locale;
         const resolvedTitle =
           task.titleKey !== task.id
             ? localize(locale, task.titleKey)
@@ -635,15 +630,13 @@ function bindTasks(
               : resolvedPurpose,
         };
       }),
-    present(taskName, result) {
+    present(taskName, result, locale = env.configuration.snapshot().locale) {
       const task = findTask(taskName);
       if (!task.present) return JSON.stringify(result, null, 2);
       const directory = createSourceDirectory(
-        (result.inputs as InputUse<Material>[]).map((use, index) =>
-          describeUse(use, index, materials),
-        ),
+        result.inputs.map((use, index) => describeUse(use, index, materials)),
       );
-      return task.present(result.value, directory);
+      return task.present(result.value, directory, locale);
     },
   };
 }

@@ -59,6 +59,15 @@ export function toAppError(error: unknown): AppError {
     : appError("internal.unexpected", { cause: error });
 }
 
+export function errorCode(error: unknown): string | undefined {
+  return typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    typeof error.code === "string"
+    ? error.code
+    : undefined;
+}
+
 export function toErrorInfo(
   error: unknown,
   translate: (key: string, params?: MessageParams) => string = (key) => key,

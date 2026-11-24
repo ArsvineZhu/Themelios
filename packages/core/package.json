@@ -16,9 +16,14 @@
     "./time": {
       "types": "./dist/types/time.d.ts",
       "import": "./dist/time.js"
+    },
+    "./files": {
+      "types": "./dist/types/files.d.ts",
+      "import": "./dist/files.js"
     }
   },
   "dependencies": {
+    "file-type": "22.3.0",
     "zod": "catalog:"
   }
 }

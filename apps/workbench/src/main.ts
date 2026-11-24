@@ -4,13 +4,13 @@ import { resolve } from "node:path";
 import { Installation } from "@themelios/runtime";
 import { standardOperations } from "@themelios/application";
 import { runApplicationCli } from "@themelios/transports";
-import { workbenchApplication } from "./definition.js";
+import { createWorkbench } from "./definition.js";
 import { maintain } from "./maintenance.js";
 import { localPrincipal, serve } from "./serve.js";
 
 export {
   releaseRecipes,
-  workbenchApplication,
+  workbenchId,
   workbenchTaskDescriptions,
 } from "./definition.js";
 
@@ -24,24 +24,23 @@ export async function runWorkbench(options: {
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
   try {
+    const application = await createWorkbench(options.cwd);
     const useInstallation = (root: string) =>
-      Installation.at(root, workbenchApplication);
+      Installation.at(root, application);
     return await runApplicationCli(
       useInstallation(options.installationRoot),
       options.argv,
       {
         name: "themelios",
-        operations: standardOperations().map((operation) =>
-          operation.id === "instance.info"
-            ? operation
-            : { ...operation, cli: false },
-        ),
+        operations: standardOperations(),
+        mountOperationCommands: false,
         configure: mountStandardCli,
         cwd: options.cwd,
         principal: localPrincipal,
         signal: signal.signal,
         useInstallation,
-        offline: (request) => maintain(options.installationRoot, request),
+        offline: (request) =>
+          maintain(options.installationRoot, request, application),
         serve,
       },
     );

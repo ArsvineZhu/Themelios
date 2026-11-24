@@ -93,7 +93,9 @@ test("time domains register idempotently, persist across reopens, and reject con
       label: "Story Timeline",
       tickSeconds: { numerator: "1", denominator: "1000" },
     });
+    const registeredAt = database.cut();
     expect(database.defineTimeDomain(story)).toEqual(story);
+    expect(database.cut()).toBe(registeredAt);
     const opaque = database.defineTimeDomain({
       id: "dream.ordinal",
       kind: "opaque",

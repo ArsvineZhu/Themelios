@@ -1,72 +1,118 @@
-import { appError, parseJson, type CallOptions } from "@themelios/core";
-import { z } from "zod";
+import { createHash } from "node:crypto";
+import {
+  appError,
+  parseJson,
+  type CallOptions,
+  type Json,
+  type MediaInput,
+  type PreparedRepresentation,
+  type RepresentationCoverage,
+} from "@themelios/core";
+import {
+  inputVariables,
+  mediaDescription,
+  messagesWithParts,
+} from "./task-definition.js";
 import type {
-  MediaInput,
   ModelPart,
   Models,
   Preparation,
-  PreparedRepresentation,
+  PreparedInput,
   Prompts,
-  TaskDefinition,
 } from "./types.js";
 
-const mediaDescribeVariablesSchema = z.object({
-  language: z.enum(["zh-CN", "en"]).default("zh-CN"),
-  instructions: z.string().max(4000).nullable().default(null),
-});
+function audioPart(prepared: PreparedInput, input: MediaInput) {
+  const parts = prepared.parts.filter((part) => part.kind === "media");
+  const [audio] = parts;
+  if (parts.length !== 1 || !audio?.mediaType.startsWith("audio/")) {
+    throw appError("input.capability_missing", {
+      details: {
+        mediaType: input.info.mediaType,
+        required: "one prepared audio attachment",
+      },
+    });
+  }
+  return audio;
+}
 
-export function createMediaDescriptionInlineTask(): TaskDefinition<
-  z.output<typeof mediaDescribeVariablesSchema>,
-  string,
-  z.input<typeof mediaDescribeVariablesSchema>
-> {
+function combinedRange(
+  prepared: PreparedInput,
+  input: MediaInput,
+): RepresentationCoverage["sourceRange"] {
+  const delivered = prepared.sources.entries[0]?.delivered ?? [];
+  if (delivered.length === 1) return delivered[0]!.sourceRange;
+  const ranges = delivered.map(({ sourceRange }) => sourceRange);
+  const pages = ranges.filter((range) => range?.kind === "pages");
+  const [first, ...remaining] = pages;
+  if (first && pages.length === ranges.length) {
+    let end = first.end;
+    let continuous = true;
+    for (const next of remaining) {
+      if (next.start !== end) {
+        continuous = false;
+        break;
+      }
+      end = next.end;
+    }
+    if (continuous) return { kind: "pages", start: first.start, end };
+  }
+  throw appError("input.capability_missing", {
+    details: {
+      mediaType: input.info.mediaType,
+      required: "one continuous range for a combined textual representation",
+    },
+  });
+}
+
+function partFingerprint(part: ModelPart) {
+  if (part.kind === "text") return part;
+  const { bytes, ...metadata } = part;
   return {
-    id: "media.describe",
-    title: "Describe media",
-    purpose:
-      "Produce a factual textual description of an image, audio, or document input.",
-    titleKey: "tasks.mediaDescription.title",
-    purposeKey: "tasks.mediaDescription.purpose",
-    input: mediaDescribeVariablesSchema,
-    output: "text",
-    requirements: {
-      minMaterials: 1,
-      maxMaterials: 1,
-      inputs: [
-        { mediaType: "text/plain", needs: ["text"] },
-        { mediaType: "text/markdown", needs: ["text"] },
-        { mediaType: "image/*", needs: ["visual"] },
-        { mediaType: "application/pdf", needs: ["text", "visual"] },
-        { mediaType: "audio/*", needs: ["speech"] },
-        { mediaType: "video/*", needs: ["visual", "speech", "motion"] },
-      ],
-    },
-    templates: {
-      inline: true,
-      system:
-        "Produce a concise, faithful textual representation of the provided input for downstream tasks.",
-      user: "{% if instructions %}{{ instructions }}\n\n{% endif %}Respond in {{ language | default: 'zh-CN' }}.\nMaterial: {{ sources[0].mediaType }} ({{ sources[0].originalExtent }}).",
-    },
-    examples: [],
-    outputRuleKeys: [],
+    ...metadata,
+    sha256: createHash("sha256").update(bytes).digest("hex"),
   };
 }
 
-export async function prepareModelRepresentation(params: {
+function textRepresentation(
+  name: string,
+  text: string,
+  details: Json,
+  input: PreparedInput,
+  sourceRange: RepresentationCoverage["sourceRange"],
+): PreparedRepresentation {
+  const file = "text.txt";
+  const bytes = new TextEncoder().encode(text);
+  return {
+    outputs: [file],
+    result: {
+      value: { text },
+      inputs: input.uses,
+      files: [
+        {
+          name: file,
+          material: { name: file, bytes, mediaType: "text/plain" },
+          sourceIndices: [0],
+          coverage: {
+            sourceRange,
+            extent: { kind: "text", bytes: bytes.byteLength },
+          },
+        },
+      ],
+      producer: { kind: "model", name, details },
+    },
+  };
+}
+
+export async function planModelRepresentation(params: {
   recipe: "media.describe" | "speech.transcribe";
   model: string;
   input: MediaInput;
   call: CallOptions;
   models: Models;
-  prompts?: Prompts;
+  prompts: Prompts;
   preparation: Preparation;
-  maxMaterialBytes: number;
-  readPart: (
-    input: MediaInput,
-    call: CallOptions,
-    maxBytes: number,
-  ) => Promise<ModelPart>;
-}): Promise<PreparedRepresentation> {
+  descriptionDefaults?: Readonly<Record<string, Json>>;
+}) {
   const {
     recipe,
     model,
@@ -75,116 +121,84 @@ export async function prepareModelRepresentation(params: {
     models,
     prompts,
     preparation,
-    maxMaterialBytes,
-    readPart,
+    descriptionDefaults,
   } = params;
-  const material = input.source;
-  if (recipe === "speech.transcribe") {
-    const audio = await readPart(input, call, maxMaterialBytes);
-    if (audio.kind !== "media" || !audio.mediaType.startsWith("audio/")) {
-      throw appError("input.capability_missing", {
-        details: { mediaType: input.info.mediaType, required: "audio/*" },
-      });
-    }
-    const result = await models.transcribe({ model, audio }, call);
+  const capabilities = models.describe(model).capabilities;
+  const transcription = recipe === "speech.transcribe";
+  const prepared = await preparation.forModel(
+    [{ source: input.source }],
+    transcription
+      ? {
+          minMaterials: 1,
+          maxMaterials: 1,
+          inputs: [
+            { mediaType: "audio/*", needs: ["speech"] },
+            { mediaType: "video/*", needs: ["speech"] },
+          ],
+        }
+      : mediaDescription.requirements,
+    capabilities,
+    call.signal ? { signal: call.signal } : {},
+  );
+  const sourceRange = combinedRange(prepared, input);
+  const originalExtent =
+    prepared.sources.entries[0]?.originalExtent ?? input.info.extent;
+  const modelFingerprint = models.fingerprint(model);
+  if (transcription) {
+    const audio = audioPart(prepared, input);
+    const identity = {
+      modelFingerprint,
+      audio: partFingerprint(audio),
+      sourceRange,
+    };
     return {
-      outputs: ["text.txt"],
-      result: {
-        value: parseJson({ text: result.text }),
-        inputs: [{ source: material, delivered: [material], role: "primary" }],
-        files: [
-          {
-            name: "text.txt",
-            material: {
-              bytes: new TextEncoder().encode(result.text),
-              mediaType: "text/plain",
-              name: "text.txt",
-            },
-            sourceIndices: [0],
-          },
-        ],
-        producer: {
-          kind: "model",
-          name: "speech.transcribe",
-          details: parseJson(result.model),
-        },
+      identity,
+      originalExtent,
+      async run() {
+        const result = await models.transcribe({ model, audio }, call);
+        return textRepresentation(
+          recipe,
+          result.text,
+          parseJson(result.model),
+          prepared,
+          sourceRange,
+        );
       },
     };
   }
-  const describeTask = createMediaDescriptionInlineTask();
-  const prepared = await preparation.forModel(
-    [{ source: material }],
-    describeTask.requirements,
-    models.describe(model).capabilities,
-    call,
+  const variables = inputVariables(mediaDescription, {}, descriptionDefaults);
+  const prompt = await prompts.compile(
+    mediaDescription,
+    variables,
+    prepared.sources,
   );
-  const messages = prompts
-    ? (
-        await prompts.compile(
-          describeTask,
-          { language: "zh-CN", instructions: null },
-          prepared.sources,
-        )
-      ).messages
-    : [
-        {
-          role: "system" as const,
-          parts: [
-            {
-              kind: "text" as const,
-              text: (
-                describeTask.templates as {
-                  inline: true;
-                  system?: string;
-                  user: string;
-                }
-              ).system!,
-            },
-          ],
-        },
-        {
-          role: "user" as const,
-          parts: [
-            {
-              kind: "text" as const,
-              text: "Describe the input media accurately.",
-            },
-          ],
-        },
-      ];
-  const generated = await models.generate<string>(
-    {
-      model,
-      output: "text",
-      messages: messages.map((m) =>
-        m.role === "user"
-          ? { ...m, parts: [...m.parts, ...prepared.parts] }
-          : m,
-      ),
-    },
-    call,
-  );
+  const messages = messagesWithParts(prompt, prepared.parts);
+  const identity = {
+    modelFingerprint,
+    messages: messages.map(({ role, parts }) => ({
+      role,
+      parts: parts.map(partFingerprint),
+    })),
+    sourceRange,
+  };
   return {
-    outputs: ["text.txt"],
-    result: {
-      value: parseJson({ text: generated.value }),
-      inputs: prepared.uses,
-      files: [
-        {
-          name: "text.txt",
-          material: {
-            bytes: new TextEncoder().encode(generated.value),
-            mediaType: "text/plain",
-            name: "text.txt",
-          },
-          sourceIndices: [0],
-        },
-      ],
-      producer: {
-        kind: "model",
-        name: "media.describe",
-        details: parseJson(generated.model),
-      },
+    identity,
+    originalExtent,
+    async run() {
+      const generated = await models.generate<string>(
+        { model, output: "text", messages },
+        call,
+      );
+      return textRepresentation(
+        recipe,
+        generated.value,
+        parseJson({
+          ...generated.model,
+          prompts: prompt.files.map(({ role, source }) => ({ role, source })),
+        }),
+        prepared,
+        sourceRange,
+      );
     },
   };
 }

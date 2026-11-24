@@ -1,10 +1,13 @@
-import type {
-  MediaInput,
-  PreparedRepresentation,
-  RecipeDescription,
-  RepresentationAdapter,
-} from "@themelios/models/tasks";
-import { appError, type Json, type ProducedFile } from "@themelios/core";
+import {
+  appError,
+  type Json,
+  type MediaInput,
+  type PreparedRepresentation,
+  type RecipeDescription,
+  type RepresentationAdapter,
+  type RepresentationCoverage,
+  type RepresentationFile,
+} from "@themelios/core";
 import { z } from "zod";
 import {
   bounds,
@@ -30,7 +33,7 @@ function prepared(
   input: MediaInput,
   id: string,
   value: Json,
-  files: ProducedFile[],
+  files: RepresentationFile[],
   details: Json,
 ): PreparedRepresentation {
   return {
@@ -50,8 +53,14 @@ function file(
   name: string,
   bytes: Uint8Array,
   mediaType: string,
-): ProducedFile {
-  return { name, material: { name, bytes, mediaType }, sourceIndices: [0] };
+  coverage: RepresentationCoverage,
+): RepresentationFile {
+  return {
+    name,
+    material: { name, bytes, mediaType },
+    sourceIndices: [0],
+    coverage,
+  };
 }
 
 /** PDF adapters can be registered independently of a task or model provider. */
@@ -123,7 +132,12 @@ export function createPdfAdapters({
               input,
               "pdf.text",
               { pages, emptyPages },
-              [file("text.txt", bytes, "text/plain")],
+              [
+                file("text.txt", bytes, "text/plain", {
+                  sourceRange: input.range ?? null,
+                  extent: { kind: "text", bytes: bytes.byteLength },
+                }),
+              ],
               { library: "pdfjs-dist", libraryVersion: pdfjsVersion },
             );
           },
@@ -153,7 +167,12 @@ export function createPdfAdapters({
             input,
             "pdf.pages",
             { pages },
-            [file("pages.pdf", bytes, "application/pdf")],
+            [
+              file("pages.pdf", bytes, "application/pdf", {
+                sourceRange: input.range ?? null,
+                extent: { kind: "pages", pages: pages.length },
+              }),
+            ],
             { library: "pdf-lib", libraryVersion: "1.17.1" },
           );
         });

@@ -107,7 +107,7 @@ export const customTimeDomainIdSchema = timeDomainIdSchema.refine(
 
 export const ticksSchema = z
   .string()
-  .regex(/^(?:0|-?[1-9][0-9]{0,18})$/)
+  .regex(/^(?:0|-?[1-9][0-9]{0,18})$/, { abort: true })
   .refine((value) => {
     const ticks = BigInt(value);
     return ticks >= -9223372036854775808n && ticks <= 9223372036854775807n;
@@ -159,17 +159,17 @@ export function utcPoint(iso: string): TimePoint {
 }
 
 export function pointToUtcIso(point: TimePoint): Instant {
+  if (!timePointSchema.safeParse(point).success) {
+    throw appError("time.invalid", { details: { point } });
+  }
   if (point.domain !== "utc") {
     throw appError("time.domain_mismatch", {
       details: { expected: "utc", actual: point.domain },
     });
   }
-  const ms = Number(BigInt(point.ticks));
-  if (!Number.isSafeInteger(ms)) {
-    throw appError("time.invalid", { details: { point } });
-  }
-  const iso = new Date(ms).toISOString();
-  if (!canonicalUtc.test(iso)) {
+  const date = new Date(Number(point.ticks));
+  const iso = Number.isFinite(date.getTime()) ? date.toISOString() : undefined;
+  if (!iso || !canonicalUtc.test(iso)) {
     throw appError("time.invalid", { details: { point } });
   }
   return iso;
@@ -308,29 +308,20 @@ export function comparePoints(
   return left < right ? -1 : 1;
 }
 
-type LowerBound = { kind: "finite"; ticks: bigint } | { kind: "negInf" };
-type UpperBound = { kind: "finite"; ticks: bigint } | { kind: "posInf" };
-
-function lowerBound(boundary: TimeRangeBoundary): LowerBound {
-  return boundary.kind === "unbounded"
-    ? { kind: "negInf" }
-    : { kind: "finite", ticks: BigInt(boundary.point.ticks) };
+function knownTicks(boundary: TimeBoundary): bigint | undefined {
+  return boundary.kind === "known" ? BigInt(boundary.point.ticks) : undefined;
 }
 
-function upperBound(boundary: TimeRangeBoundary): UpperBound {
-  return boundary.kind === "unbounded"
-    ? { kind: "posInf" }
-    : { kind: "finite", ticks: BigInt(boundary.point.ticks) };
+function before(left: bigint | undefined, right: bigint | undefined): boolean {
+  return left !== undefined && right !== undefined && left < right;
 }
 
 function inQueryRange(
   ticks: bigint,
-  qStart: LowerBound,
-  qEnd: UpperBound,
+  qStart: bigint | undefined,
+  qEnd: bigint | undefined,
 ): boolean {
-  if (qStart.kind === "finite" && ticks < qStart.ticks) return false;
-  if (qEnd.kind === "finite" && ticks > qEnd.ticks) return false;
-  return true;
+  return !before(ticks, qStart) && !before(qEnd, ticks);
 }
 
 function opaquePoint(
@@ -361,24 +352,15 @@ function matchOpaque(value: TemporalValue, query: TimeRangeQuery): RangeMatch {
 
 function matchOrderedInterval(
   value: Extract<TemporalValue, { kind: "interval" }>,
-  qStart: LowerBound,
-  qEnd: UpperBound,
+  qStart: bigint | undefined,
+  qEnd: bigint | undefined,
 ): RangeMatch {
-  const knownStart =
-    value.start.kind === "known" ? BigInt(value.start.point.ticks) : undefined;
-  const knownEnd =
-    value.end.kind === "known" ? BigInt(value.end.point.ticks) : undefined;
-  if (
-    (knownEnd !== undefined &&
-      qStart.kind === "finite" &&
-      knownEnd < qStart.ticks) ||
-    (knownStart !== undefined &&
-      qEnd.kind === "finite" &&
-      knownStart > qEnd.ticks)
-  ) {
+  const knownStart = knownTicks(value.start);
+  const knownEnd = knownTicks(value.end);
+  if (before(knownEnd, qStart) || before(qEnd, knownStart)) {
     return "no_match";
   }
-  if (qStart.kind === "negInf" && qEnd.kind === "posInf") return "matches";
+  if (qStart === undefined && qEnd === undefined) return "matches";
   if (value.meaning === "uncertain_instant")
     return matchUncertain(knownStart, knownEnd, qStart, qEnd);
   return matchDuration(value, knownStart, knownEnd, qStart, qEnd);
@@ -387,14 +369,13 @@ function matchOrderedInterval(
 function matchUncertain(
   start: bigint | undefined,
   end: bigint | undefined,
-  queryStart: LowerBound,
-  queryEnd: UpperBound,
+  queryStart: bigint | undefined,
+  queryEnd: bigint | undefined,
 ): RangeMatch {
   const startContained =
-    queryStart.kind === "negInf" ||
-    (start !== undefined && start >= queryStart.ticks);
+    queryStart === undefined || (start !== undefined && start >= queryStart);
   const endContained =
-    queryEnd.kind === "posInf" || (end !== undefined && end <= queryEnd.ticks);
+    queryEnd === undefined || (end !== undefined && end <= queryEnd);
   return startContained && endContained ? "matches" : "unknown";
 }
 
@@ -402,8 +383,8 @@ function matchDuration(
   value: Extract<TemporalValue, { kind: "interval" }>,
   knownStart: bigint | undefined,
   knownEnd: bigint | undefined,
-  qStart: LowerBound,
-  qEnd: UpperBound,
+  qStart: bigint | undefined,
+  qEnd: bigint | undefined,
 ): RangeMatch {
   // A non-disjoint duration with non-unknown endpoints always overlaps the query interval.
   if (value.start.kind !== "unknown" && value.end.kind !== "unknown")
@@ -430,8 +411,8 @@ export function matchRange(
   const domain = value.kind === "instant" ? value.at.domain : value.domain;
   if (domain !== query.domain) return "no_match";
   if (domainKind === "opaque") return matchOpaque(value, query);
-  const qStart = lowerBound(query.start);
-  const qEnd = upperBound(query.end);
+  const qStart = knownTicks(query.start);
+  const qEnd = knownTicks(query.end);
   if (value.kind === "instant") {
     return inQueryRange(BigInt(value.at.ticks), qStart, qEnd)
       ? "matches"

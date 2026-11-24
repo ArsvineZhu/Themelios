@@ -11,6 +11,7 @@ export {
   collectStorage,
   verifyStorage,
   type BackupInfo,
+  type CollectionOptions,
   type CollectionReport,
   type StorageInventory,
 } from "./maintenance.js";

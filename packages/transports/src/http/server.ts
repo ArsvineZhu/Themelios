@@ -1,4 +1,5 @@
 import {
+  assertOperationPermission,
   callOperation,
   type BinaryReadResult,
 } from "@themelios/runtime/operations";
@@ -15,6 +16,8 @@ import type {
   Translate,
 } from "../types.js";
 import { compileHttpRoutes, type HttpEnvironment } from "./routes.js";
+
+export { httpRouteSpecs } from "./routes.js";
 
 const encoder = new TextEncoder();
 
@@ -44,16 +47,26 @@ export function createHttpHandler<App>(
     throw error;
   });
 
-  for (const route of compileHttpRoutes(directory.values())) {
+  const routes = compileHttpRoutes(directory.values());
+  const methods = new Set(routes.map(({ method }) => method));
+  if (methods.has("GET")) methods.add("HEAD");
+  if (mcpHandler)
+    for (const method of ["GET", "POST", "DELETE"] as const) {
+      methods.add(method);
+    }
+  const corsMethods = [...methods, "OPTIONS"].join(", ");
+  for (const route of routes) {
     router.on(route.method, route.path, async (ctx) => {
       const call = ctx.env.operation;
+      assertOperationPermission(route.operation, call.principal);
+      if (route.operation.kind === "stream") ctx.env.setIdleTimeout?.(0);
       const result = callOperation(
         app,
         directory,
         route.operation.id,
         await route.extractInput(ctx),
         call,
-        route.binaryInput,
+        route.binaryBody,
       );
       if (route.operation.kind === "stream") {
         return eventStream(
@@ -76,15 +89,20 @@ export function createHttpHandler<App>(
   }
 
   return {
-    fetch(request) {
+    fetch(request, setIdleTimeout) {
       const defaultLocale = options.locale?.();
       return runProtectedHttp(
         request,
         tracker,
         options,
         defaultLocale,
+        corsMethods,
         (ctx) => {
+          if (ctx.call.timeoutMs !== undefined) {
+            setIdleTimeout?.(Math.ceil(ctx.call.timeoutMs / 1000) + 1);
+          }
           if (mcpHandler && new URL(request.url).pathname === "/mcp") {
+            if (request.method === "GET") setIdleTimeout?.(0);
             return mcpHandler(request, ctx);
           }
           return Promise.resolve(
@@ -95,6 +113,7 @@ export function createHttpHandler<App>(
                 options: ctx.call,
                 maxJsonBytes: ctx.maxJsonBytes,
               },
+              ...(setIdleTimeout ? { setIdleTimeout } : {}),
             }),
           );
         },

@@ -10,8 +10,9 @@
 
 ## CAS 与内容表模式
 
-- `Cas` 按字节内容 SHA-256 寻址存储于 `<instance>/objects/sha256/<hh>/<rest>`，写入先流式计算摘要与临时落地，再以不可变链接发布；同一字节天然去重。
-- `@themelios/storage` 的核心表包含 `store_meta`、`commits` 与 `time_domains`；`@themelios/content/schema` 增加以下内容表：
+- `Cas` 按字节内容 SHA-256 寻址存储于 `<instance>/objects/sha256/<hh>/<rest>`。写入先流式计算摘要并同步暂存，再以独占操作发布；同一字节只存一份。Windows 使用同卷独占移动，其他平台使用硬链接。
+- `@themelios/storage` 的核心表包含 `store_meta`、`commits`、`time_domains` 与 `blobs`。`blobs` 记录正式对象的哈希和字节数。应用在事务中使用 `tx.registerBlob(blob)` 登记 `Cas.put()` 返回的对象，在同一事务写入具有 `REFERENCES blobs(ref)` 的拥有行。可为空的外键列取 NULL 时不持有对象。同一对象可由任意数量的业务表与内容行共同持有。
+- `@themelios/content/schema` 增加以下内容表：
   - `artifacts`：保存实体主键 `ref`（`art_<uuid>`）、Agent 短码 `agent_code`（唯一索引）、类型 `kind`（`material` / `result`）、`media_type`、`blob_ref`、`size_bytes`、`name`、`extent_json`、`origin_json`、`created_seq`、`created_at`。
   - `artifact_edges`：记录有向来源图（`relation` 为 `'input'` / `'file'` / `'representation-source'`，`ordinal` 保序）。
   - `artifact_roots`：记录显式保留根与释放切面，用于历史可达性分析与垃圾回收。
@@ -27,9 +28,13 @@
 ## 双层标识：`art_<uuid>` 与 `readable60`
 
 - **系统与存储主标识**：内部表、SDK、HTTP REST 路径与持久数据始终使用全局唯一的 UUIDv4 引用 `art_<uuid>`。
-- **Agent 短引用**：每条 `artifacts` 记录在采用或插入时同时分配互不重复的 60 位随机编码 `agent_code`，使用 `@themelios/core` 内置的 1,024 词 4 字母英文码表编码为 24 字符短串（`art_<24个小写字母>`，例如 `art_thatwiththishavefromyour`）。
+- **Agent 短引用**：每条 `artifacts` 记录在采用或插入时同时分配互不重复的 60 位随机编码 `agent_code`。`@themelios/core` 从固定的 1,024 项 tokenizer 码表编码六个四字母单元，组成 `art_` 加 24 个 ASCII 字母，例如 `art_userFilefileListUseritem`。大小写是编码的一部分，复制、传输与解析均保留原样。
 - **双向解析**：`materials.resolve(refOrAgentRef)` 接受任意一种合法引用并解析为规范 `art_<uuid>`；`materials.agentRef(ref)` 返回对应短引用。在无数据库的独立工具场景下，可以使用 `@themelios/core` 的 `createAgentRefBook()` 在会话内存内双向映射。
 
 ## 离线维护
 
-`backupStorage` 使用 SQLite 在线一致性快照与硬链接/拷贝构建独立自洽的 `themelios.backup` 归档目录（含对象文件与配置快照）；`restoreStorage` 按目标格式与对象校验恢复到全新实例；`verifyStorage` / `verifyContent` 检查对象完整性与关系约束；`collectStorage({ retainSince })` 推进历史下界 `history_floor` 并安全回收未再被引用的历史材料及 CAS 对象。
+`backupStorage` 通过一致的 SQLite 快照确定业务外键实际持有的对象，构建 `themelios.backup` 目录。备份可选取实例 `config/` 下的应用文件，默认选取已知的实例配置、托管配置及提示词。`restoreStorage` 校验归档并恢复到新目标，`verifyStorage` 检查库与对象，`verifyContent` 再检查内容图。
+
+恢复按共享安装配置路径协调最终发布。已有相同配置时可重复采用。需要写入新配置时，锁覆盖配置写入、实例发布，以及发布失败时对本次写入的撤回。
+
+`collectStorage(database, cas, {retainSince, prune, signal})` 可在推进历史下界的同一事务调用业务清理函数，再回收所有拥有行已解除的对象。`collectContent` 先执行应用提供的 `prune`，再按内容根、边和表示记录计算材料可达性。持有 `artifacts(ref)` 的应用行应当随材料保留，已过期的业务行可在该清理函数中移除。原始字节外键的拥有行由 Storage 直接识别。提交后收到取消信号时，回收返回已保留的 `historyFloor`，并用 `sweepComplete: false` 标明尚可重试的字节清理。备份和恢复在正常取消或失败后移除各自的私有暂存目录。

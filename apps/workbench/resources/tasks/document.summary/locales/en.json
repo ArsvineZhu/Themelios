@@ -1,8 +1,8 @@
 {
   "tasks.summary.title": "Material summary",
   "tasks.summary.purpose": "Read the primary materials together, use context materials to aid interpretation, and return sections with material-level sources.",
-  "tasks.summary.fields.language": "Output language. Defaults to Simplified Chinese; en selects English.",
-  "tasks.summary.fields.maxSections": "Maximum section count, from 1 to 12, default 6. Empty source content may produce zero sections.",
+  "tasks.summary.fields.language": "Output language name or tag, such as French or fr. Defaults to Simplified Chinese.",
+  "tasks.summary.fields.maxSections": "Maximum section count, default 6. Empty source content may produce zero sections.",
   "tasks.summary.fields.focus": "Focus for this request, at most 2000 characters; null or omitted means organize around the materials.",
   "tasks.summary.fields.title": "Summary title, from 1 to 200 characters.",
   "tasks.summary.fields.sections": "Sections in reading order, no more than this request's maxSections.",

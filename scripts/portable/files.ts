@@ -1,10 +1,10 @@
-import { constants } from "node:fs";
+import { createReadStream } from "node:fs";
 import {
   copyFile,
   cp,
-  link,
   lstat,
   mkdir,
+  mkdtemp,
   readdir,
   realpath,
   rename,
@@ -12,13 +12,8 @@ import {
   unlink,
 } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
-import { randomUUID } from "node:crypto";
-
-function errorCode(error: unknown): string | undefined {
-  return typeof error === "object" && error !== null && "code" in error
-    ? String(error.code)
-    : undefined;
-}
+import { errorCode } from "../../packages/core/src/errors.js";
+import { publishNewFile, stageFile } from "../../packages/core/src/files.js";
 
 export async function exists(path: string): Promise<boolean> {
   try {
@@ -49,33 +44,31 @@ function outside(root: string, path: string): boolean {
   );
 }
 
-/** Checks packaged links before the standard copier materializes them. */
-export async function materialize(
-  source: string,
-  destination: string,
-): Promise<void> {
-  const root = await realpath(source);
-  const queue = [root];
-  for (const directory of queue) {
-    for (const child of await readdir(directory, { withFileTypes: true })) {
-      const path = join(directory, child.name);
-      if (child.isDirectory()) queue.push(path);
-      if (child.isSymbolicLink()) {
-        const target = await realpath(path);
-        if (outside(root, target) || !outside(target, directory)) {
-          throw new Error(
-            `Package link escapes the staging directory or creates a cycle: ${path} -> ${target}`,
-          );
-        }
-      }
+/** Replaces package links inside the private release tree with their files. */
+export async function materializeLinks(app: string): Promise<void> {
+  const root = await realpath(app);
+  const links: { path: string; target: string }[] = [];
+  const entries = await readdir(root, { recursive: true, withFileTypes: true });
+  for (const child of entries) {
+    if (!child.isSymbolicLink()) continue;
+    const path = join(child.parentPath, child.name);
+    const target = await realpath(path);
+    if (outside(root, target) || !outside(target, child.parentPath)) {
+      throw new Error(
+        `Package link escapes the staging directory or creates a cycle: ${path} -> ${target}`,
+      );
     }
+    links.push({ path, target });
   }
-  await cp(root, destination, {
-    recursive: true,
-    dereference: true,
-    errorOnExist: true,
-    force: false,
-  });
+  for (const { path, target } of links) {
+    await unlink(path);
+    await cp(target, path, {
+      recursive: true,
+      dereference: true,
+      errorOnExist: true,
+      force: false,
+    });
+  }
 }
 
 /** Cleans only the exact private staging path created by this build. */
@@ -119,7 +112,7 @@ export async function requireNew(path: string): Promise<void> {
     throw new Error("Release output already exists: " + path);
 }
 
-export async function publishDirectory(
+async function publishDirectory(
   candidate: string,
   output: string,
 ): Promise<void> {
@@ -128,42 +121,62 @@ export async function publishDirectory(
     await rename(candidate, output);
   } catch (error) {
     if (errorCode(error) !== "EXDEV") throw error;
-    const adjacent = join(
-      dirname(output),
-      `.${basename(output)}-${randomUUID()}.partial`,
+    const adjacent = await mkdtemp(
+      join(dirname(output), `.${basename(output)}-`),
     );
-    await mkdir(adjacent);
+    const copy = join(adjacent, basename(output));
     try {
-      await cp(candidate, adjacent, {
+      await cp(candidate, copy, {
         recursive: true,
         errorOnExist: true,
         force: false,
       });
       await requireNew(output);
-      await rename(adjacent, output);
+      await rename(copy, output);
     } finally {
-      await removeBuildTree(adjacent);
+      await removeBuildTree(adjacent).catch((cleanup) =>
+        console.error(
+          `Cannot remove release staging ${adjacent}: ${String(cleanup)}`,
+        ),
+      );
     }
   }
 }
 
-export async function publishFile(
-  candidate: string,
-  output: string,
-): Promise<void> {
+async function publishFile(candidate: string, output: string): Promise<void> {
   try {
-    await link(candidate, output);
+    publishNewFile(candidate, output);
   } catch (error) {
     if (errorCode(error) !== "EXDEV") throw error;
-    const adjacent = join(
+    await stageFile(
       dirname(output),
-      `.${basename(output)}-${randomUUID()}.partial`,
+      (file) => file.writeFile(createReadStream(candidate)),
+      (path) => publishNewFile(path, output),
     );
-    await copyFile(candidate, adjacent, constants.COPYFILE_EXCL);
+  }
+}
+
+/** Publishes the archive first, so archive failure leaves the output directory available for retry. */
+export async function publishRelease(
+  candidate: string,
+  output: string,
+  archive: string,
+  archiveOutput: string,
+): Promise<void> {
+  await publishFile(archive, archiveOutput);
+  try {
+    await publishDirectory(candidate, output);
+  } catch (error) {
     try {
-      await link(adjacent, output);
-    } finally {
-      await unlink(adjacent);
+      await unlink(archiveOutput);
+    } catch (rollback) {
+      if (errorCode(rollback) !== "ENOENT")
+        throw new AggregateError(
+          [error, rollback],
+          `Release publication failed and ${archiveOutput} could not be removed`,
+          { cause: error },
+        );
     }
+    throw error;
   }
 }

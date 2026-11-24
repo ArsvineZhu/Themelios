@@ -1,26 +1,14 @@
-import { extname } from "node:path";
-import { AppError } from "@themelios/core";
+import {
+  AppError,
+  hasTextControls,
+  isTextMedia,
+  mediaProbeBytes,
+  probeMediaType,
+  textMediaForName,
+  type Extent,
+} from "@themelios/core";
 import type { BlobInfo, Cas } from "@themelios/storage";
-import { fileTypeFromBuffer } from "file-type";
-import type { Extent } from "./artifacts.js";
 import { contentError } from "./validation.js";
-
-const textExtensions: Partial<Record<string, string>> = {
-  ".txt": "text/plain",
-  ".md": "text/markdown",
-  ".markdown": "text/markdown",
-  ".csv": "text/csv",
-  ".tsv": "text/tab-separated-values",
-  ".json": "application/json",
-};
-
-export function isTextMedia(mediaType: string): boolean {
-  return (
-    mediaType.startsWith("text/") ||
-    mediaType === "application/json" ||
-    mediaType.endsWith("+json")
-  );
-}
 
 export async function blobBytes(
   cas: Cas,
@@ -48,11 +36,7 @@ async function validUtf8(
       next = await reader.read()
     ) {
       const part = decoder.decode(next.value, { stream: true });
-      if (
-        forbidControls &&
-        [...part].some((char) => char < " " && !"\r\n\t\f".includes(char))
-      )
-        return false;
+      if (forbidControls && hasTextControls(part)) return false;
     }
     decoder.decode();
     return true;
@@ -63,42 +47,6 @@ async function validUtf8(
     await reader.cancel().catch(() => undefined);
     reader.releaseLock();
   }
-}
-
-const signatureRequired = new Set([
-  "application/pdf",
-  "image/png",
-  "image/jpeg",
-  "image/webp",
-  "image/gif",
-  "image/tiff",
-  "image/avif",
-]);
-
-/** Check declared MIME against the actual binary signature of a captured prefix. */
-export async function probeMediaType(
-  prefix: Uint8Array,
-  declared?: string,
-): Promise<string | undefined> {
-  let detected: string | undefined;
-  try {
-    detected = (await fileTypeFromBuffer(prefix))?.mime;
-  } catch (error) {
-    if (!(error instanceof Error && error.name === "EndOfStreamError"))
-      throw error;
-  }
-  if (
-    declared !== undefined &&
-    declared !== detected &&
-    (signatureRequired.has(declared) ||
-      (declared.startsWith("image/") && detected !== undefined))
-  ) {
-    throw contentError("content.media_mismatch", {
-      declared,
-      detected: detected ?? null,
-    });
-  }
-  return declared ?? detected;
 }
 
 type Metadata = { mediaType: string; extent: Extent };
@@ -120,10 +68,7 @@ async function detectTextOrBinary(
   signal: AbortSignal,
   name?: string,
 ): Promise<Metadata> {
-  const extensionType =
-    name === undefined
-      ? undefined
-      : textExtensions[extname(name).toLowerCase()];
+  const extensionType = textMediaForName(name);
   if (await validUtf8(cas, blob, signal, extensionType === undefined))
     return textMetadata(extensionType ?? "text/plain", blob.sizeBytes);
   if (extensionType) invalidUtf8(extensionType);
@@ -166,7 +111,7 @@ export async function detectMetadata(
 ): Promise<{ mediaType: string; extent: Extent }> {
   const prefix = await blobBytes(cas, blob, signal, {
     start: 0,
-    end: Math.min(16_384, blob.sizeBytes),
+    end: Math.min(mediaProbeBytes, blob.sizeBytes),
   });
   const mediaType = await probeMediaType(prefix, declared);
   if (!mediaType) return detectTextOrBinary(cas, blob, signal, name);

@@ -1,13 +1,13 @@
 import { resolve } from "node:path";
 
-const release = Bun.argv[2];
-if (!release) {
+const [release, destination = ".", ...extra] = Bun.argv.slice(2);
+if (!release || extra.length) {
   throw new Error(
-    "Run bun install-release.ts <directory containing Themelios tarballs>",
+    "Usage: bun scripts/install-packages.ts <tarball-directory> [consumer-directory]",
   );
 }
 
-const consumer = process.cwd();
+const consumer = resolve(destination);
 const manifestPath = resolve(consumer, "package.json");
 const manifest = (await Bun.file(manifestPath).json()) as {
   dependencies?: Record<string, string>;
@@ -22,8 +22,13 @@ for (const file of new Bun.Glob("themelios-*.tgz").scanSync({
   onlyFiles: true,
 })) {
   const match = /^themelios-([a-z0-9-]+)-\d+\.\d+\.\d+.*\.tgz$/.exec(file);
-  if (!match) continue;
-  const packageName = `@themelios/${match[1]!}`;
+  const name = match?.[1];
+  if (!name) continue;
+  const packageName = `@themelios/${name}`;
+  if (overrides[packageName])
+    throw new Error(
+      `Found multiple tarballs for ${packageName} in ${releasePath}`,
+    );
   const path = resolve(releasePath, file);
   overrides[packageName] = `file:${path.replaceAll("\\", "/")}`;
 }

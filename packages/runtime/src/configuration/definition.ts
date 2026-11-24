@@ -1,28 +1,26 @@
 import { z } from "zod";
-import type { Json } from "@themelios/core";
+import { appError, type Json } from "@themelios/core";
 import type {
   SettingDescription,
   SettingIssue,
   SettingMeta,
   SettingsDefinition,
 } from "../settings.js";
-import { failure } from "../failure.js";
 import { isObject, matches, pathParts, pointer } from "./path.js";
 
 export type Field = { parts: string[]; metadata: SettingMeta };
 
 export function invalid(issues: readonly SettingIssue[], cause?: unknown) {
-  return failure(
-    "config.invalid",
-    {
+  return appError("config.invalid", {
+    details: {
       issues: issues.map(({ path, messageKey, params }) => ({
         path,
         messageKey,
         ...(params ? { params: { ...params } } : {}),
       })),
     },
-    cause,
-  );
+    cause: cause,
+  });
 }
 
 export class SettingFields<S> {
@@ -80,7 +78,8 @@ export class SettingFields<S> {
         parts.length < child.parts.length &&
         matches(child.parts.slice(0, parts.length), parts),
     );
-    if (!children.length) throw failure("config.unknown_setting", { path });
+    if (!children.length)
+      throw appError("config.unknown_setting", { details: { path } });
     return children.map((child) =>
       this.#description(child.parts, child.metadata),
     );
@@ -132,8 +131,14 @@ export class SettingFields<S> {
 
 function childSchema(schema: Json | undefined, part: string): Json | undefined {
   if (!isObject(schema)) return undefined;
-  const { properties, additionalProperties, patternProperties, anyOf, oneOf } =
-    schema;
+  const {
+    properties,
+    additionalProperties,
+    patternProperties,
+    allOf,
+    anyOf,
+    oneOf,
+  } = schema;
   if (isObject(properties) && Object.hasOwn(properties, part))
     return properties[part];
   if (isObject(patternProperties)) {
@@ -143,11 +148,7 @@ function childSchema(schema: Json | undefined, part: string): Json | undefined {
     if (entry) return entry[1];
   }
   if (isObject(additionalProperties)) return additionalProperties;
-  const alternatives = Array.isArray(anyOf)
-    ? anyOf
-    : Array.isArray(oneOf)
-      ? oneOf
-      : [];
+  const alternatives = [allOf, anyOf, oneOf].find(Array.isArray) ?? [];
   return alternatives
     .map((candidate) => childSchema(candidate, part))
     .find((child) => child !== undefined);

@@ -1,7 +1,12 @@
-import { rangeSchema, type Range, type Selection } from "@themelios/core";
+import {
+  isTextMedia,
+  rangeSchema,
+  type Range,
+  type Selection,
+} from "@themelios/core";
 import type { Cas } from "@themelios/storage";
 import type { ArtifactDraft } from "./artifacts.js";
-import { blobBytes, isTextMedia } from "./media-metadata.js";
+import { blobBytes } from "./media-metadata.js";
 import { contentError, jsonValue } from "./validation.js";
 
 export const resultMediaType = "application/vnd.themelios.result+json";

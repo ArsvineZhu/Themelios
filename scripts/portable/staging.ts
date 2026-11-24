@@ -53,7 +53,7 @@ export async function buildInStaging(
     await copyParts(workspace.root, destination, ["package.json"]);
     if (built.has(workspace)) {
       await copyParts(workspace.root, destination, ["src", "tsconfig.json"]);
-      await copyOptional(workspace.root, destination, ["resources"]);
+      await copyOptional(workspace.root, destination, ["resources", "proto"]);
     }
   }
   await run(
@@ -116,7 +116,7 @@ async function stageWorkspaceOutput(
   const source = workspacePath(build, workspace);
   const destination = workspacePath(app, workspace);
   await copyParts(source, destination, ["dist"]);
-  await copyOptional(source, destination, ["resources"]);
+  await copyOptional(source, destination, ["resources", "proto"]);
   for (const contract of Object.values(workspace.manifest.exports ?? {})) {
     for (const entry of [contract.types, contract.import]) {
       const path = join(destination, entry);
@@ -124,22 +124,6 @@ async function stageWorkspaceOutput(
         throw new Error("Missing workspace export: " + path);
     }
   }
-}
-
-async function captured(command: string[], cwd: string): Promise<string> {
-  const child = Bun.spawn(command, {
-    cwd,
-    stdin: "ignore",
-    stdout: "pipe",
-    stderr: "inherit",
-  });
-  const [exit, output] = await Promise.all([
-    child.exited,
-    new Response(child.stdout).text(),
-  ]);
-  if (exit !== 0)
-    throw new Error(`${command.join(" ")} failed with code ${exit}`);
-  return output;
 }
 
 export interface WorkbenchMetadata {
@@ -154,12 +138,12 @@ export async function workbenchMetadata(
 ): Promise<WorkbenchMetadata> {
   const source = `
     import { pathToFileURL } from 'node:url';
-    const { workbenchApplication, releaseRecipes } = await import(pathToFileURL(process.argv[1]));
-    console.log(JSON.stringify({ applicationId: workbenchApplication.id, formatId: workbenchApplication.formatId, recipes: releaseRecipes }));
+    const { workbenchId, releaseRecipes } = await import(pathToFileURL(process.argv[1]));
+    console.log(JSON.stringify({ applicationId: workbenchId, formatId: workbenchId, recipes: releaseRecipes }));
   `;
-  const output = await captured(
+  const output = await run(
     [process.execPath, "--no-install", "-e", source, entry],
-    app,
+    { cwd: app, capture: true, label: "Read Workbench release metadata" },
   );
   const metadata = JSON.parse(output) as WorkbenchMetadata;
   if (
@@ -175,9 +159,9 @@ export async function writeNotices(
   candidate: string,
   appName: string,
 ): Promise<void> {
-  const licenses = await captured(
+  const licenses = await run(
     [process.execPath, "pm", "licenses", "--prod", "--filter", `${appName}...`],
-    join(candidate, "app"),
+    { cwd: join(candidate, "app"), capture: true },
   );
   const bunLicense = join(import.meta.dir, "BUN-LICENSE.md");
   await mkdir(join(candidate, "licenses"), { recursive: true });

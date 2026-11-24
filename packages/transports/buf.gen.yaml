@@ -1,0 +1,7 @@
+version: v2
+plugins:
+  - local: protoc-gen-es
+    out: src/grpc
+    opt: [target=ts, import_extension=js]
+inputs:
+  - directory: proto

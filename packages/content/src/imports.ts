@@ -1,11 +1,15 @@
 import { open } from "node:fs/promises";
 import { basename } from "node:path";
-import { AppError, openCall, type CallOptions } from "@themelios/core";
+import {
+  AppError,
+  mediaTypeSchema,
+  openCall,
+  type CallOptions,
+} from "@themelios/core";
 import type { BlobInfo, Cas } from "@themelios/storage";
 import { z } from "zod";
 import {
   newArtifactRef,
-  mediaTypeSchema,
   originSchema,
   type ArtifactDraft,
   type Origin,
@@ -28,13 +32,13 @@ export type AcceptInput =
     }
   | {
       body: ReadableStream<Uint8Array>;
-      mediaType: string;
+      mediaType?: string;
       name?: string;
       origin?: Origin;
     };
 
 const importFields = {
-  mediaType: mediaTypeSchema,
+  mediaType: mediaTypeSchema.toLowerCase(),
   name: z.string().min(1).optional(),
   origin: originSchema.optional(),
 };
@@ -42,11 +46,12 @@ const acceptSchema = z.union([
   z.strictObject({ ...importFields, bytes: z.instanceof(Uint8Array) }),
   z.strictObject({
     ...importFields,
-    mediaType: mediaTypeSchema.optional(),
+    mediaType: importFields.mediaType.optional(),
     file: z.string().min(1),
   }),
   z.strictObject({
     ...importFields,
+    mediaType: importFields.mediaType.optional(),
     body: z.instanceof(ReadableStream<Uint8Array>),
   }),
 ]);
@@ -136,7 +141,9 @@ export async function importArtifact(
     const put = {
       signal: scope.signal,
       maxBytes:
-        "bytes" in accepted ? limits.maxInlineBytes : limits.maxImportBytes,
+        "bytes" in accepted
+          ? Math.min(limits.maxInlineBytes, limits.maxImportBytes)
+          : limits.maxImportBytes,
     };
     let blob: BlobInfo;
     if ("bytes" in accepted) {

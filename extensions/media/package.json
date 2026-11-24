@@ -1,0 +1,21 @@
+{
+  "name": "@themelios/media",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "MIT",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/types/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@themelios/core": "workspace:*",
+    "zod": "catalog:"
+  }
+}

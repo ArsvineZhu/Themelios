@@ -2,22 +2,19 @@
 
 This file applies to the entire repository. When modifying content in one part of it, follow the `AGENTS.md` of the corresponding directory; rules belong in the file that loads where the work happens.
 
-No Agent may modify, move, or delete `AGENTS.md` or another file that governs Agents, such as the (*) documents listed in [docs/AGENTS.md](docs/AGENTS.md), unless the developer has explicitly permitted and requested it. When a requested change requires such a modification and that permission is absent, deliver it as `<TOPIC>.proposal.patch` in the repository root, remind the developer to review it, and keep working on unrelated parts. The patch is not repository content: Git ignores it, and you delete it once it has been applied.
+No Agent may modify, move, or delete `AGENTS.md` or another file that governs Agents, such as the (\*) documents listed in [docs/AGENTS.md](docs/AGENTS.md), unless the developer has explicitly permitted and requested it. When a requested change requires such a modification and that permission is absent, deliver it as `<TOPIC>.proposal.patch` in the repository root, remind the developer to review it, and keep working on unrelated parts. The patch is not repository content: Git ignores it, and you delete it once it has been applied.
 
 Proactively use applicable Skills. Apply their methods within the user's instructions and repository rules; when a Skill conflicts with either, follow the applicable higher-priority instruction. Do not mistake familiarity with a Skill's description for understanding it.
-
 
 ## AntiRLHF Rules
 
 > **Mandatory** for GPT models.
 
-Read the [CONSTITUTION](docs/agents/antirlhf/CONSTITUTION.zh-CN.md) before acting; if its complete text has already been supplied in the session/context, use that copy. The [AntiRLHF Charter](docs/agents/antirlhf/CHARTER.md) explains its background and intent; read it when writing or assessing governance text or when a requirement's intent is unclear.
+Read the [CONSTITUTION](docs/agents/antirlhf/CONSTITUTION.zh-CN.md) before acting; if its complete text has already been supplied in the session/context, use that copy. The [AntiRLHF Charter](docs/agents/antirlhf/CHARTER.md) explains its background and intent.
 
 ## Overview
 
 Themelios is an independently developed and distributed foundation platform, usable by applications through its public interfaces.
-
-`legacy/` is retired research material and does not participate in running; when a capability in it is needed, migrate/adapt it in according to the current contract, and do not restore the entire old runtime stack.
 
 Read the relevant entries according to the task. There is no need to read all of the designs and historical discussions all the way through.
 
@@ -25,7 +22,7 @@ Read the relevant entries according to the task. There is no need to read all of
 
 ## Engineering Choices & Principles
 
-- The project is a prototype with no external consumers; keep `v0.1.0`. Replace unsuitable internal structures directly, migrate their producers, consumers, configuration, tests, and documents, and remove the replaced implementation and its support. Do not add incrementing internal version identifiers such as `v1`/`v2`, version chains, compatibility branches, or dual paths. Do not retain or back up old formats of internal structures being eliminated. Preserve user manuscript revisions and precise historical citations according to the product contract.
+- The project is a prototype with no external consumers; keep `v0.1.0`. Replace unsuitable internal structures directly, migrate their producers, consumers, configuration, tests, and documents, and remove the replaced implementation and its support. Do not add incrementing internal version identifiers such as `v2`/`v3`, version chains, compatibility branches, or dual paths. Do not retain or back up old formats of internal structures being eliminated. Preserve user manuscript revisions and precise historical citations according to the product contract.
 - Use the formal capabilities of the project's mature dependencies for protocol clients, media parsing, and databases; do not duplicate them or add forwarding layers to preserve an unsuitable structure. Do not mechanically create a service, repository, or manager for every concept.
 - Remain vendor-neutral. LLM services are accessed through a unified gateway. "New API" is one usable gateway. Production code does not add special business behavior for a particular external platform. Configure the work according to explicit protocol, capability, and task, and do not guess capabilities from model names.
 - Follow the [LLM usage and prompt guide](docs/agents/llm-use.md) when designing or assessing model calls. Provide the context needed for the task and assess outputs using the information actually available to the model.
@@ -86,7 +83,7 @@ This project is cross-platform. Except where the requirement itself involves pla
 
 Put temporary generated products, reference repositories, worktrees, downloads, installations, and experimental scripts in `temp/`. Keep requested deliverables and generated project files at their required destinations. Do not scatter temporary project content into the user directory or other locations; existing external development tools may continue to be used.
 
-Use the [temp management tool](scripts/temp/README.md) to create directories, view status, and clean up. *Recursive deletion commands* are prohibited and typically blocked; use a different safe method instead. For authorized temporary cleanup, use the temp tool to preview and select the specific paths, then apply the intended cleanup.
+Use the [temp management tool](scripts/temp/README.md) to create directories, view status, and clean up. _Recursive deletion commands_ are prohibited and typically blocked; use a different safe method instead. For authorized temporary cleanup, use the temp tool to preview and select the specific paths, then apply the intended cleanup.
 
 ## Codebase Navigating and Reference Retrieval
 

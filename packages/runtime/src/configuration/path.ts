@@ -1,10 +1,9 @@
-import type { Json } from "@themelios/core";
-import { failure } from "../failure.js";
+import { appError, type Json } from "@themelios/core";
 
-type Obj = Record<string, Json>;
+export type SettingValues = Record<string, Json>;
 const unsafe = new Set(["__proto__", "constructor", "prototype"]);
 
-export const isObject = (value: unknown): value is Obj =>
+export const isObject = (value: unknown): value is SettingValues =>
   value !== null &&
   typeof value === "object" &&
   (Object.getPrototypeOf(value) === Object.prototype ||
@@ -27,7 +26,7 @@ export function pathParts(path: string): string[] {
     parts.some((key) => !key || unsafe.has(key)) ||
     (path.startsWith("/") && /~(?![01])/.test(path))
   ) {
-    throw failure("config.unknown_setting", { path });
+    throw appError("config.unknown_setting", { details: { path } });
   }
   return parts;
 }
@@ -44,32 +43,35 @@ export function at(
 }
 
 export function setAt(
-  object: Obj,
+  object: SettingValues,
   path: readonly string[],
   value: Json | undefined,
 ): void {
   let current = object;
-  const parents: [Obj, string][] = [];
+  const parents: [SettingValues, string][] = [];
   for (const key of path.slice(0, -1)) {
     if (!Object.hasOwn(current, key) || !isObject(current[key])) {
       if (value === undefined) return;
       current[key] = {};
     }
     parents.push([current, key]);
-    current = current[key] as Obj;
+    current = current[key] as SettingValues;
   }
   const key = path.at(-1)!;
   if (value !== undefined) current[key] = value;
   else {
     delete current[key];
     for (const [parent, name] of parents.reverse()) {
-      if (Object.keys(parent[name] as Obj).length) break;
+      if (Object.keys(parent[name] as SettingValues).length) break;
       delete parent[name];
     }
   }
 }
 
-export function merge(lower: Obj, upper: Obj): Obj {
+export function merge(
+  lower: SettingValues,
+  upper: SettingValues,
+): SettingValues {
   const result = { ...lower };
   for (const [key, value] of Object.entries(upper)) {
     const previous = Object.hasOwn(result, key) ? result[key] : undefined;
@@ -102,8 +104,10 @@ export function assertValues(
   if (isObject(value)) {
     for (const [key, child] of Object.entries(value)) {
       if (unsafe.has(key))
-        throw failure("config.unknown_setting", {
-          path: pointer([...path, key]),
+        throw appError("config.unknown_setting", {
+          details: {
+            path: pointer([...path, key]),
+          },
         });
       assertValues(child, [...path, key]);
     }
@@ -116,8 +120,10 @@ export function assertValues(
     typeof value === "boolean" ||
     (typeof value === "number" && Number.isFinite(value))
   )) {
-    throw failure("config.invalid", {
-      issues: [{ path: pointer(path), messageKey: "config.invalid_value" }],
+    throw appError("config.invalid", {
+      details: {
+        issues: [{ path: pointer(path), messageKey: "config.invalid_value" }],
+      },
     });
   }
 }

@@ -1,14 +1,19 @@
-import { randomUUID } from "node:crypto";
-import { access, link, open, unlink } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { access } from "node:fs/promises";
+import { dirname } from "node:path";
 import { once } from "node:events";
-import { AppError, appError, throwIfAborted } from "@themelios/core";
+import {
+  appError,
+  errorCode,
+  streamChunks,
+  throwIfAborted,
+} from "@themelios/core";
+import { publishNewFile, stageFile } from "@themelios/core/files";
 
 export async function ensureNewFile(destination: string): Promise<void> {
   try {
     await access(destination);
   } catch (cause) {
-    if (cause instanceof Error && "code" in cause && cause.code === "ENOENT") {
+    if (errorCode(cause) === "ENOENT") {
       await access(dirname(destination));
       return;
     }
@@ -27,35 +32,12 @@ export async function publishOutput(
   text: string,
   result: unknown,
 ): Promise<void> {
-  const temporary = join(
-    dirname(destination),
-    "." + basename(destination) + "." + randomUUID() + ".tmp",
-  );
-  let created = false;
   try {
-    const file = await open(temporary, "wx");
-    created = true;
-    try {
-      await file.writeFile(text, "utf8");
-      await file.sync();
-    } finally {
-      await file.close();
-    }
-    try {
-      await link(temporary, destination);
-    } catch (cause) {
-      if (
-        cause instanceof Error &&
-        "code" in cause &&
-        cause.code === "EEXIST"
-      ) {
-        throw appError("storage.already_exists", {
-          details: { operation: "output", path: destination },
-          cause,
-        });
-      }
-      throw cause;
-    }
+    await stageFile(
+      dirname(destination),
+      (file) => file.writeFile(text, "utf8"),
+      (path) => publishNewFile(path, destination),
+    );
   } catch (cause) {
     const ref =
       result !== null &&
@@ -68,11 +50,11 @@ export async function publishOutput(
       path: destination,
       ...(ref === undefined ? {} : { ref }),
     };
-    if (cause instanceof AppError)
-      throw appError(cause.code, { details, cause });
-    throw appError("transport.delivery_failed", { details, cause });
-  } finally {
-    if (created) await unlink(temporary);
+    const code =
+      errorCode(cause) === "EEXIST"
+        ? "storage.already_exists"
+        : "transport.delivery_failed";
+    throw appError(code, { details, cause });
   }
 }
 
@@ -89,19 +71,6 @@ export async function streamStdout(
   stream: ReadableStream<Uint8Array>,
   signal?: AbortSignal,
 ): Promise<void> {
-  const reader = stream.getReader();
-  try {
-    for (;;) {
-      throwIfAborted(signal);
-      const chunk = await reader.read();
-      if (chunk.done) return;
-      await writeStdout(chunk.value, signal);
-    }
-  } finally {
-    try {
-      await reader.cancel();
-    } finally {
-      reader.releaseLock();
-    }
-  }
+  for await (const chunk of streamChunks(stream, signal))
+    await writeStdout(new Uint8Array(chunk), signal);
 }

@@ -1,6 +1,6 @@
 {
   "tasks.mediaDescription.title": "材料描述",
   "tasks.mediaDescription.purpose": "把实际提供的材料范围描述为可读文字，供后续阅读、检索或结构化任务使用。",
-  "tasks.mediaDescription.fields.language": "输出语言，zh-CN 或 en，默认 zh-CN。",
+  "tasks.mediaDescription.fields.language": "输出语言，可填语言名称或标签，例如日语或 ja。默认使用简体中文。",
   "tasks.mediaDescription.fields.instructions": "本次描述重点，最多 4000 字符；null 或省略时采用完整材料描述。"
 }

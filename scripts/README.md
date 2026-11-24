@@ -1,20 +1,22 @@
 # 开发工具
 
-根目录的 `dev.ps1` 和 `dev.sh` 配置当前终端的工作区环境。第一次运行 `init` 会安装项目指定的 Bun、安装锁定的开发依赖，准备 CodeGraph、Zvec-grep 和 ast-grep MCP，并同步到已检测到的 Agent Harness（Codex、Antigravity 等）。Fallow 和 ast-grep MCP 使用工作区自己的配置；工具、缓存与临时文件放在 `temp/`。
+根目录的 `dev.ps1` 和 `dev.sh` 配置当前终端。`bootstrap` 安装项目指定的 Bun 和锁定的开发依赖，可直接运行和打包。`init` 还会准备 CodeGraph、Zvec-grep 和 ast-grep MCP，并同步到检测到的 Agent Harness。工具、缓存与临时文件放在 `temp/`。
 
 ```powershell
-. ./dev.ps1 init    # 首次准备
+. ./dev.ps1 bootstrap  # 安装构建依赖
+. ./dev.ps1 init       # 准备 Agent 工具、索引和 MCP
 . ./dev.ps1         # 新终端配置环境
 . ./dev.ps1 status  # 查看运行时与检索索引
 ```
 
 ```sh
+source ./dev.sh bootstrap
 source ./dev.sh init
 source ./dev.sh
 source ./dev.sh status
 ```
 
-`init` 需要 Node.js、npm、Python 和 uv；`env` 只配置当前终端。初始化还会安装 Fallow 的 Git pre-commit 钩子，检查暂存内容；已有其他钩子时保留原样并提示合并。仓库尚无首个提交时，Fallow 没有比较基准，首个提交会跳过这项检查。
+`bootstrap` 需要 Node.js、npm 和 Python。`init` 另需 uv，并配置 Fallow 的 Git pre-commit 钩子，检查暂存内容。`env` 只配置当前终端。
 
 Fallow 的统一提交与推送门禁由 `scripts/harness/` 提供；各 Harness 的适配器入口分别位于 `.codex/hooks.json`（Codex，需在 `/hooks` 或设置中检查信任后生效）和 `.agents/hooks.json`（Antigravity）。
 

@@ -1,108 +1,34 @@
-import { basename, extname } from "node:path";
+import { basename } from "node:path";
 import {
   appError,
   decodeUtf8,
-  openCall,
-  selectUtf8,
+  hasTextControls,
+  inlineMaterialSchema,
+  isTextMedia,
+  mediaProbeBytes,
+  probeMediaType,
+  textMediaForName,
+  readMediaBytes,
   throwIfAborted,
   type CallOptions,
   type Completed,
+  type InlineMaterial,
   type Material,
-  type Range,
+  type MediaInput,
+  type RepresentationCoverage,
+  type ResultOutput,
   type SavedResult,
+  type Selection,
 } from "@themelios/core";
-import { fileTypeFromBuffer } from "file-type";
 import type {
-  MediaInput,
   PreparationStore,
   TaskMaterial,
   TaskMaterialInput,
 } from "./types.js";
 
-const extensionMimes: Readonly<Record<string, string>> = {
-  ".txt": "text/plain",
-  ".md": "text/markdown",
-  ".markdown": "text/markdown",
-  ".csv": "text/csv",
-  ".tsv": "text/tab-separated-values",
-  ".json": "application/json",
-};
-
-const signatureRequired = new Set([
-  "application/pdf",
-  "image/png",
-  "image/jpeg",
-  "image/webp",
-  "image/gif",
-  "image/tiff",
-  "image/avif",
-]);
-
-export function isTextMedia(mediaType: string): boolean {
-  return (
-    mediaType.startsWith("text/") ||
-    mediaType === "application/json" ||
-    mediaType.endsWith("+json")
-  );
-}
-
-/** Reads one media stream under byte and cancellation budgets. */
-export async function readMediaBytes(
-  input: MediaInput,
-  options?: CallOptions,
-  maxBytes = 67_108_864,
-): Promise<Uint8Array> {
-  const scope = openCall("input.media_read", options);
-  const oversized = (actual: number): never => {
-    throw appError("model.input_too_large", {
-      details: {
-        name: input.info.name ?? null,
-        mediaType: input.info.mediaType,
-        maxBytes,
-        actualBytes: actual,
-      },
-    });
-  };
-  try {
-    scope.throwIfAborted();
-    if (input.info.sizeBytes > maxBytes) oversized(input.info.sizeBytes);
-    const body = await input.open({ signal: scope.signal });
-    const reader = body.getReader();
-    const abort = () => {
-      void reader.cancel(scope.signal.reason).catch(() => undefined);
-    };
-    scope.signal.addEventListener("abort", abort, { once: true });
-    const chunks: Uint8Array[] = [];
-    let size = 0;
-    let done = false;
-    try {
-      while (!done) {
-        scope.throwIfAborted();
-        const next = await reader.read();
-        done = next.done;
-        scope.throwIfAborted();
-        if (!next.done) {
-          size += next.value.byteLength;
-          if (size > maxBytes) oversized(size);
-          chunks.push(next.value);
-        }
-      }
-    } finally {
-      scope.signal.removeEventListener("abort", abort);
-      if (!done) abort();
-      reader.releaseLock();
-    }
-    if (chunks.length === 1) return chunks[0]!;
-    const bytes = new Uint8Array(size);
-    let cursor = 0;
-    for (const chunk of chunks) {
-      bytes.set(chunk, cursor);
-      cursor += chunk.byteLength;
-    }
-    return bytes;
-  } finally {
-    scope.close();
-  }
+export interface ResolvedMediaInput extends MediaInput {
+  readonly storedSelection?: Selection;
+  readonly coverage?: RepresentationCoverage;
 }
 
 export async function detectInlineMimeType(
@@ -110,31 +36,20 @@ export async function detectInlineMimeType(
   declared?: string,
   name?: string,
 ): Promise<string> {
-  let detected: string | undefined;
-  try {
-    detected = (await fileTypeFromBuffer(bytes.subarray(0, 16_384)))?.mime;
-  } catch (error) {
-    if (!(error instanceof Error && error.name === "EndOfStreamError"))
-      throw error;
-  }
-  if (
-    declared !== undefined &&
-    declared !== detected &&
-    (signatureRequired.has(declared) ||
-      (declared.startsWith("image/") && detected !== undefined))
-  ) {
-    throw appError("content.media_mismatch", {
-      details: { declared, detected: detected ?? null },
-    });
-  }
-  if (declared) return declared;
+  const detected = await probeMediaType(
+    bytes.subarray(0, mediaProbeBytes),
+    declared,
+  );
   if (detected) return detected;
-  const byExt = name ? extensionMimes[extname(name).toLowerCase()] : undefined;
-  if (byExt) return byExt;
+  const byExtension = textMediaForName(name);
   try {
-    new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
-    return "text/plain";
-  } catch {
+    const text = decodeUtf8(bytes);
+    return (
+      byExtension ??
+      (hasTextControls(text) ? "application/octet-stream" : "text/plain")
+    );
+  } catch (error) {
+    if (byExtension) throw error;
     return "application/octet-stream";
   }
 }
@@ -158,19 +73,26 @@ export function rangeDescription(input: Pick<MediaInput, "range">): string {
   }
 }
 
-function inlineMediaInput(material: {
-  bytes: Uint8Array;
-  mediaType: string;
-  name?: string;
-}): MediaInput {
-  const bytes = material.bytes;
+function inlineMediaInput(material: InlineMaterial): ResolvedMediaInput {
+  const parsed = inlineMaterialSchema.safeParse(material);
+  if (!parsed.success) {
+    throw appError("input.invalid", {
+      details: {
+        issues: parsed.error.issues.map((issue) => ({
+          path: issue.path.map(String),
+          reason: issue.message,
+        })),
+      },
+    });
+  }
+  const { bytes, mediaType, name } = parsed.data;
   return {
-    source: material,
+    source: parsed.data,
     info: {
-      mediaType: material.mediaType,
+      mediaType,
       sizeBytes: bytes.byteLength,
-      ...(material.name === undefined ? {} : { name: material.name }),
-      extent: isTextMedia(material.mediaType)
+      ...(name === undefined ? {} : { name }),
+      extent: isTextMedia(mediaType)
         ? { kind: "text", bytes: bytes.byteLength }
         : { kind: "unknown" },
     },
@@ -184,10 +106,11 @@ function inlineMediaInput(material: {
 function storeSelectionInput(
   selection: Extract<Material, { ref: string }>,
   store: PreparationStore,
-): MediaInput {
+): ResolvedMediaInput {
   const artifact = store.inspect(selection.ref);
   return {
     source: selection,
+    storedSelection: selection,
     info: {
       mediaType: artifact.mediaType,
       sizeBytes: artifact.sizeBytes,
@@ -202,17 +125,22 @@ function storeSelectionInput(
   };
 }
 
-function resultOutputInput(
-  material: { result: Completed | SavedResult; output?: string },
+export function resolveResultOutput(
+  result: Completed | SavedResult,
+  output: string | undefined,
   store?: PreparationStore,
-): MediaInput {
-  const target = material.output ?? "$value";
+): ResolvedMediaInput {
+  const source: ResultOutput = {
+    result: "ref" in result ? result.ref : result,
+    ...(output === undefined ? {} : { output }),
+  };
+  const target = output ?? "$value";
   if (target === "$value") {
     const jsonBytes = new TextEncoder().encode(
-      JSON.stringify(material.result.value, null, 2),
+      JSON.stringify(result.value, null, 2),
     );
     return {
-      source: material,
+      source,
       info: {
         mediaType: "application/json",
         sizeBytes: jsonBytes.byteLength,
@@ -225,43 +153,53 @@ function resultOutputInput(
       },
     };
   }
-  if ("files" in material.result && Array.isArray(material.result.files)) {
-    const found = material.result.files.find((f) => f.name === target);
-    if (!found) {
-      throw appError("content.output_not_found", {
-        details: { output: target },
-      });
-    }
-    return resolveMedia(found.material, store);
-  }
-  const saved = material.result as SavedResult;
-  const savedFile = Object.hasOwn(saved.files, target)
-    ? saved.files[target]
-    : undefined;
-  if (!savedFile) {
+  const file =
+    "ref" in result
+      ? Object.hasOwn(result.files, target)
+        ? result.files[target]
+        : undefined
+      : result.files.find((entry) => entry.name === target);
+  if (!file) {
     throw appError("content.output_not_found", {
       details: { output: target },
     });
   }
-  return resolveMedia(savedFile.material, store);
+  return {
+    ...resolvePart(file.material, store),
+    source,
+    ...(file.coverage === undefined ? {} : { coverage: file.coverage }),
+  };
 }
 
-export function resolveMedia(
-  material: Material,
+function resolvePart(
+  material: Exclude<Material, ResultOutput>,
   store?: PreparationStore,
-): MediaInput {
+): ResolvedMediaInput {
   if ("bytes" in material) return inlineMediaInput(material);
-  if ("ref" in material) {
-    if (!store) {
-      throw appError("input.capability_missing", {
-        details: {
-          required: "PreparationStore is required for Selection inputs",
-        },
-      });
-    }
-    return storeSelectionInput(material, store);
-  }
-  return resultOutputInput(material, store);
+  return storeSelectionInput(material, requireStore(store));
+}
+
+function requireStore(store?: PreparationStore): PreparationStore {
+  if (!store)
+    throw appError("input.capability_missing", {
+      details: {
+        required: "PreparationStore is required for stored materials",
+      },
+    });
+  return store;
+}
+
+export async function resolveMedia(
+  material: Material,
+  store: PreparationStore | undefined,
+  call: CallOptions,
+): Promise<ResolvedMediaInput> {
+  if (!("result" in material)) return resolvePart(material, store);
+  const result =
+    typeof material.result === "string"
+      ? await requireStore(store).readResult(material.result, call)
+      : material.result;
+  return resolveResultOutput(result, material.output, store);
 }
 
 export async function normalizeMaterialInput(
@@ -317,49 +255,25 @@ async function readLocalMaterial(
   return { bytes, mediaType, name };
 }
 
-function readJsonPointerValue(
-  text: string,
-  range: Extract<Range, { kind: "json" }>,
-): string {
-  let current: unknown = JSON.parse(
-    text.startsWith("\uFEFF") ? text.slice(1) : text,
-  );
-  if (range.pointer) {
-    for (const part of range.pointer.slice(1).split("/")) {
-      const key = part.replaceAll("~1", "/").replaceAll("~0", "~");
-      if (
-        current === null ||
-        typeof current !== "object" ||
-        !Object.hasOwn(current, key)
-      ) {
-        throw appError("content.range_invalid", {
-          details: {
-            pointer: range.pointer,
-            reason: "JSON Pointer does not resolve",
-          },
-        });
-      }
-      current = (current as Record<string, unknown>)[key];
-    }
-  }
-  return typeof current === "string"
-    ? current
-    : JSON.stringify(current, null, 2);
-}
-
 export async function readMediaText(
-  input: MediaInput,
+  input: ResolvedMediaInput,
   store: PreparationStore | undefined,
   call: CallOptions,
   maxBytes: number,
 ): Promise<string> {
-  if ("ref" in input.source && store) {
-    return store.text(input.source, call);
+  if (input.storedSelection) {
+    const range = input.range;
+    const enforceBudget = (actualBytes: number) => {
+      if (actualBytes > maxBytes)
+        throw appError("model.input_too_large", {
+          details: { mediaType: input.info.mediaType, actualBytes, maxBytes },
+        });
+    };
+    if (range?.kind === "text") enforceBudget(range.end - range.start);
+    if (!range) enforceBudget(input.info.sizeBytes);
+    const text = await requireStore(store).text(input.storedSelection, call);
+    enforceBudget(Buffer.byteLength(text));
+    return text;
   }
-  const bytes = await readMediaBytes(input, call, maxBytes);
-  const range = input.range;
-  if (range?.kind === "text") return decodeUtf8(selectUtf8(bytes, range));
-  const full = decodeUtf8(bytes);
-  if (range?.kind === "json") return readJsonPointerValue(full, range);
-  return full;
+  return decodeUtf8(await readMediaBytes(input, call, maxBytes));
 }

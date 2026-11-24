@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import {
+  appError,
   AppError,
   systemClock,
   throwIfAborted,
@@ -28,9 +29,12 @@ import {
   type ResourceContext,
   type ResourceSlot,
 } from "./execution.js";
-import { failure } from "./failure.js";
 import { createLocalizer, type Dictionaries } from "./locales.js";
-import { openInstanceLock, type Endpoints, type OwnedLock } from "./lock.js";
+import {
+  openInstanceLock,
+  type EndpointUpdate,
+  type OwnedLock,
+} from "./lock.js";
 import { createSessionNetwork, type Network } from "./network.js";
 import type { InstanceInfo, InstancePaths } from "./paths.js";
 import { SessionResources } from "./resources.js";
@@ -78,8 +82,9 @@ export interface Session<Api, S> {
   readonly api: Api;
   readonly instance: InstanceInfo;
   readonly configuration: Configuration<S>;
+  readonly languages: readonly string[];
   localize(key: string, params?: MessageParams, locale?: string): string;
-  setEndpoints(endpoints: Endpoints): Promise<void>;
+  setEndpoints(update: EndpointUpdate): Promise<void>;
   close(options?: { graceMs?: number }): Promise<void>;
 }
 
@@ -180,6 +185,7 @@ export async function openSession<Api, S>(
         createSessionNetwork(
           {
             timeoutMs: settings.network.timeoutMs,
+            noProxy: settings.network.noProxy,
             ...(settings.network.proxy
               ? { proxy: settings.network.proxy }
               : {}),
@@ -263,7 +269,7 @@ export async function openSession<Api, S>(
         return resource;
       },
       bindResource: (select, create) =>
-        ownedResources.bind(select, create, current),
+        settings.serialize(() => ownedResources.bind(select, create, current)),
     };
     const api = await application.open(env);
     throwIfAborted(options.signal);
@@ -277,10 +283,13 @@ export async function openSession<Api, S>(
       api,
       instance,
       configuration: settings,
+      languages: localize.languages,
       localize: env.localize,
       setEndpoints(endpoints) {
         if (closing || !lock)
-          return Promise.reject(failure("runtime.closed", { state: "closed" }));
+          return Promise.reject(
+            appError("runtime.closed", { details: { state: "closed" } }),
+          );
         return lock.endpoints(endpoints);
       },
       close(options) {
@@ -290,8 +299,12 @@ export async function openSession<Api, S>(
           ownedResources.active.runtime.runtime.shutdownGraceMs;
         if (!Number.isSafeInteger(graceMs) || graceMs < 0 || graceMs > 300000) {
           return Promise.reject(
-            failure("input.invalid", {
-              issues: [{ path: ["graceMs"], reason: "Expected 0..300000 ms" }],
+            appError("input.invalid", {
+              details: {
+                issues: [
+                  { path: ["graceMs"], reason: "Expected 0..300000 ms" },
+                ],
+              },
             }),
           );
         }
@@ -303,9 +316,11 @@ export async function openSession<Api, S>(
           await ownedResources.close(closeOwned);
           await closeLock();
           if (failures.length)
-            throw failure("runtime.close_failed", {
-              owners: failures.map((error) => error.owner),
-              codes: failures.map((error) => error.code),
+            throw appError("runtime.close_failed", {
+              details: {
+                owners: failures.map((error) => error.owner),
+                codes: failures.map((error) => error.code),
+              },
             });
         })();
         return closing;

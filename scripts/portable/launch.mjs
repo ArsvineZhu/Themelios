@@ -72,13 +72,11 @@ try {
   const entry = installedPath(manifest.entry);
   if (!(await stat(entry)).isFile())
     throw new Error("Themelios application entry is missing: " + entry);
-  const { runWorkbench, workbenchApplication } = await import(
-    pathToFileURL(entry).href
-  );
+  const { runWorkbench, workbenchId } = await import(pathToFileURL(entry).href);
   if (
     typeof runWorkbench !== "function" ||
-    workbenchApplication?.id !== manifest.applicationId ||
-    workbenchApplication.formatId !== manifest.formatId
+    workbenchId !== manifest.applicationId ||
+    workbenchId !== manifest.formatId
   ) {
     throw new Error(
       "The application entry does not match the Themelios release manifest",

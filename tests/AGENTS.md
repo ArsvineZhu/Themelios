@@ -23,4 +23,4 @@ Tests are organized into the following directories:
 - `tests/platform/`
 - `tests/*/shared/`
 
-`native/` has its own tests.
+`native` has its own tests.
