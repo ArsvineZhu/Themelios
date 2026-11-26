@@ -8,23 +8,26 @@ const task = defineTask({
   title: "Sample Summary",
   purpose: "Summarize text materials into structured markdown sections.",
   input: z.strictObject({ language: z.enum(["en", "zh-CN"]).default("en") }),
-  output: z.strictObject({
-    title: z.string().min(1),
-    sections: z
-      .array(
-        z.strictObject({
-          markdown: z.string().min(1),
-          sourceKeys: z.array(z.literal("S1")).length(1),
-        }),
-      )
-      .min(1)
-      .max(3),
-    notes: z.string(),
-  }),
+  output: {
+    kind: "json",
+    schema: z.strictObject({
+      title: z.string().min(1),
+      sections: z
+        .array(
+          z.strictObject({
+            markdown: z.string().min(1),
+            sourceKeys: z.array(z.literal("S1")).length(1),
+          }),
+        )
+        .min(1)
+        .max(3),
+      notes: z.string(),
+    }),
+  },
   requirements: {
     minMaterials: 1,
     maxMaterials: 1,
-    inputs: [{ mediaType: "text/plain", needs: ["text"] }],
+    inputs: [{ mediaType: "text/plain", accepts: [["text"]] }],
   },
   templates: filePrompt
     ? { system: "system.md.liquid", user: "user.md.liquid" }
@@ -32,7 +35,7 @@ const task = defineTask({
         inline: true,
         system:
           "Summarize the material concisely and cite source keys such as S1.",
-        user: "Language: {{ language }}\n{% for s in sources %}Source {{ s.key }} ({{ s.name }}): {{ s.originalExtent }}\n{% endfor %}",
+        user: "Language: {{ language }}\n{% for s in sources %}Source {{ s.key }} ({{ s.name }}): {{ s.originalExtent | extent }}\n{% endfor %}",
       },
   validateOutput: (value, sources) =>
     value.sections.every((s) => s.sourceKeys.every((k) => sources.has(k)))
@@ -54,39 +57,47 @@ if (!baseURL || !providerModel) {
   );
 }
 
-const models = createModels({
-  resourceRoot: fileURLToPath(new URL("./resources", import.meta.url)),
-  connections: {
-    local: {
-      protocol: "openai-compatible",
-      baseURL,
-      ...(process.env.THEMELIOS_MODEL_KEY
-        ? { credential: "env:THEMELIOS_MODEL_KEY" }
-        : {}),
-    },
-  },
-  bindings: {
-    summary: {
-      connection: "local",
-      providerModel,
-      capabilities: {
-        operations: ["generate"],
-        inputMimeTypes: ["text/plain"],
-        needs: ["text"],
-        structuredOutput: true,
-        streaming: true,
+const models = createModels(
+  {
+    connections: {
+      local: {
+        protocol: "openai-compatible",
+        baseURL,
+        ...(process.env.THEMELIOS_MODEL_KEY
+          ? { credential: "env:THEMELIOS_MODEL_KEY" }
+          : {}),
       },
-      parameters: { temperature: 0, maxOutputTokens: 768 },
+    },
+    bindings: {
+      summary: {
+        connection: "local",
+        providerModel,
+        capabilities: {
+          operations: ["generate"],
+          inputMimeTypes: ["text/plain"],
+          needs: ["text"],
+          structuredOutput: true,
+          streaming: true,
+        },
+        parameters: { temperature: 0, maxOutputTokens: 768 },
+      },
     },
   },
-});
+  {
+    resourceRoot: fileURLToPath(new URL("./resources", import.meta.url)),
+  },
+);
 
 try {
-  const result = await models.runTask(task, {
+  const result = await models.tasks.run(task, {
     variables: {},
     materials: [
       {
-        path: fileURLToPath(new URL("./summary-material.txt", import.meta.url)),
+        source: {
+          file: fileURLToPath(
+            new URL("./summary-material.txt", import.meta.url),
+          ),
+        },
       },
     ],
   });

@@ -1,4 +1,4 @@
-import { AppError, type Json } from "@themelios/core";
+import { AppError, formatJsonPointer, type Json } from "@themelios/core";
 import type { z } from "zod";
 
 export function contentError(
@@ -7,12 +7,6 @@ export function contentError(
   cause?: unknown,
 ): AppError {
   return new AppError({ code, messageKey: code, details, cause });
-}
-
-export function pointer(path: readonly PropertyKey[]): string {
-  return path
-    .map((key) => `/${String(key).replaceAll("~", "~0").replaceAll("/", "~1")}`)
-    .join("");
 }
 
 export function validated<T>(
@@ -24,7 +18,7 @@ export function validated<T>(
   if (!check.success)
     throw contentError("content.schema_invalid", {
       issues: check.error.issues.map((issue) => ({
-        path: pointer([...path, ...issue.path]),
+        path: formatJsonPointer([...path, ...issue.path]),
         constraint: issue.message,
       })),
     });

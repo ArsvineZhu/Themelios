@@ -1,10 +1,14 @@
 import { createHash } from "node:crypto";
-import { readFileSync, type Stats } from "node:fs";
+import type { Stats } from "node:fs";
 import { mkdir, open, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import {
   AppError,
   appError,
+  blobDigestAlgorithm,
+  blobDigestHexCharacters,
+  blobRefFromDigest,
+  blobRefPrefix,
   blobRefSchema,
   errorCode,
   openCall,
@@ -20,11 +24,35 @@ export interface BlobInfo {
   sizeBytes: number;
 }
 
+const shardWidth = 2;
+const shardPattern = new RegExp(
+  `^[${blobDigestHexCharacters}]{${shardWidth}}$`,
+);
+export const casStagingDirectory = "tmp";
+
+export function casObjectsPath(root: string): string {
+  return join(root, blobDigestAlgorithm);
+}
+
+export function isObjectShard(name: string): boolean {
+  return shardPattern.test(name);
+}
+
+export function objectRef(shard: string, name: string): BlobRef | undefined {
+  const ref = blobRefSchema.safeParse(`${blobRefPrefix}${shard}${name}`);
+  return ref.success ? ref.data : undefined;
+}
+
 export function objectPath(root: string, ref: BlobRef): string {
   const parsed = blobRefSchema.safeParse(ref);
   if (!parsed.success)
     throw appError("storage.blob_ref_invalid", { details: { blobRef: ref } });
-  return join(root, "sha256", ref.slice(7, 9), ref.slice(9));
+  const digest = parsed.data.slice(blobRefPrefix.length);
+  return join(
+    casObjectsPath(root),
+    digest.slice(0, shardWidth),
+    digest.slice(shardWidth),
+  );
 }
 
 function objectSize(info: Stats, ref: BlobRef, path: string): number {
@@ -82,7 +110,7 @@ export class Cas {
     options?: CallOptions & { maxBytes?: number },
   ): Promise<BlobInfo> {
     const scope = this.#operation("storage.put", options);
-    const temporary = join(this.root, "tmp");
+    const temporary = join(this.root, casStagingDirectory);
     const maxBytes = options?.maxBytes ?? Number.MAX_SAFE_INTEGER;
     try {
       scope.throwIfAborted();
@@ -98,12 +126,19 @@ export class Cas {
             sizeBytes: input.byteLength,
           },
         });
-      const source = inline ? new Uint8Array(input) : input;
+      const source = inline
+        ? new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new Uint8Array(input));
+              controller.close();
+            },
+          })
+        : input;
       await mkdir(temporary, { recursive: true });
       return await stageFile(
         temporary,
         async (handle) => {
-          const hash = createHash("sha256");
+          const hash = createHash(blobDigestAlgorithm);
           let sizeBytes = 0;
           for await (const chunk of streamChunks(source, scope.signal)) {
             const bytes = inline ? chunk : new Uint8Array(chunk);
@@ -118,7 +153,7 @@ export class Cas {
             hash.update(bytes);
             await writeChunk(handle, bytes, scope.signal);
           }
-          return { ref: `sha256:${hash.digest("hex")}`, sizeBytes };
+          return { ref: blobRefFromDigest(hash.digest("hex")), sizeBytes };
         },
         async (path, { ref, sizeBytes }) => {
           scope.throwIfAborted();
@@ -160,17 +195,6 @@ export class Cas {
     const path = objectPath(this.root, ref);
     try {
       return { ref, sizeBytes: objectSize(await stat(path), ref, path) };
-    } catch (error) {
-      throw this.#readFailure(error, ref, path);
-    }
-  }
-
-  /** Reads a complete object for a synchronous metadata operation. */
-  readBytesSync(ref: BlobRef): Uint8Array {
-    if (this.#stopping.signal.aborted) throw this.#stopping.signal.reason;
-    const path = objectPath(this.root, ref);
-    try {
-      return readFileSync(path);
     } catch (error) {
       throw this.#readFailure(error, ref, path);
     }
@@ -231,7 +255,7 @@ export class Cas {
           start(output) {
             controller = output;
           },
-          async pull(output) {
+          pull: async (output) => {
             try {
               scope.throwIfAborted();
               if (position === end) {
@@ -259,13 +283,8 @@ export class Cas {
               position += bytesRead;
               output.enqueue(bytes.subarray(0, bytesRead));
             } catch (error) {
-              await finish();
-              throw error instanceof AppError
-                ? error
-                : appError("storage.read_failed", {
-                    details: { blobRef: ref, path, reason: String(error) },
-                    cause: error,
-                  });
+              await finish().catch(() => undefined);
+              throw this.#readFailure(error, ref, path);
             }
           },
           cancel: finish,
@@ -276,7 +295,7 @@ export class Cas {
       scope.signal.addEventListener("abort", abort, { once: true });
       return body;
     } catch (error) {
-      await handle?.close();
+      await handle?.close().catch(() => undefined);
       scope.close();
       throw this.#readFailure(error, ref, path);
     }

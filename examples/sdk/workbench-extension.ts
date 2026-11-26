@@ -7,10 +7,13 @@ export default {
       title: "Keywords",
       purpose: "Extract search terms from the supplied documents.",
       input: z.strictObject({ focus: z.string().nullable().default(null) }),
-      output: z.strictObject({ keywords: z.array(z.string().min(1)) }),
+      output: {
+        kind: "json",
+        schema: z.strictObject({ keywords: z.array(z.string().min(1)) }),
+      },
       requirements: {
         minMaterials: 1,
-        inputs: [{ mediaType: "text/*", needs: ["text"] }],
+        inputs: [{ mediaType: "text/*", accepts: [["text"]] }],
       },
       templates: {
         inline: true,

@@ -1,19 +1,22 @@
 import { resolve } from "node:path";
-import type { ApplicationApi } from "@themelios/application";
 import {
-  callOperation,
-  type BinaryReadResult,
+  taskOperationIds,
+  promptOperationIds,
+  type ApplicationApi,
+} from "@themelios/application";
+import { materialOperationIds, resultOperationIds } from "@themelios/content";
+import {
+  configurationOperationIds,
+  instanceOperationIds,
 } from "@themelios/runtime/operations";
-import { appError, type Flow } from "@themelios/core";
+import { appError } from "@themelios/core";
+import { promptRoleSchema } from "@themelios/models";
 import {
   cliInputError,
   jsonCliInput,
   nonnegativeInt,
   objectCliInput,
   readCliInput,
-  ensureNewFile,
-  publishOutput,
-  streamStdout,
   writeStdout,
   type CliWiring,
 } from "@themelios/transports/cli";
@@ -22,7 +25,9 @@ export function mountStandardCli(w: CliWiring<ApplicationApi>): void {
   const instance = w.program.commands.find(
     (command) => command.name() === "instance",
   );
-  instance?.command("info").action(() => w.unary("instance.info", () => ({})));
+  instance
+    ?.command("info")
+    .action(() => w.invoke(instanceOperationIds.info, () => ({})));
   mountMaterials(w);
   mountResults(w);
   mountTasks(w);
@@ -31,7 +36,7 @@ export function mountStandardCli(w: CliWiring<ApplicationApi>): void {
 }
 
 function mountMaterials(w: CliWiring<ApplicationApi>) {
-  const { directory, program, cwd } = w;
+  const { program, cwd } = w;
   const material = program
     .command("material")
     .description("Import, read and trace materials");
@@ -60,13 +65,13 @@ function mountMaterials(w: CliWiring<ApplicationApi>) {
       const declared =
         opts.mime === undefined ? {} : { mediaType: String(opts.mime) };
       if (opts.input !== undefined) {
-        return w.unary("materials.accept", async (max) => ({
+        return w.invoke(materialOperationIds.accept, async (max) => ({
           ...objectCliInput(await readCliInput(opts.input, cwd, max)),
           ...display,
           ...declared,
         }));
       }
-      w.permission("materials.accept");
+      w.permission(materialOperationIds.accept);
       await w.session(async (api, ctx) => {
         const source =
           opts.file !== undefined
@@ -89,13 +94,13 @@ function mountMaterials(w: CliWiring<ApplicationApi>) {
   for (const op of ["inspect", "structure", "retain", "release"] as const) {
     material
       .command(op + " <ref>")
-      .action((ref) => w.unary("materials." + op, () => ({ ref })));
+      .action((ref) => w.invoke(materialOperationIds[op], () => ({ ref })));
   }
   material
     .command("sources <ref>")
     .option("--depth <count>", "maximum depth", nonnegativeInt)
     .action((ref, { depth }) =>
-      w.unary("materials.sources", () => ({
+      w.invoke(materialOperationIds.sources, () => ({
         ref,
         ...(depth === undefined ? {} : { depth }),
       })),
@@ -105,31 +110,22 @@ function mountMaterials(w: CliWiring<ApplicationApi>) {
     .option("--at <cut>")
     .option("--after <ref>")
     .option("--limit <count>", "maximum items", nonnegativeInt)
-    .action((opts) => w.unary("materials.list", () => opts));
+    .action((opts) => w.invoke(materialOperationIds.listRetained, () => opts));
   material
     .command("text [ref]")
     .option("--input <file|->")
     .action((ref, opts) =>
-      w.unary("materials.text", (max) =>
+      w.invoke(materialOperationIds.text, (max) =>
         opts.input === undefined ? { ref } : readCliInput(opts.input, cwd, max),
       ),
     );
-  material.command("read <ref>").action((ref) =>
-    w.session(async (api, ctx) => {
-      const res = (await callOperation(
-        api,
-        directory,
-        "materials.read",
-        { ref },
-        ctx,
-      )) as BinaryReadResult;
-      await streamStdout(res.body, w.signal);
-    }),
-  );
+  material
+    .command("read <ref>")
+    .action((ref) => w.invoke(materialOperationIds.read, () => ({ ref })));
   material
     .command("export <ref> <destination>")
     .action(async (ref, destination) => {
-      w.permission("materials.read");
+      w.permission(materialOperationIds.read);
       await w.session(async (api, ctx) => {
         const mats = api.materials;
         await mats.export(
@@ -150,15 +146,17 @@ function mountResults<App>(w: CliWiring<App>) {
     .command("save")
     .requiredOption("--input <file|->")
     .action((opts) =>
-      w.unary("results.save", (max) => readCliInput(opts.input, cwd, max)),
+      w.invoke(resultOperationIds.save, (max) =>
+        readCliInput(opts.input, cwd, max),
+      ),
     );
   result
     .command("read <ref>")
-    .action((ref) => w.unary("results.read", () => ({ ref })));
+    .action((ref) => w.invoke(resultOperationIds.read, () => ({ ref })));
 }
 
 function mountTasks<App>(w: CliWiring<App>) {
-  const { directory, program, cwd } = w;
+  const { program, cwd } = w;
   const task = program
     .command("task")
     .description("Inspect, preview and run model tasks");
@@ -166,21 +164,25 @@ function mountTasks<App>(w: CliWiring<App>) {
     readCliInput(path, cwd, max)
       .then(objectCliInput)
       .then((value) => (id === undefined ? value : { ...value, task: id }));
-  task.command("list").action(() => w.unary("tasks.list", () => ({})));
+  task
+    .command("list")
+    .action(() => w.invoke(taskOperationIds.list, () => ({})));
   task
     .command("describe <task>")
-    .action((id) => w.unary("tasks.describe", () => ({ task: id })));
+    .action((id) => w.invoke(taskOperationIds.describe, () => ({ task: id })));
   task
     .command("preview [task]")
     .requiredOption("--input <file|->")
     .action((id, opts) =>
-      w.unary("tasks.preview", (max) => taskReq(id, opts.input, max)),
+      w.invoke(taskOperationIds.preview, (max) => taskReq(id, opts.input, max)),
     );
   task
     .command("run-many")
     .requiredOption("--input <file|->")
     .action((opts) =>
-      w.unary("tasks.runMany", (max) => readCliInput(opts.input, cwd, max)),
+      w.invoke(taskOperationIds.runMany, (max) =>
+        readCliInput(opts.input, cwd, max),
+      ),
     );
   task
     .command("run [task]")
@@ -188,55 +190,22 @@ function mountTasks<App>(w: CliWiring<App>) {
     .option("--stream")
     .option("--save")
     .option("--output <file>")
-    .action(async (id, opts) => {
-      const dest =
-        opts.output === undefined ? undefined : resolve(cwd, opts.output);
-      if (dest !== undefined) await ensureNewFile(dest);
-      await w.session(async (api, ctx) => {
-        const max = ctx.maxJsonBytes;
-        const payload = await taskReq(id, opts.input, max);
-        if (opts.save) payload.persist = true;
-        const publish =
-          dest === undefined
-            ? undefined
-            : (value: unknown) =>
-                publishOutput(dest, JSON.stringify(value) + "\n", value);
-        if (!opts.stream) {
-          const value = await callOperation(
-            api,
-            directory,
-            "tasks.run",
-            payload,
-            ctx,
-          );
-          if (publish) return publish(value);
-          const op = directory.get("tasks.run");
-          const rendered =
-            !w.isJson() && op?.present
-              ? await op.present(value, api, ctx)
-              : value;
-          return w.emit(rendered, max);
-        }
-        const stream = callOperation(
-          api,
-          directory,
-          "tasks.stream",
-          payload,
-          ctx,
-        ) as Flow<unknown>;
-        for await (const event of stream) {
-          if (event.type === "result") await publish?.(event.value);
-          if (w.isJson()) await w.emit(event, max);
-          else if (event.type === "text-delta")
-            await writeStdout(event.text, w.signal);
-          else if (event.type === "result") await writeStdout("\n");
-        }
-      });
-    });
+    .action((id, opts) =>
+      w.invoke(
+        opts.stream ? taskOperationIds.stream : taskOperationIds.run,
+        async (max) => {
+          const request = await taskReq(id, opts.input, max);
+          return opts.save ? { ...request, persist: true } : request;
+        },
+        opts.output === undefined
+          ? undefined
+          : { output: resolve(cwd, opts.output) },
+      ),
+    );
 }
 
-function mountPrompts<App>(w: CliWiring<App>) {
-  const { directory, program, cwd } = w;
+function mountPrompts(w: CliWiring<ApplicationApi>) {
+  const { program, cwd } = w;
   const prompt = program
     .command("prompt")
     .description("Read and edit task prompts");
@@ -245,19 +214,15 @@ function mountPrompts<App>(w: CliWiring<App>) {
     .option("--part <role>")
     .action(async (task, opts) => {
       if (opts.part === undefined)
-        return w.unary("prompts.read", () => ({ task }));
-      if (opts.part !== "user" && opts.part !== "system") {
-        return cliInputError("Use --part user or --part system.");
-      }
+        return w.invoke(promptOperationIds.read, () => ({ task }));
+      const role = promptRoleSchema.safeParse(opts.part);
+      if (!role.success)
+        return cliInputError(
+          "Choose " + promptRoleSchema.options.join(" or ") + " for --part.",
+        );
+      w.permission(promptOperationIds.read);
       await w.session(async (api, ctx) => {
-        const templates = (await callOperation(
-          api,
-          directory,
-          "prompts.read",
-          { task },
-          ctx,
-        )) as Record<string, string>;
-        const text = templates[opts.part]!;
+        const text = (await api.prompts.read(task))[role.data];
         if (w.isJson()) await w.emit(text, ctx.maxJsonBytes);
         else await writeStdout(text);
       });
@@ -265,14 +230,14 @@ function mountPrompts<App>(w: CliWiring<App>) {
   for (const action of ["describe", "diff"] as const) {
     prompt
       .command(action + " <task>")
-      .action((task) => w.unary("prompts." + action, () => ({ task })));
+      .action((task) => w.invoke(promptOperationIds[action], () => ({ task })));
   }
   prompt
     .command("edit <task>")
     .requiredOption("--file <path>")
     .requiredOption("--part <role>")
     .action((task, opts) =>
-      w.unary("prompts.setOverride", async (max) => {
+      w.invoke(promptOperationIds.setOverride, async (max) => {
         const file = Bun.file(resolve(cwd, opts.file));
         if (file.size > max) {
           throw appError("transport.request_too_large", {
@@ -286,7 +251,7 @@ function mountPrompts<App>(w: CliWiring<App>) {
     .command("reset <task>")
     .option("--part <role>")
     .action((task, opts) =>
-      w.unary("prompts.reset", () => ({
+      w.invoke(promptOperationIds.reset, () => ({
         task,
         ...(opts.part === undefined ? {} : { role: opts.part }),
       })),
@@ -301,17 +266,21 @@ function mountConfiguration<App>(w: CliWiring<App>) {
   config
     .command("describe [path]")
     .action((path) =>
-      w.unary("configuration.describe", () => (path ? { path } : {})),
+      w.invoke(configurationOperationIds.describe, () =>
+        path ? { path } : {},
+      ),
     );
   config
     .command("explain <path>")
-    .action((path) => w.unary("configuration.explain", () => ({ path })));
+    .action((path) =>
+      w.invoke(configurationOperationIds.explain, () => ({ path })),
+    );
   config
     .command("set [path] [json]")
     .option("--input <file|->", "read a JSON object with path and value")
     .action((path, value, opts) => {
       if (opts.input !== undefined && path === undefined) {
-        return w.unary("configuration.set", (max) =>
+        return w.invoke(configurationOperationIds.set, (max) =>
           readCliInput(opts.input, cwd, max),
         );
       }
@@ -320,7 +289,7 @@ function mountConfiguration<App>(w: CliWiring<App>) {
         path !== undefined &&
         value !== undefined
       ) {
-        return w.unary("configuration.set", () => ({
+        return w.invoke(configurationOperationIds.set, () => ({
           path,
           value: jsonCliInput(value),
         }));
@@ -331,8 +300,10 @@ function mountConfiguration<App>(w: CliWiring<App>) {
     });
   config
     .command("unset <path>")
-    .action((path) => w.unary("configuration.unset", () => ({ path })));
+    .action((path) =>
+      w.invoke(configurationOperationIds.unset, () => ({ path })),
+    );
   config
     .command("reload")
-    .action(() => w.unary("configuration.reload", () => ({})));
+    .action(() => w.invoke(configurationOperationIds.reload, () => ({})));
 }

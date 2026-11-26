@@ -260,13 +260,6 @@ export function grpcOperations<App>(
     };
   }
 
-  function kind(id: string) {
-    const operation = directory.get(id);
-    if (!operation)
-      throw transportError("transport.not_found", { operation: id });
-    return operation.kind ?? "unary";
-  }
-
   async function* streaming(
     rpc: HandlerContext,
     work: (call: Call) => AsyncIterable<Event>,
@@ -291,21 +284,20 @@ export function grpcOperations<App>(
       try {
         lease = tracker.take(rpc.signal);
         const call = await authorize(rpc, lease.signal, locale);
-        if (kind(request.operation) !== "unary") {
-          throw transportError("transport.invalid_request", {
-            operation: request.operation,
-            reason: "use_stream",
-          });
-        }
         const input = readInput(request, call.maxJsonBytes);
-        const output = await callOperation(
+        const outcome = callOperation(
           app,
           directory,
           request.operation,
           input,
           call,
+          { accepts: ["unary"] },
         );
-        return { result: encodeOutput(output, call.maxJsonBytes) };
+        if (outcome.kind !== "unary")
+          throw transportError("internal.unexpected");
+        return {
+          result: encodeOutput(await outcome.result, call.maxJsonBytes),
+        };
       } catch (error) {
         throw grpcError(error, rpc, locale, options);
       } finally {
@@ -314,24 +306,20 @@ export function grpcOperations<App>(
     },
     stream(request, rpc) {
       return streaming(rpc, async function* (call) {
-        const type = kind(request.operation);
-        if (type === "unary") {
-          throw transportError("transport.invalid_request", {
-            operation: request.operation,
-            reason: "use_invoke",
-          });
-        }
         const input = readInput(request, call.maxJsonBytes);
-        const output = callOperation(
+        const outcome = callOperation(
           app,
           directory,
           request.operation,
           input,
           call,
+          { accepts: ["stream", "binary-read"] },
         );
-        if (type === "stream")
-          yield* flowEvents(output as Flow<unknown>, call.maxJsonBytes);
-        else yield* download((await output) as BinaryReadResult, call);
+        if (outcome.kind === "stream")
+          yield* flowEvents(outcome.flow, call.maxJsonBytes);
+        else if (outcome.kind === "binary-read")
+          yield* download(await outcome.result, call);
+        else throw transportError("internal.unexpected");
       });
     },
     upload(frames, rpc) {
@@ -349,30 +337,26 @@ export function grpcOperations<App>(
             iterator,
             call.maxJsonBytes,
           );
-          const type = kind(operation);
-          if (type === "binary-read")
-            throw transportError("transport.invalid_request", {
-              reason: "use_stream",
-            });
           const payload = {
             ...metadata,
             body: receivedBytes(iterator, call.options.signal, close),
           };
-          const output = callOperation(
+          const outcome = callOperation(
             app,
             directory,
             operation,
             payload,
             call,
-            true,
+            { input: "binary", accepts: ["unary", "stream"] },
           );
-          if (type === "stream")
-            yield* flowEvents(output as Flow<unknown>, call.maxJsonBytes);
-          else
+          if (outcome.kind === "stream")
+            yield* flowEvents(outcome.flow, call.maxJsonBytes);
+          else if (outcome.kind === "unary")
             yield {
               case: "result",
-              value: encodeOutput(await output, call.maxJsonBytes),
+              value: encodeOutput(await outcome.result, call.maxJsonBytes),
             };
+          else throw transportError("internal.unexpected");
         } finally {
           await close();
         }

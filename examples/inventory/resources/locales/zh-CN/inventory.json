@@ -12,7 +12,6 @@
   "inventory.row_count": "数据记录数量不在配置允许范围内。",
   "inventory.invalid_row": "一条 CSV 记录包含无效字段。",
   "inventory.duplicate_sku": "同一份导入文件重复出现了相同 SKU。",
-  "inventory.invalid_cut": "提交位置格式无效，或该位置尚未提交。",
   "inventory.invalid_sku": "SKU 必须由 1 至 64 个大写字母、数字、点、下划线或连字符组成。",
   "inventory.source_not_found": "该来源不是本库存应用的导入材料。",
   "inventory.usage": "用法：main.ts ROOT init | import CSV | list [CUT] | history SKU [CUT] | export REF DESTINATION"

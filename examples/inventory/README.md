@@ -1,6 +1,6 @@
 # 库存登记应用直接消费 Themelios 公共包
 
-这个应用把一份 CSV 原件和其中的库存记录在同一笔提交中保存，并能读取指定提交位置的库存和历史。它使用 Runtime 的安装与会话、Storage 的事务与 CAS、Content 的材料准备与采用；业务 API 完全由应用自己定义。
+这个应用把一份 CSV 原件和其中的库存记录在同一笔提交中保存，并能读取指定提交位置的库存和历史。它使用 Application 的实例和材料接口，业务 API 由库存应用定义。
 
 ## 一次导入更新列出的 SKU，并保留来源
 
@@ -16,15 +16,13 @@ CSV 使用 UTF-8，可带 BOM，表头必须恰好为 `sku,name,quantity`，列�
 
 一次导入只有一个 `source_ref`，所有数据行共享这份完整 CSV 材料。`source_record` 是表头之后从 1 开始的数据记录序号；带引号的字段可包含换行，因此它不表示物理行号或字节偏移。
 
-## 文件捕获、验证与提交顺序固定
+## 文件验证与原子提交
 
 1. 读取本次根操作捕获的配置；按实际读取字节累计文件大小。默认上限为 2 MiB，允许在 1 byte–8 MiB 内配置。
 2. 捕获整份字节、严格解码 UTF-8、解析 CSV、检查全部记录。默认最多 5000 条，允许 1–100000 条；超过上限时解析立即退出。
-3. 把已经解析过的同一份字节交给 `materials.prepare`，保留提交的文件名与捕获时间。
-4. 在进入同步事务前检查取消；`database.write` 内调用一次 `prepared.adopt(tx)`，再写导入记录、结束旧版本、插入新版本。
-5. COMMIT 成功后返回 `{cut,sourceRef,rows}`，最后释放准备对象。旧引用与新库存行共同提交；任意业务写入失败时共同回滚。
+3. 将解析过的同一份字节传给 `materials.adopt`。应用在事务回调中写导入记录、结束旧版本、插入新版本，并返回 `{cut,sourceRef,rows}`。材料与库存行共同提交。任意业务写入失败时整次导入回滚。
 
-Content 的采用操作同时保留顶层材料，应用无需为每条库存行重复保留。该示例保留全部库存历史和源文件；未来增加历史清理时，应用先确定业务保留范围，再协调其来源根的释放。
+`inventory_imports.source_ref` 的外键持有源文件。该示例保留全部库存历史和导入记录。清理旧历史时，可以在回收事务中移除相应的业务行，Content 会按其余持有关系保留仍被使用的材料。
 
 `list(at)` 在一个读快照中选择截止位置，只返回该位置有效的版本。`history(sku,at)` 返回截至该位置已产生的全部版本；当某版本在更晚的提交才结束时，此次历史查询仍返回 `validTo:null`。提交位置用十进制字符串跨 API，SQL 内使用 bigint。
 
@@ -33,19 +31,17 @@ Content 的采用操作同时保留顶层材料，应用无需为每条库存行
 | 文件                                          | 内容                                                                |
 | --------------------------------------------- | ------------------------------------------------------------------- |
 | `main.ts`                                     | 应用设置、CSV 验证、ApplicationModule、业务操作与 HTTP/MCP/CLI 入口 |
-| `schema.sql`                                  | 库存导入及版本表，含数量范围、当前版本唯一性和来源约束              |
+| `inventory.ts`                                | 库存结构及约束，供 CSV 校验、业务表和公开操作使用                   |
 | `package.json`                                | 实际消费包及 CSV/Zod 依赖                                           |
 | `resources/locales/{zh-CN,en}/inventory.json` | 设置说明与应用错误词典                                              |
 
-`Database.init` 自建 Storage 的提交元数据表。应用通过 `@themelios/content/schema` 取得 `contentSchemaSql`，与自己的 SQL 一起初始化；这个应用没有时间域映射需求，因此无需加载 time 表。
-
-设置使用 `combineSettings(runtimeSettings, inventorySettings)`。两个业务字段分别是 `inventory.maxFileBytes` 和 `inventory.maxRows`，在下一次导入生效；Runtime 的日志、代理、语言和关闭设置继续由 Runtime 定义。Content 的固定导入上限设为示例允许的最大值 8 MiB，每次实际导入再应用本次配置的更小限制。
+库存通过 `createApplicationModule` 安装业务表，打开时使用同一实例的数据库和材料 API。平台负责初始化 Storage 和 Content 表。`combineSettings(applicationSettings, inventorySettings)` 组合平台设置及两个业务字段 `inventory.maxFileBytes` 和 `inventory.maxRows`。业务限制从下一次导入起生效，`inventory.maxFileBytes` 最大为 8 MiB。
 
 应用词典通过 `ApplicationModule.locales` 注册。业务操作使用 `@themelios/runtime/operations` 声明，由 `@themelios/transports` 将同一操作目录开放给 CLI、HTTP/SSE 与 MCP。
 
 ## 从仓库外目录安装发行包
 
-在 Themelios 仓库运行 `bun run pack:packages -- core runtime storage content transports`。将本示例目录复制到仓库外的空目录。
+在 Themelios 仓库运行 `bun run pack:packages -- application transports`。将本示例目录复制到仓库外的空目录。
 
 在 Themelios 仓库运行，指定消费目录：
 
@@ -131,7 +127,7 @@ CLI 和监听服务打开实例时持有实例锁。终止尚在读取的导入�
 | 将 maxFileBytes 降低后导入超限文件              | 本次配置生效，累计读取超过上限就停止，未建立正式材料                   |
 | 合法 CSV 的第二行在写入时违反 SQL 约束          | 前一行更新、材料采用、导入记录、提交位置共同回滚                       |
 | 再次导入同一份 CSV                              | 形成新的来源身份和新版本，CAS 字节可复用                               |
-| 查询尚未提交的 cut                              | 返回 inventory.invalid_cut，并给出当前最新 cut                         |
+| 查询尚未提交的 cut                              | Storage 返回 `storage.cut_invalid` 和当前最新提交位置                  |
 | 在只读 Session 中调用 importCsv                 | 返回 runtime.read_only，文件读取和 CAS 写入尚未开始                    |
 
 事务回滚用临时验证实例中的 SQLite 触发器制造真实写入失败：在 `inventory_versions` 上对 `NEW.sku='FAIL'` 执行 `RAISE(ABORT,'fixture')`，再导入包含正常行和 FAIL 行的合法 CSV。失败后检查全部正式表和 cut 与之前相同，再删除这个验证触发器。准备阶段已发布而未被正式采用的 CAS 字节可留待正常离线回收。

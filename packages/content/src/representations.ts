@@ -1,36 +1,36 @@
 import {
-  activeRepresentation,
   registerRepresentation,
+  representationKey,
 } from "./representation-index.js";
 import {
   artifactRefSchema,
+  representationPurposeSchema,
+  resultOutputNamesSchema,
+  selectionRangeKey,
   selectionSchema,
+  throwIfAborted,
   type ArtifactRef,
+  type CallOptions,
+  type SavedRepresentation,
   type Selection,
 } from "@themelios/core";
-import type { Cas, Database } from "@themelios/storage";
+import type { Database } from "@themelios/storage";
 import { z } from "zod";
 import { storedArtifact } from "./artifacts.js";
-import { selectOutput } from "./result-graph.js";
-import { parseManifest } from "./results.js";
-import { checkExtent, rangeKey, utf8Text } from "./selections.js";
-import { validated } from "./validation.js";
-
-export interface Representation {
-  source: Selection;
-  purpose: "model-input" | "retrieval-text";
-  recipe: string;
-  result: ArtifactRef;
-  outputs: readonly string[];
-}
+import type { Results } from "./results.js";
+import { checkExtent } from "./selections.js";
+import { jsonValue, validated } from "./validation.js";
 
 export interface Representations {
-  find(
+  /** Reads the saved result and output names for this reuse key, if registered. */
+  read(
     source: Selection,
     purpose: Representation["purpose"],
     recipe: string,
-  ): Representation | undefined;
-  set(representation: Representation): void;
+    options?: CallOptions,
+  ): Promise<SavedRepresentation | undefined>;
+  /** Indexes named outputs from a saved result with matching source provenance. */
+  set(representation: Representation, options?: CallOptions): Promise<void>;
   remove(
     source: Selection,
     purpose: Representation["purpose"],
@@ -38,19 +38,19 @@ export interface Representations {
   ): void;
 }
 
-const purposeSchema = z.enum(["model-input", "retrieval-text"]);
 const recipeSchema = z.string().min(1);
 const representationSchema = z.strictObject({
   source: selectionSchema,
-  purpose: purposeSchema,
+  purpose: representationPurposeSchema,
   recipe: recipeSchema,
   result: artifactRefSchema,
-  outputs: z.array(z.string().min(1)).min(1),
+  outputs: resultOutputNamesSchema,
 });
+export type Representation = z.infer<typeof representationSchema>;
 
 export function createRepresentations(
   database: Database,
-  cas: Cas,
+  results: Results,
 ): Representations {
   function lookup(
     rawSource: Representation["source"],
@@ -58,63 +58,47 @@ export function createRepresentations(
     recipe: string,
   ) {
     const source = validated(selectionSchema, rawSource, ["source"]);
-    validated(purposeSchema, purpose, ["purpose"]);
+    validated(representationPurposeSchema, purpose, ["purpose"]);
     validated(recipeSchema, recipe, ["recipe"]);
-    return { source, key: rangeKey(source.range) };
+    return { source, key: selectionRangeKey(source.range) };
   }
 
   return {
-    find(rawSource, purpose, recipe) {
+    async read(rawSource, purpose, recipe, options) {
+      throwIfAborted(options?.signal);
       const { source, key } = lookup(rawSource, purpose, recipe);
-      return database.read((tx) => {
+      const row = database.read((tx) => {
         checkExtent(storedArtifact(tx.sql, source.ref), source);
-        const row = tx.sql
+        return tx.sql
           .query<{ result_ref: ArtifactRef; outputs_json: string }>(
-            `SELECT result_ref, outputs_json FROM representations ${activeRepresentation}`,
+            `SELECT result_ref, outputs_json FROM representations ${representationKey}`,
           )
           .get(source.ref, key, purpose, recipe);
-        return row
-          ? {
-              source,
-              purpose,
-              recipe,
-              result: row.result_ref,
-              outputs: validated(
-                representationSchema.shape.outputs,
-                JSON.parse(row.outputs_json),
-                ["outputs"],
-              ),
-            }
-          : undefined;
       });
+      if (!row) return;
+      const outputs = validated(
+        resultOutputNamesSchema,
+        jsonValue(row.outputs_json, row.result_ref),
+        ["outputs"],
+      );
+      return { result: await results.read(row.result_ref, options), outputs };
     },
-    set(representation) {
-      const parsed = validated(representationSchema, representation);
-      const { source, result, outputs } = parsed;
-      const stored = database.read((tx) =>
-        storedArtifact(tx.sql, result, "result"),
+    async set(representation, options) {
+      database.requireWritable("representations.set");
+      const { result, ...entry } = validated(
+        representationSchema,
+        representation,
       );
-      const { result: saved } = parseManifest(
-        result,
-        utf8Text(cas.readBytesSync(stored.blob), stored),
-      );
-      const selections = outputs.map((output) =>
-        selectOutput(result, saved.files, output),
-      );
-      database.write((tx) => {
-        checkExtent(storedArtifact(tx.sql, source.ref), source);
-        storedArtifact(tx.sql, result, "result");
-        for (const selected of selections) storedArtifact(tx.sql, selected.ref);
-        registerRepresentation(tx, parsed);
-      });
+      const saved = await results.read(result, options);
+      throwIfAborted(options?.signal);
+      database.write((tx) => registerRepresentation(tx, saved, entry));
     },
     remove(rawSource, purpose, recipe) {
       const { source, key } = lookup(rawSource, purpose, recipe);
       database.write((tx) => {
         checkExtent(storedArtifact(tx.sql, source.ref), source);
         tx.sql.run(
-          `UPDATE representations SET retired_seq = ? ${activeRepresentation}`,
-          tx.seq,
+          `DELETE FROM representations ${representationKey}`,
           source.ref,
           key,
           purpose,

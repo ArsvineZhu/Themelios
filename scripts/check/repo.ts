@@ -52,8 +52,8 @@ try {
     (path) => path.startsWith("tests/") && path.endsWith(".test.ts"),
   );
   await buildPackages(names, true);
-  // The build already checks the workspace packages. The root project owns
-  // the remaining scripts and tests and can use the emitted declarations.
+  // The package build checks workspaces. The root project checks scripts,
+  // tests, and examples against the emitted declarations.
   if (!names.length)
     await run(
       [bun, "check", "--no-script", "--no-pretty", "-p", repoRoot],

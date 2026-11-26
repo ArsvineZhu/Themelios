@@ -21,7 +21,7 @@ import type { Diagnostics } from "@themelios/runtime/diagnostics";
 import type {
   ModelIdentity,
   ModelNotice,
-  ModelsOptions,
+  ModelDefaults,
   Usage,
 } from "./types.js";
 import {
@@ -38,7 +38,7 @@ export class ModelCalls {
   readonly attempts: number;
 
   constructor(
-    defaults: Required<NonNullable<ModelsOptions["defaults"]>>,
+    defaults: ModelDefaults,
     private readonly diagnostics?: Diagnostics,
   ) {
     this.#queue = new PQueue({ concurrency: defaults.concurrency });

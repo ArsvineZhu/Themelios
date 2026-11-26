@@ -4,11 +4,18 @@ import { appError, type Json, parseJson, parseValue } from "@themelios/core";
 import { Liquid, type FS, type Template } from "liquidjs";
 import PQueue from "p-queue";
 import writeFileAtomic from "write-file-atomic";
-import { z } from "zod";
-import { extentDescription } from "./delivery.js";
-import { rangeDescription } from "./media-input.js";
-import { modelNameSchema, sourceEntrySchema } from "./schema.js";
-import { inputVariables, taskInputJsonSchema } from "./task-definition.js";
+import {
+  deliveredDescription,
+  extentDescription,
+  rangeDescription,
+} from "./delivery.js";
+import {
+  modelNameSchema,
+  outputSchema,
+  promptRoleSchema,
+  sourceEntrySchema,
+} from "./schema.js";
+import { taskInputJsonSchema } from "./task-definition.js";
 import type {
   CompiledPrompt,
   PromptDescription,
@@ -16,7 +23,7 @@ import type {
   PromptFileInfo,
   Prompts,
   PromptTemplates,
-  SourceDirectory,
+  SourceEntries,
   TaskDefinition,
   TaskTemplates,
 } from "./types.js";
@@ -25,7 +32,7 @@ export * from "./types.js";
 export { sourceEntrySchema };
 
 type Role = PromptFileInfo["role"];
-const roles = ["system", "user"] as const;
+const roles = promptRoleSchema.options;
 type Task<I extends Json, O extends Json, RawI> = TaskDefinition<I, O, RawI>;
 type PromptOwner = { readonly id: string; readonly templates: TaskTemplates };
 
@@ -84,7 +91,7 @@ function templateVariables<I extends Json, O extends Json, RawI>(
   task: Task<I, O, RawI>,
   role: Role,
   variables: I,
-  sources: SourceDirectory,
+  sources: SourceEntries,
 ): Record<string, Json> {
   if (role === "system")
     return {
@@ -108,21 +115,7 @@ function templateVariables<I extends Json, O extends Json, RawI>(
       },
     });
   }
-  const entries = sources.entries.map(
-    ({ originalExtent, requestedRange, delivered, ...source }) => ({
-      ...source,
-      originalExtent: extentDescription(originalExtent),
-      requestedRange: rangeDescription(
-        requestedRange ? { range: requestedRange } : {},
-      ),
-      deliveredExtent: delivered.map(
-        ({ sourceRange, extent, mediaType, name }) =>
-          `${name ?? mediaType}: ${sourceRange?.kind === "timePoint" ? `frame at ${sourceRange.atMs} ms` : rangeDescription(sourceRange ? { range: sourceRange } : {})} (${mediaType}, ${extentDescription(extent)})`,
-      ),
-      coverage: { originalExtent, requestedRange, delivered },
-    }),
-  );
-  return { ...variables, sources: parseJson(entries) };
+  return { ...variables, sources: parseJson(sources.entries) };
 }
 
 export function createPrompts(
@@ -208,6 +201,9 @@ export function createPrompts(
       ownPropertyOnly: true,
       lenientIf: true,
     });
+    engine.registerFilter("extent", extentDescription);
+    engine.registerFilter("range", rangeDescription);
+    engine.registerFilter("delivery", deliveredDescription);
     engines.set(key, engine);
     return engine;
   }
@@ -328,9 +324,9 @@ export function createPrompts(
       files: resolveFileTemplates(task, snapshot).files,
       variablesSchema: taskInputJsonSchema(task.input),
       requirements: task.requirements,
-      ...(task.output === "text"
+      ...(task.output.kind === "text"
         ? {}
-        : { outputSchema: parseJson(z.toJSONSchema(task.output)) }),
+        : { outputSchema: outputSchema(task.output.schema) }),
     };
   }
 
@@ -401,7 +397,6 @@ export function createPrompts(
       return describe(task, await load(task));
     },
     async compile(task, variables, sources) {
-      const validatedVars = inputVariables(task, variables);
       const isInline = "inline" in task.templates && task.templates.inline;
       const loaded = isInline
         ? {
@@ -421,7 +416,7 @@ export function createPrompts(
                 resolved[file.role],
                 file,
                 task.id,
-                templateVariables(task, file.role, validatedVars, sources),
+                templateVariables(task, file.role, variables, sources),
                 loaded.engine,
               ),
             },

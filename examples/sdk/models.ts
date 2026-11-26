@@ -1,34 +1,68 @@
 import {
   createModels,
-  createPreparation,
   createPrompts,
-  createTasks,
   defineTask,
   describeTask,
+  presentTask,
+  textOutput,
   z,
 } from "@themelios/models";
+import { inlineText } from "@themelios/core";
 import type {
   Connection,
   ModelBinding,
   ModelOperation,
 } from "@themelios/models";
-import { createSourceDirectory } from "@themelios/models/tasks";
 const action = Bun.argv[2] ?? "all";
 const live = process.env.DEMO_LIVE === "1";
-const protocol = process.env.DEMO_PROTOCOL as
-  Connection["protocol"] | undefined;
-const baseURL = live ? process.env.DEMO_URL : "http://fixture.invalid/v1";
-const providerModel = live ? process.env.DEMO_MODEL : "fixture";
-if (!baseURL || !providerModel || (live && (!protocol || action === "all")))
-  throw Error(
-    "Set DEMO_PROTOCOL, DEMO_URL, DEMO_MODEL and choose generate, embed, rank or transcribe.",
-  );
-const endpoint = {
-  baseURL,
-  ...(!live || process.env.DEMO_KEY
-    ? { credential: "env:DEMO_KEY" as const }
-    : {}),
-};
+const routes = new Map<Connection["protocol"], readonly ModelOperation[]>([
+  ["openai-compatible", ["generate", "embed"]],
+  ["openai", ["generate", "embed", "transcribe"]],
+  ["google", ["generate", "embed"]],
+  ["cohere", ["rank"]],
+]);
+const requestedProtocol = process.env.DEMO_PROTOCOL;
+const protocol = [...routes.keys()].find(
+  (candidate) => candidate === requestedProtocol,
+);
+if (requestedProtocol !== undefined && protocol === undefined)
+  throw Error("Unknown demo protocol " + requestedProtocol);
+const selectedRoutes = [...routes].filter(
+  ([name]) => protocol === undefined || protocol === name,
+);
+if (
+  action !== "all" &&
+  !selectedRoutes.some(([, operations]) =>
+    operations.some((operation) => operation === action),
+  )
+)
+  throw Error("No selected protocol demonstrates " + action);
+
+function demoEndpoint() {
+  const credential = "env:DEMO_KEY" as const;
+  if (!live)
+    return {
+      baseURL: "http://fixture.invalid/v1",
+      providerModel: "fixture",
+      credential,
+    } as const;
+  const {
+    DEMO_URL: baseURL,
+    DEMO_MODEL: providerModel,
+    DEMO_KEY: key,
+  } = process.env;
+  if (!baseURL || !providerModel || !protocol || action === "all")
+    throw Error(
+      "Set DEMO_PROTOCOL, DEMO_URL, DEMO_MODEL and choose generate, embed, rank or transcribe.",
+    );
+  return {
+    baseURL,
+    providerModel,
+    ...(key ? { credential } : {}),
+  };
+}
+
+const { providerModel, ...endpoint } = demoEndpoint();
 const useFixture = live
   ? {}
   : {
@@ -38,8 +72,8 @@ const useFixture = live
 const text = (s: string) => ({ kind: "text" as const, text: s });
 const json = (body: unknown) => Response.json(body);
 const counters = new Map<string, number>();
-function chatFixture(init?: RequestInit): Response {
-  const raw = typeof init?.body === "string" ? JSON.parse(init.body) : {};
+async function chatFixture(request: Request): Promise<Response> {
+  const raw = await request.json();
   const message = raw.response_format ? '{"tea":"Earl Grey"}' : "Earl Grey";
   if (raw.stream) {
     const sequence = [
@@ -144,77 +178,72 @@ const fixtures = new Map(
   }),
 );
 
-async function fixtureFetch(input: string | URL | Request, init?: RequestInit) {
-  const path = new URL(input instanceof Request ? input.url : String(input))
-    .pathname;
+async function fixtureFetch(request: Request) {
+  const path = new URL(request.url).pathname;
   counters.set(path, (counters.get(path) ?? 0) + 1);
   const endpoint = path.slice(
     Math.max(path.lastIndexOf("/"), path.lastIndexOf(":")) + 1,
   );
   const fixture = fixtures.get(endpoint);
   if (!fixture) throw Error("No sample response for " + path);
-  return fixture(init);
+  return fixture(request);
 }
 
-const create = (
-  protocol: Connection["protocol"],
-  operation: ModelOperation,
-) => {
-  const binding: ModelBinding = {
-    connection: "gateway",
-    providerModel,
-    capabilities: {
-      operations: [operation],
-      needs: ["text", "speech", "visual"],
-      inputMimeTypes: ["text/plain", "audio/wav", "image/png"],
-      streaming: true,
-      structuredOutput: true,
-      transcriptionTimestamps: ["segment", "word"],
+const teaTaskId = "tea.name";
+const operationSettings: Partial<
+  Record<ModelOperation, Partial<ModelBinding>>
+> = {
+  embed: {
+    embeddingSpace: {
+      id: "tea-vectors",
+      dimensions: Number(process.env.DEMO_DIMENSIONS ?? 2),
+      metric: "cosine",
+      normalization: "l2",
+      purposes: ["query", "document"],
     },
-    ...(operation === "embed"
-      ? {
-          embeddingSpace: {
-            id: "tea-vectors",
-            dimensions: Number(process.env.DEMO_DIMENSIONS ?? 2),
-            metric: "cosine",
-            normalization: "l2",
-            purposes: ["query", "document"],
-          },
-        }
-      : {}),
-  };
-  const configured =
-    operation === "transcribe"
-      ? {
-          ...binding,
-          parameters: {
-            providerOptions: { openai: { responseFormat: "verbose_json" } },
-          },
-        }
-      : binding;
-  return createModels({
-    connections: { gateway: { protocol, ...endpoint } },
-    bindings: { tea: configured },
-    defaults: { maxAttempts: 1, timeoutMs: 30000, concurrency: 2 },
-    ...useFixture,
-  });
+  },
+  transcribe: {
+    parameters: {
+      providerOptions: { openai: { responseFormat: "verbose_json" } },
+    },
+  },
 };
-const routes: Record<Connection["protocol"], ModelOperation[]> = {
-  "openai-compatible": ["generate", "embed"],
-  openai: ["generate", "embed", "transcribe"],
-  google: ["generate", "embed"],
-  cohere: ["rank"],
-};
+
+function create(protocol: Connection["protocol"], operation: ModelOperation) {
+  return createModels(
+    {
+      connections: { gateway: { protocol, ...endpoint } },
+      bindings: {
+        tea: {
+          connection: "gateway",
+          providerModel,
+          capabilities: {
+            operations: [operation],
+            needs: ["text", "speech", "visual"],
+            inputMimeTypes: ["text/plain", "audio/wav", "image/png"],
+            streaming: true,
+            structuredOutput: true,
+            transcriptionTimestamps: ["segment", "word"],
+          },
+          ...operationSettings[operation],
+        },
+      },
+      maxAttempts: 1,
+      timeoutMs: 30000,
+      concurrency: 2,
+    },
+    useFixture,
+  );
+}
 const request = {
   model: "tea",
   messages: [{ role: "user" as const, parts: [text("Name one tea")] }],
-  output: "text" as const,
+  output: textOutput,
 };
-for (const [name, operations] of Object.entries(routes)) {
-  if (protocol && name !== protocol) continue;
+for (const [name, operations] of selectedRoutes) {
   for (const operation of operations) {
     if (action !== "all" && action !== operation) continue;
-    const models = create(name as Connection["protocol"], operation);
+    const models = create(name, operation);
     try {
       console.log(name, operation, models.describe("tea").providerModel);
       if (operation === "generate") {
@@ -235,21 +264,24 @@ for (const [name, operations] of Object.entries(routes)) {
             (
               await models.generate({
                 ...request,
-                output: z.strictObject({ tea: z.string() }),
+                output: {
+                  kind: "json",
+                  schema: z.strictObject({ tea: z.string() }),
+                },
               })
             ).value,
           );
           for await (const event of models.stream(request))
             console.log(event.type);
           const task = defineTask({
-            id: "tea.name",
+            id: teaTaskId,
             title: "Tea",
             purpose: "Read the note",
             input: z.strictObject({ language: z.string() }),
-            output: "text",
+            output: textOutput,
             requirements: {
               minMaterials: 1,
-              inputs: [{ mediaType: "text/plain", needs: ["text"] }],
+              inputs: [{ mediaType: "text/plain", accepts: [["text"]] }],
             },
             templates: {
               inline: true,
@@ -257,45 +289,17 @@ for (const [name, operations] of Object.entries(routes)) {
             },
           });
           const prompts = createPrompts();
-          const directory = createSourceDirectory([
-            {
-              key: "S1",
-              mediaType: "text/plain",
-              originalExtent: { kind: "text", bytes: 9 },
-              requestedRange: null,
-              delivered: [
-                {
-                  mediaType: "text/plain",
-                  sourceRange: null,
-                  extent: { kind: "text", bytes: 9 },
-                },
-              ],
-              role: "primary",
-            },
-          ]);
-          console.log("source", directory.has("S1"), directory.link("S1"));
-          console.log(
-            "task",
-            (await describeTask(task, prompts)).id,
-            "compiled",
-            (await prompts.compile(task, { language: "en" }, directory))
-              .messages.length,
-          );
-          const tasks = createTasks({
-            models,
-            prompts,
-            preparation: createPreparation(),
-            routes: { "tea.name": { model: "tea" } },
-          });
+          console.log("task", (await describeTask(task, prompts)).id);
+          const { tasks } = models;
           const input = {
             variables: { language: "en" },
-            materials: [{ text: "Earl Grey" }],
+            materials: [{ source: inlineText("Earl Grey") }],
           };
           console.log(
             "preview",
             (await tasks.preview(task, input)).sources.entries,
           );
-          console.log("runTask", (await models.runTask(task, input)).value);
+          console.log("run", presentTask(task, await tasks.run(task, input)));
           console.log(
             "many",
             (

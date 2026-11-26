@@ -7,6 +7,7 @@
     "inventory": "bun run main.ts"
   },
   "dependencies": {
+    "@themelios/application": "0.1.0",
     "@themelios/core": "0.1.0",
     "@themelios/runtime": "0.1.0",
     "@themelios/storage": "0.1.0",

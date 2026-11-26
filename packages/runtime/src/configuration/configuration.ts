@@ -1,10 +1,17 @@
 import { isDeepStrictEqual } from "node:util";
 import writeAtomic from "write-file-atomic";
-import { appError, AppError, errorCode, type Json } from "@themelios/core";
-import type {
-  Configuration,
-  ConfigurationChange,
-  SettingExplanation,
+import {
+  appError,
+  AppError,
+  errorCode,
+  formatJsonPointer,
+  type Json,
+} from "@themelios/core";
+import {
+  configurationFileLayers,
+  type Configuration,
+  type ConfigurationChange,
+  type SettingExplanation,
 } from "../settings.js";
 import type { ResourceUpdate } from "../resources.js";
 import {
@@ -17,7 +24,7 @@ import {
   readLayers,
 } from "./load.js";
 import { SettingFields } from "./definition.js";
-import { at, leafPaths, pathParts, pointer, setAt } from "./path.js";
+import { at, leafPaths, pathParts, setAt } from "./path.js";
 
 type ManagedEdit = { path: string; value: Json | undefined };
 
@@ -51,7 +58,7 @@ export class ActiveConfiguration<S> implements Configuration<S> {
   explain(path: string): SettingExplanation {
     const parts = pathParts(path);
     const field = this.fields.describeFields(path)[0];
-    if (!field || field.path !== pointer(parts))
+    if (!field || field.path !== formatJsonPointer(parts))
       throw appError("config.unknown_setting", { details: { path } });
     const value = (input: Json) =>
       field.metadata.sensitive && field.metadata.format !== "credential"
@@ -133,7 +140,7 @@ export class ActiveConfiguration<S> implements Configuration<S> {
     if (!deferred.length) return desired;
     const layers = structuredClone(desired.layers);
     // Keep each deferred setting's inputs and file provenance together.
-    for (const layer of ["installation", "instance", "managed"] as const) {
+    for (const layer of configurationFileLayers) {
       for (const parts of deferred) {
         setAt(layers[layer], parts, at(this.#active.layers[layer], parts));
       }
@@ -190,7 +197,7 @@ export class ActiveConfiguration<S> implements Configuration<S> {
         path.length &&
         !isDeepStrictEqual(at(asJson(a), path), at(asJson(b), path))
       )
-        result.add(pointer(path));
+        result.add(formatJsonPointer(path));
     }
     return [...result].sort();
   }

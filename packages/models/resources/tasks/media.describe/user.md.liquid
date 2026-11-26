@@ -5,7 +5,7 @@ Write in {{ language }}.
 {% for source in sources -%}
 # Source {{ source.key }}{% if source.name %} · {{ source.name }}{% endif %}
 Media type: {{ source.mediaType }}
-Original extent: {{ source.originalExtent }}
-Requested selection: {{ source.requestedRange }}
-Delivered: {% if source.deliveredExtent.size == 0 %}pending{% else %}{{ source.deliveredExtent | join: '; ' }}{% endif %}
+Original extent: {{ source.originalExtent | extent }}
+Requested selection: {{ source.requestedRange | range }}
+Delivered: {% for part in source.delivered %}{{ part | delivery }}{% unless forloop.last %}; {% endunless %}{% else %}pending{% endfor %}
 {% endfor -%}

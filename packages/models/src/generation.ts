@@ -30,6 +30,7 @@ import {
 import { countTokens, type ModelTelemetry } from "./model-telemetry.js";
 import {
   type BoundModel,
+  type OpenAiEndpoint,
   captureParts,
   checkOperation,
   checkParts,
@@ -38,32 +39,13 @@ import {
   sdkMessages,
 } from "./providers.js";
 import {
-  mimePatternSchema,
+  modelMessageSchema,
   modelParametersSchema,
   outputSchema,
   validateOutput,
 } from "./schema.js";
 
-const messagesSchema = z
-  .array(
-    z.strictObject({
-      role: z.enum(["system", "user", "assistant"]),
-      parts: z
-        .array(
-          z.discriminatedUnion("kind", [
-            z.strictObject({ kind: z.literal("text"), text: z.string() }),
-            z.strictObject({
-              kind: z.literal("media"),
-              mediaType: mimePatternSchema,
-              bytes: z.instanceof(Uint8Array),
-              name: z.string().optional(),
-            }),
-          ]),
-        )
-        .min(1),
-    }),
-  )
-  .min(1);
+const messagesSchema = z.array(modelMessageSchema).min(1);
 
 export function providerOutputSchema(schema: z.ZodType<Json>): Json {
   const result = outputSchema(schema);
@@ -92,13 +74,20 @@ export function validateGeneration<O extends Json>(
   checkOperation(model, "generate");
   if (streaming && !model.binding.capabilities.streaming)
     requireCapability(model, "streaming");
-  if (request.output !== "text" && !model.binding.capabilities.structuredOutput)
+  if (
+    request.output.kind === "json" &&
+    !model.binding.capabilities.structuredOutput
+  )
     requireCapability(model, "structuredOutput");
-  parseValue(messagesSchema, request.messages, "model.invalid_request");
+  const messages = parseValue(
+    messagesSchema,
+    request.messages,
+    "model.invalid_request",
+  );
   checkParts(
     model,
     "generate",
-    request.messages.flatMap((message) => message.parts),
+    messages.flatMap((message) => message.parts),
   );
   const { openaiApi, ...parameters } = requestParameters(
     model,
@@ -110,13 +99,13 @@ export function validateGeneration<O extends Json>(
           "model.invalid_request",
         ),
   );
-  const schema = request.output;
+  const format = { ...request.output };
   const sentSchema =
-    schema === "text" ? undefined : providerOutputSchema(schema);
-  return { parameters, schema, sentSchema, openaiApi };
+    format.kind === "text" ? undefined : providerOutputSchema(format.schema);
+  return { parameters, format, sentSchema, openaiApi, messages };
 }
 
-export function prepareGeneration<O extends Json>(
+function captureGeneration<O extends Json>(
   model: BoundModel,
   request: GenerateRequest<O>,
   streaming = false,
@@ -124,7 +113,7 @@ export function prepareGeneration<O extends Json>(
   const validated = validateGeneration(model, request, streaming);
   const captured = new WeakMap<Uint8Array, Uint8Array>();
   const messages = sdkMessages(
-    request.messages.map((message) => ({
+    validated.messages.map((message) => ({
       role: message.role,
       parts: captureParts(message.parts, captured),
     })),
@@ -137,7 +126,40 @@ export function prepareGeneration<O extends Json>(
   return { ...validated, messages, output };
 }
 
-type Generation<O extends Json> = ReturnType<typeof prepareGeneration<O>>;
+type Generation<O extends Json> = ReturnType<typeof captureGeneration<O>>;
+type ResolveLanguageModel = (api?: OpenAiEndpoint) => Promise<LanguageModel>;
+
+export function prepareGeneration<O extends Json>(
+  model: BoundModel,
+  request: GenerateRequest<O>,
+) {
+  const prepared = captureGeneration(model, request);
+  return (
+    call: CallScope,
+    attempts: number,
+    telemetry: ModelTelemetry,
+    client: ResolveLanguageModel,
+  ) =>
+    generate(prepared, call, model.identity, attempts, telemetry, () =>
+      client(prepared.openaiApi),
+    );
+}
+
+export function prepareStreamingGeneration<O extends Json>(
+  model: BoundModel,
+  request: GenerateRequest<O>,
+) {
+  const prepared = captureGeneration(model, request, true);
+  return (
+    call: CallScope,
+    attempts: number,
+    telemetry: ModelTelemetry,
+    client: ResolveLanguageModel,
+  ) =>
+    streamGeneration(prepared, call, model.identity, attempts, telemetry, () =>
+      client(prepared.openaiApi),
+    );
+}
 
 function finish<O extends Json>(
   prepared: Generation<O>,
@@ -163,9 +185,9 @@ function finish<O extends Json>(
       }),
     });
   }
-  if (prepared.schema === "text")
+  if (prepared.format.kind === "text")
     return {
-      value: text as O,
+      value: validateOutput(prepared.format.schema, text, model.binding),
       model,
       ...measured,
       notices: modelNotices(warnings),
@@ -180,7 +202,7 @@ function finish<O extends Json>(
     });
   }
   return {
-    value: validateOutput(prepared.schema, value, model.binding),
+    value: validateOutput(prepared.format.schema, value, model.binding),
     model,
     ...measured,
     notices: modelNotices(warnings),
@@ -203,7 +225,7 @@ function sdkGeneration<O extends Json>(
   };
 }
 
-export async function generate<O extends Json>(
+async function generate<O extends Json>(
   prepared: Generation<O>,
   call: CallScope,
   identity: ModelIdentity,
@@ -233,7 +255,7 @@ export async function generate<O extends Json>(
   });
 }
 
-export async function* streamGeneration<O extends Json>(
+async function* streamGeneration<O extends Json>(
   prepared: Generation<O>,
   call: CallScope,
   identity: ModelIdentity,
@@ -339,11 +361,14 @@ function captureSchema<O extends Json>(
 ): Json | undefined {
   if (
     !telemetry.capturesContent ||
-    prepared.schema === "text" ||
+    prepared.format.kind === "text" ||
     !prepared.sentSchema
   )
     return undefined;
-  return { task: outputSchema(prepared.schema), sent: prepared.sentSchema };
+  return {
+    task: outputSchema(prepared.format.schema),
+    sent: prepared.sentSchema,
+  };
 }
 
 type StreamResponse = {

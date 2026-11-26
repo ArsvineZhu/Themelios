@@ -1,4 +1,8 @@
-import { instantSchema } from "@themelios/core";
+import {
+  instanceConfigurationFiles,
+  instanceDirectories,
+  instanceManifestSchema,
+} from "@themelios/core";
 import { z } from "zod";
 import { join } from "node:path";
 import type { ConfigurationFiles } from "./configuration/load.js";
@@ -13,12 +17,7 @@ export const instancePathsSchema = z.strictObject({
   run: z.string(),
 });
 
-export const instanceInfoSchema = z.strictObject({
-  id: z.string().min(1),
-  name: z.string().min(1),
-  applicationId: z.string().min(1),
-  formatId: z.string().min(1),
-  createdAt: instantSchema,
+export const instanceInfoSchema = instanceManifestSchema.extend({
   paths: instancePathsSchema,
 });
 
@@ -28,12 +27,12 @@ export type InstanceInfo = z.infer<typeof instanceInfoSchema>;
 export function instancePaths(root: string): InstancePaths {
   return {
     root,
-    config: join(root, "config"),
-    state: join(root, "state"),
-    objects: join(root, "objects"),
-    cache: join(root, "cache"),
-    logs: join(root, "logs"),
-    run: join(root, "run"),
+    config: join(root, instanceDirectories.config),
+    state: join(root, instanceDirectories.state),
+    objects: join(root, instanceDirectories.objects),
+    cache: join(root, instanceDirectories.cache),
+    logs: join(root, instanceDirectories.logs),
+    run: join(root, instanceDirectories.run),
   };
 }
 
@@ -42,8 +41,12 @@ export function configurationFiles(
   paths: InstancePaths,
 ): ConfigurationFiles {
   return {
-    installation: join(configRoot, "installation.toml"),
-    instance: join(paths.config, "instance.toml"),
-    managed: join(paths.config, "managed.toml"),
+    installation: installationConfigurationPath(configRoot),
+    instance: join(paths.config, instanceConfigurationFiles.instance),
+    managed: join(paths.config, instanceConfigurationFiles.managed),
   };
+}
+
+export function installationConfigurationPath(configRoot: string): string {
+  return join(configRoot, instanceConfigurationFiles.installation);
 }

@@ -2,26 +2,22 @@ import { randomUUID } from "node:crypto";
 import {
   artifactRefSchema,
   blobRefSchema,
+  commitPointSchema,
   extentSchema,
   formatAgentArtifactRef,
   generateReadable60,
   instantSchema,
   jsonSchema,
+  mediaTypeSchema,
   parseAgentArtifactCode,
+  rangeSchema,
+  selectionRangeKey,
   selectionSchema,
   type AgentArtifactRef,
   type ArtifactRef,
-  type BlobRef,
-  type CommitPoint,
-  type Extent,
-  type Instant,
   type Selection,
 } from "@themelios/core";
-import type {
-  Database,
-  ReadTransaction,
-  WriteTransaction,
-} from "@themelios/storage";
+import type { ReadTransaction, WriteTransaction } from "@themelios/storage";
 import { z } from "zod";
 import { contentError, jsonValue, validated } from "./validation.js";
 
@@ -33,28 +29,28 @@ export const originSchema = z.strictObject({
 });
 export type Origin = z.infer<typeof originSchema>;
 
-export interface ArtifactInfo {
-  ref: ArtifactRef;
-  kind: "material" | "result";
-  mediaType: string;
-  sizeBytes: number;
-  name?: string;
-  extent: Extent;
-  origin?: Origin;
-  createdAt: Instant;
-  createdAtCut: CommitPoint;
-}
+export const artifactInfoSchema = z.strictObject({
+  ref: artifactRefSchema,
+  kind: z.enum(["material", "result"]),
+  mediaType: mediaTypeSchema,
+  sizeBytes: z.int().nonnegative(),
+  name: z.string().min(1).optional(),
+  extent: extentSchema,
+  origin: originSchema.optional(),
+  createdAt: instantSchema,
+  createdAtCut: commitPointSchema,
+});
+export type ArtifactInfo = z.infer<typeof artifactInfoSchema>;
 
-export interface ArtifactRow extends ArtifactInfo {
-  blob: BlobRef;
-}
+const artifactRowSchema = artifactInfoSchema.extend({ blob: blobRefSchema });
+export type ArtifactRow = z.infer<typeof artifactRowSchema>;
 
-export interface SourceLink {
-  relation: "input" | "file" | "representation-source";
-  selection: Selection;
-}
+export const sourceLinkSchema = z.strictObject({
+  relation: z.enum(["input", "file", "representation-source"]),
+  selection: selectionSchema,
+});
+export type SourceLink = z.infer<typeof sourceLinkSchema>;
 
-const size = z.int().nonnegative();
 interface StoredArtifact {
   ref: string;
   agent_code: string;
@@ -66,38 +62,45 @@ interface StoredArtifact {
   extent_json: string;
   origin_json: string | null;
   created_seq: bigint;
-  created_at: string;
+  recorded_at: string;
 }
 
-export type ArtifactDraft = Omit<ArtifactInfo, "createdAt" | "createdAtCut"> &
-  Pick<ArtifactRow, "blob">;
-export type StoredInfo = ArtifactInfo & Pick<ArtifactRow, "blob">;
+const artifactQuery = `
+  SELECT a.*, b.size_bytes, c.recorded_at FROM artifacts a
+  JOIN blobs b ON b.ref = a.blob_ref
+  JOIN commits c ON c.seq = a.created_seq
+`;
+
+export type ArtifactDraft = Omit<ArtifactRow, "createdAt" | "createdAtCut">;
 export type Query = ReadTransaction["sql"];
 
 export function newArtifactRef(): ArtifactRef {
   return `art_${randomUUID()}`;
 }
 
-function storedInfo(row: StoredArtifact): StoredInfo {
-  return {
-    ref: validated(artifactRefSchema, row.ref),
+function storedInfo(row: StoredArtifact): ArtifactRow {
+  return validated(artifactRowSchema, {
+    ref: row.ref,
     kind: row.kind,
     mediaType: row.media_type,
-    blob: validated(blobRefSchema, row.blob_ref),
-    sizeBytes: validated(size, Number(row.size_bytes)),
-    extent: validated(extentSchema, jsonValue(row.extent_json, row.ref)),
-    createdAt: validated(instantSchema, row.created_at),
+    blob: row.blob_ref,
+    sizeBytes: Number(row.size_bytes),
+    extent: jsonValue(row.extent_json, row.ref),
+    createdAt: row.recorded_at,
     createdAtCut: row.created_seq.toString(),
     ...(row.name === null ? {} : { name: row.name }),
     ...(row.origin_json === null
       ? {}
       : {
-          origin: validated(originSchema, jsonValue(row.origin_json, row.ref)),
+          origin: jsonValue(row.origin_json, row.ref),
         }),
-  };
+  });
 }
 
-export function publicInfo({ blob: _blob, ...info }: StoredInfo): ArtifactInfo {
+export function publicInfo({
+  blob: _blob,
+  ...info
+}: ArtifactRow): ArtifactInfo {
   return info;
 }
 
@@ -105,12 +108,10 @@ export function storedArtifact(
   sql: Query,
   ref: ArtifactRef,
   kind?: ArtifactInfo["kind"],
-): StoredInfo {
+): ArtifactRow {
   validated(artifactRefSchema, ref);
   const row = sql
-    .query<StoredArtifact, [ArtifactRef]>(
-      "SELECT a.*, b.size_bytes FROM artifacts a JOIN blobs b ON b.ref = a.blob_ref WHERE a.ref = ?",
-    )
+    .query<StoredArtifact, [ArtifactRef]>(artifactQuery + " WHERE a.ref = ?")
     .get(ref);
   if (!row || (kind && row.kind !== kind))
     throw contentError("content.not_found", { ref });
@@ -150,8 +151,17 @@ export function agentRefFor(sql: Query, ref: ArtifactRef): AgentArtifactRef {
   return formatAgentArtifactRef(row.agent_code);
 }
 
-export function decodeSelection(value: string, ref: ArtifactRef): Selection {
-  return validated(selectionSchema, jsonValue(value, ref));
+export function edgeRange({ range }: Selection): string | null {
+  return range === undefined ? null : selectionRangeKey(range);
+}
+
+export function edgeSelection(
+  ref: ArtifactRef,
+  range: string | null,
+): Selection {
+  return range === null
+    ? { ref }
+    : { ref, range: validated(rangeSchema, jsonValue(range, ref)) };
 }
 
 function isAgentCodeUniqueError(error: unknown): boolean {
@@ -178,8 +188,8 @@ export function addArtifact(
     try {
       const changes = tx.sql.run(
         `
-        INSERT INTO artifacts (ref, agent_code, kind, media_type, blob_ref, name, extent_json, origin_json, created_seq, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(ref) DO NOTHING
+        INSERT INTO artifacts (ref, agent_code, kind, media_type, blob_ref, name, extent_json, origin_json, created_seq)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(ref) DO NOTHING
       `,
         artifact.ref,
         agentCode,
@@ -190,7 +200,6 @@ export function addArtifact(
         extent,
         origin,
         tx.seq,
-        tx.recordedAt,
       ).changes;
       if (changes > 0) return true;
       break;
@@ -200,7 +209,7 @@ export function addArtifact(
     }
   }
   const row = tx.sql
-    .query<Omit<StoredArtifact, "size_bytes">>(
+    .query<Omit<StoredArtifact, "size_bytes" | "recorded_at">>(
       "SELECT * FROM artifacts WHERE ref = ?",
     )
     .get(artifact.ref)!;
@@ -223,7 +232,7 @@ export function retain(
   seq: bigint,
 ): void {
   sql.run(
-    "INSERT OR IGNORE INTO artifact_roots (artifact_ref, retained_seq) VALUES (?, ?)",
+    "INSERT OR IGNORE INTO artifact_retention (artifact_ref, retained_seq) VALUES (?, ?)",
     ref,
     seq,
   );
@@ -246,7 +255,7 @@ export function addEdges(
   edges: readonly SourceLink[],
 ): void {
   const insert = tx.sql.query(
-    "INSERT INTO artifact_edges (owner_ref, relation, ordinal, target_ref, selection_json) VALUES (?, ?, ?, ?, ?)",
+    "INSERT INTO artifact_edges (owner_ref, relation, ordinal, target_ref, range_json) VALUES (?, ?, ?, ?, ?)",
   );
   for (const edge of indexEdges(edges)) {
     insert.run(
@@ -254,12 +263,12 @@ export function addEdges(
       edge.relation,
       edge.ordinal,
       edge.selection.ref,
-      JSON.stringify(edge.selection),
+      edgeRange(edge.selection),
     );
   }
 }
 
-export function listArtifacts(
+export function listRetainedArtifacts(
   tx: ReadTransaction,
   cut: bigint,
   after: ArtifactRef | undefined,
@@ -268,32 +277,11 @@ export function listArtifacts(
   return tx.sql
     .query<StoredArtifact>(
       `
-    SELECT a.*, b.size_bytes FROM artifact_roots r JOIN artifacts a ON a.ref = r.artifact_ref
-    JOIN blobs b ON b.ref = a.blob_ref
+    ${artifactQuery} JOIN artifact_retention r ON r.artifact_ref = a.ref
     WHERE r.retained_seq <= ? AND (r.released_seq IS NULL OR r.released_seq > ?) AND r.artifact_ref > ?
     ORDER BY r.artifact_ref LIMIT ?
   `,
     )
     .all(cut, cut, after ?? "", limit)
     .map((row) => publicInfo(storedInfo(row)));
-}
-
-export function prepareAdoption<T>(
-  database: Database,
-  operation: string,
-  work: (tx: WriteTransaction) => T,
-) {
-  let closed = false;
-  return {
-    adopt(tx: WriteTransaction): T {
-      if (closed) throw contentError("content.prepared_closed", { operation });
-      if (!database.owns(tx))
-        throw contentError("content.transaction_mismatch", { operation });
-      return work(tx);
-    },
-    close(): Promise<void> {
-      closed = true;
-      return Promise.resolve();
-    },
-  };
 }

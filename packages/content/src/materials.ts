@@ -1,5 +1,6 @@
 import {
   artifactRefSchema,
+  commitPointSchema,
   openCall,
   selectionSchema,
   throwIfAborted,
@@ -12,19 +13,20 @@ import {
   resolveCut,
   type Cas,
   type Database,
+  type TransactionResult,
   type WriteTransaction,
 } from "@themelios/storage";
 import { z } from "zod";
 import {
   addArtifact,
   agentRefFor,
-  decodeSelection,
-  listArtifacts,
-  prepareAdoption,
+  edgeSelection,
+  listRetainedArtifacts,
   publicInfo,
   resolveArtifactRef,
   retain,
   storedArtifact,
+  type ArtifactDraft,
   type ArtifactInfo,
   type Query,
   type SourceLink,
@@ -39,11 +41,50 @@ import { rawBytes, selectionText, utf8Text } from "./selections.js";
 import { structureText, type TextBlock } from "./text-structure.js";
 import { contentError, validated } from "./validation.js";
 
-export interface PreparedMaterial {
+export interface CapturedMaterial {
   readonly info: Omit<ArtifactInfo, "createdAt" | "createdAtCut">;
-  adopt(tx: WriteTransaction): Selection;
-  close(): Promise<void>;
+  readonly signal: AbortSignal;
+  /** Opens the exact captured bytes during analysis. */
+  read(): Promise<ReadableStream<Uint8Array>>;
 }
+
+export type MaterialAttachment<R> = (
+  tx: WriteTransaction,
+  selection: Selection,
+) => TransactionResult<R>;
+
+export interface AnalyzedMaterialAdoption<A, R> {
+  analyze(material: CapturedMaterial): Promise<A>;
+  attach(
+    tx: WriteTransaction,
+    selection: Selection,
+    analysis: A,
+  ): TransactionResult<R>;
+}
+
+export const materialOperationIds = {
+  accept: "materials.accept",
+  adopt: "materials.adopt",
+  adoptAnalyzed: "materials.adoptAnalyzed",
+  inspect: "materials.inspect",
+  read: "materials.read",
+  text: "materials.text",
+  structure: "materials.structure",
+  sources: "materials.sources",
+  listRetained: "materials.listRetained",
+  retain: "materials.retain",
+  release: "materials.release",
+  export: "materials.export",
+} as const;
+
+export const sourceTraceOptionsSchema = z.strictObject({
+  depth: z.int().min(1).max(16).default(1),
+});
+export const retainedListOptionsSchema = z.strictObject({
+  at: commitPointSchema.optional(),
+  after: artifactRefSchema.optional(),
+  limit: z.int().min(1).max(1000).default(100),
+});
 
 export interface MaterialRead {
   readonly info: ArtifactInfo;
@@ -51,20 +92,34 @@ export interface MaterialRead {
 }
 
 export interface Materials {
-  prepare(input: AcceptInput, options?: CallOptions): Promise<PreparedMaterial>;
+  /** Captures a standalone material and adds it to the retention catalog. */
   accept(input: AcceptInput, options?: CallOptions): Promise<Selection>;
+  /** Captures input and attaches it to application rows in one commit. */
+  adopt<R>(
+    input: AcceptInput,
+    attach: MaterialAttachment<R>,
+    options?: CallOptions,
+  ): Promise<R>;
+  /** Reads the captured input for analysis before attaching it in one commit. */
+  adoptAnalyzed<A, R>(
+    input: AcceptInput,
+    adoption: AnalyzedMaterialAdoption<A, R>,
+    options?: CallOptions,
+  ): Promise<R>;
   inspect(ref: ArtifactRef): ArtifactInfo;
   resolve(refOrAgentRef: string): ArtifactRef;
   agentRef(ref: ArtifactRef): AgentArtifactRef;
   read(ref: ArtifactRef, options?: CallOptions): Promise<MaterialRead>;
   text(selection: Selection, options?: CallOptions): Promise<string>;
   structure(ref: ArtifactRef, options?: CallOptions): Promise<TextBlock[]>;
-  sources(ref: ArtifactRef, options?: { depth?: number }): SourceLink[];
-  list(options?: {
-    at?: string;
-    after?: ArtifactRef;
-    limit?: number;
-  }): ArtifactInfo[];
+  sources(
+    ref: ArtifactRef,
+    options?: z.input<typeof sourceTraceOptionsSchema>,
+  ): SourceLink[];
+  /** Enumerates the standalone retention catalog at the requested commit. */
+  listRetained(
+    options?: z.input<typeof retainedListOptionsSchema>,
+  ): ArtifactInfo[];
   retain(ref: ArtifactRef): void;
   release(ref: ArtifactRef): void;
   export(
@@ -80,27 +135,32 @@ function readSources(
   depth: number,
 ): SourceLink[] {
   const edges = sql.query<
-    { relation: SourceLink["relation"]; selection_json: string },
+    {
+      relation: SourceLink["relation"];
+      target_ref: ArtifactRef;
+      range_json: string | null;
+    },
     [ArtifactRef]
   >(
-    "SELECT relation, selection_json FROM artifact_edges WHERE owner_ref = ? ORDER BY relation, ordinal",
+    "SELECT relation, target_ref, range_json FROM artifact_edges WHERE owner_ref = ? ORDER BY relation, ordinal",
   );
-  const expanded = new Set<ArtifactRef>();
+  const queued = new Set([ref]);
+  const queue = [{ ref, level: 1 }];
   const found = new Map<string, SourceLink>();
-  let current = new Set([ref]);
-  for (let level = 0; level < depth && current.size > 0; level += 1) {
-    const next = new Set<ArtifactRef>();
-    for (const owner of current) {
-      expanded.add(owner);
-      for (const edge of edges.all(owner)) {
-        const selection = decodeSelection(edge.selection_json, owner);
-        const key = `${edge.relation}:${JSON.stringify(selection)}`;
-        if (!found.has(key))
-          found.set(key, { relation: edge.relation, selection });
-        if (!expanded.has(selection.ref)) next.add(selection.ref);
+  for (let index = 0; index < queue.length; index += 1) {
+    const current = queue[index]!;
+    for (const edge of edges.all(current.ref)) {
+      const key = `${edge.relation}:${edge.target_ref}:${edge.range_json ?? ""}`;
+      if (!found.has(key))
+        found.set(key, {
+          relation: edge.relation,
+          selection: edgeSelection(edge.target_ref, edge.range_json),
+        });
+      if (current.level < depth && !queued.has(edge.target_ref)) {
+        queued.add(edge.target_ref);
+        queue.push({ ref: edge.target_ref, level: current.level + 1 });
       }
     }
-    current = new Set([...next].filter((target) => !expanded.has(target)));
   }
   return [...found.values()];
 }
@@ -108,52 +168,82 @@ function readSources(
 export function createMaterials(
   database: Database,
   cas: Cas,
-  limits: ImportLimits,
+  importLimits: () => ImportLimits,
 ): Materials {
   const lookup = (ref: ArtifactRef) =>
     database.read((tx) => storedArtifact(tx.sql, ref));
 
-  async function prepareImport(
+  async function captureAndAttach<R>(
     input: AcceptInput,
     operation: string,
-    options?: CallOptions,
-  ): Promise<PreparedMaterial> {
+    options: CallOptions | undefined,
+    prepare: (
+      artifact: ArtifactDraft,
+      signal: AbortSignal,
+    ) => Promise<MaterialAttachment<R>>,
+  ): Promise<R> {
     database.requireWritable(operation);
     const scope = openCall(operation, options);
     try {
-      const captured = captureImport(
-        input,
-        Math.min(limits.maxInlineBytes, limits.maxImportBytes),
-      );
+      scope.throwIfAborted();
+      const limits = importLimits();
+      const captured = captureImport(input, limits.maxInlineBytes);
       const artifact = await importArtifact(cas, captured, limits, {
         signal: scope.signal,
       });
-      const { blob: _blob, ...info } = artifact;
-      return {
-        info: structuredClone(info),
-        ...prepareAdoption(database, operation, (tx) => {
-          if (addArtifact(tx, artifact)) retain(tx.sql, artifact.ref, tx.seq);
-          return { ref: artifact.ref };
-        }),
-      };
+      const attach = await prepare(artifact, scope.signal);
+      scope.throwIfAborted();
+      return database.write<R>((tx) => {
+        addArtifact(tx, artifact);
+        return attach(tx, { ref: artifact.ref });
+      });
     } finally {
       scope.close();
     }
   }
 
   return {
-    prepare(input, options) {
-      return prepareImport(input, "materials.prepare", options);
+    accept(input, options) {
+      return captureAndAttach(
+        input,
+        materialOperationIds.accept,
+        options,
+        async () => (tx, selection) => {
+          retain(tx.sql, selection.ref, tx.seq);
+          return selection;
+        },
+      );
     },
 
-    async accept(input, options) {
-      const prepared = await prepareImport(input, "materials.accept", options);
-      try {
-        throwIfAborted(options?.signal);
-        return database.write((tx) => prepared.adopt(tx));
-      } finally {
-        await prepared.close();
-      }
+    adopt(input, attach, options) {
+      return captureAndAttach(
+        input,
+        materialOperationIds.adopt,
+        options,
+        async () => attach,
+      );
+    },
+
+    adoptAnalyzed(input, { analyze, attach }, options) {
+      return captureAndAttach(
+        input,
+        materialOperationIds.adoptAnalyzed,
+        options,
+        async ({ blob, ...info }, callerSignal) => {
+          const reader = new AbortController();
+          const signal = AbortSignal.any([callerSignal, reader.signal]);
+          try {
+            const analysis = await analyze({
+              info: structuredClone(info),
+              signal,
+              read: () => cas.read(blob, { signal }),
+            });
+            return (tx, selection) => attach(tx, selection, analysis);
+          } finally {
+            reader.abort();
+          }
+        },
+      );
     },
 
     inspect(ref) {
@@ -178,7 +268,7 @@ export function createMaterials(
     },
 
     async text(selection, options) {
-      const scope = openCall("content.text", options);
+      const scope = openCall(materialOperationIds.text, options);
       try {
         scope.throwIfAborted();
         const selected = validated(selectionSchema, selection);
@@ -194,7 +284,7 @@ export function createMaterials(
     },
 
     async structure(ref, options) {
-      const scope = openCall("content.structure", options);
+      const scope = openCall(materialOperationIds.structure, options);
       try {
         scope.throwIfAborted();
         const artifact = lookup(ref);
@@ -217,19 +307,21 @@ export function createMaterials(
       }
     },
 
-    sources(ref, { depth = 1 } = {}) {
-      validated(z.int().min(1).max(16), depth, ["depth"]);
+    sources(ref, options = {}) {
+      const { depth } = validated(sourceTraceOptionsSchema, options);
       return database.read((tx) => {
         storedArtifact(tx.sql, ref);
         return readSources(tx.sql, ref, depth);
       });
     },
 
-    list({ at, after, limit = 100 } = {}) {
-      if (after !== undefined) validated(artifactRefSchema, after, ["after"]);
-      validated(z.int().min(1).max(1000), limit, ["limit"]);
+    listRetained(options = {}) {
+      const { at, after, limit } = validated(
+        retainedListOptionsSchema,
+        options,
+      );
       return database.read((tx) =>
-        listArtifacts(tx, resolveCut(tx, at), after, limit),
+        listRetainedArtifacts(tx, resolveCut(tx, at), after, limit),
       );
     },
 
@@ -244,7 +336,7 @@ export function createMaterials(
       database.write((tx) => {
         storedArtifact(tx.sql, ref);
         tx.sql.run(
-          "UPDATE artifact_roots SET released_seq = ? WHERE artifact_ref = ? AND released_seq IS NULL",
+          "UPDATE artifact_retention SET released_seq = ? WHERE artifact_ref = ? AND released_seq IS NULL",
           tx.seq,
           ref,
         );

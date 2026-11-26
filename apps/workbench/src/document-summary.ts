@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { sourceKeySchema } from "@themelios/core";
 import { defineTask, type OutputIssue } from "@themelios/models/tasks";
 
 const input = z
@@ -34,7 +35,7 @@ const section = z
       .min(1)
       .meta({ descriptionKey: "tasks.summary.fields.markdown" }),
     sourceKeys: z
-      .array(z.string().regex(/^S[1-9][0-9]*$/))
+      .array(sourceKeySchema)
       .min(1)
       .meta({ descriptionKey: "tasks.summary.fields.sourceKeys" }),
   })
@@ -69,16 +70,16 @@ export const documentSummary = defineTask<
   titleKey: "tasks.summary.title",
   purposeKey: "tasks.summary.purpose",
   input,
-  output,
+  output: { kind: "json", schema: output },
   requirements: {
     minMaterials: 1,
     inputs: [
-      { mediaType: "text/*", needs: ["text"] },
-      { mediaType: "application/json", needs: ["text"] },
-      { mediaType: "application/pdf", needs: ["text"] },
-      { mediaType: "image/*", needs: ["visual"] },
-      { mediaType: "audio/*", needs: ["speech"] },
-      { mediaType: "video/*", needs: ["visual"] },
+      { mediaType: "text/*", accepts: [["text"]] },
+      { mediaType: "application/json", accepts: [["text"]] },
+      { mediaType: "application/pdf", accepts: [["text"]] },
+      { mediaType: "image/*", accepts: [["visual"]] },
+      { mediaType: "audio/*", accepts: [["speech"]] },
+      { mediaType: "video/*", accepts: [["visual"]] },
     ],
   },
   templates: { system: "system.md.liquid", user: "user.md.liquid" },

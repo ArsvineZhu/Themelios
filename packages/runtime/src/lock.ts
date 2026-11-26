@@ -6,16 +6,25 @@ import { tryExclusiveFileLock } from "@themelios/core/files";
 import { z } from "zod";
 import type { InstancePaths } from "./paths.js";
 
-export type Endpoints = Readonly<Record<string, string>>;
-export type EndpointUpdate = Endpoints | ((current: Endpoints) => Endpoints);
+const endpointsSchema = z.record(z.string(), z.string());
+export type Endpoints = Readonly<z.output<typeof endpointsSchema>>;
+export interface EndpointPublication {
+  close(): Promise<void>;
+}
+
+interface Advertisement {
+  readonly address: string;
+  readonly publication?: symbol;
+}
 const ownerSchema = z.object({
   ownerPid: z.int().positive(),
   startedAt: z.iso.datetime(),
-  endpoints: z.record(z.string(), z.string()).optional(),
+  endpoints: endpointsSchema.optional(),
 });
 
 export interface OwnedLock {
-  endpoints(value: EndpointUpdate): Promise<void>;
+  setEndpoints(endpoints: Endpoints): Promise<void>;
+  publishEndpoints(endpoints: Endpoints): Promise<EndpointPublication>;
   close(): Promise<void>;
 }
 
@@ -52,7 +61,7 @@ export async function openInstanceLock(
   }
   const owner = { ownerPid: process.pid, startedAt: new Date().toISOString() };
   let writes = Promise.resolve();
-  let advertised: Endpoints = Object.freeze({});
+  let advertised: ReadonlyMap<string, Advertisement> = new Map();
   let closing: Promise<void> | undefined;
   const writeOwner = async (endpoints?: Endpoints) => {
     try {
@@ -80,21 +89,55 @@ export async function openInstanceLock(
     }
     throw error;
   }
+  function updateEndpoints(
+    update: (
+      current: ReadonlyMap<string, Advertisement>,
+    ) => ReadonlyMap<string, Advertisement>,
+  ): Promise<void> {
+    if (closing)
+      return Promise.reject(
+        appError("runtime.closed", { details: { state: "closing" } }),
+      );
+    const result = writes.then(async () => {
+      const next = update(advertised);
+      if (next === advertised) return;
+      const endpoints = Object.fromEntries(
+        Array.from(next, ([name, { address }]) => [name, address]),
+      );
+      await writeOwner(next.size ? endpoints : undefined);
+      advertised = next;
+    });
+    writes = result.catch(() => undefined);
+    return result;
+  }
   return {
-    endpoints(value) {
-      if (closing)
-        return Promise.reject(
-          appError("runtime.closed", { details: { state: "closing" } }),
-        );
-      const update = writes.then(async () => {
-        const next = Object.freeze({
-          ...(typeof value === "function" ? value(advertised) : value),
-        });
-        await writeOwner(Object.keys(next).length ? next : undefined);
-        advertised = next;
+    setEndpoints(endpoints) {
+      const entries = Object.entries(endpoints);
+      return updateEndpoints(
+        () => new Map(entries.map(([name, address]) => [name, { address }])),
+      );
+    },
+    async publishEndpoints(endpoints) {
+      const entries = Object.entries(endpoints);
+      const publication = Symbol();
+      await updateEndpoints((current) => {
+        const next = new Map(current);
+        for (const [name, address] of entries)
+          next.set(name, { address, publication });
+        return next;
       });
-      writes = update.catch(() => undefined);
-      return update;
+      return {
+        close() {
+          if (closing) return closing;
+          return updateEndpoints((current) => {
+            const next = new Map(current);
+            for (const [name, entry] of current) {
+              if (entry.publication === publication) next.delete(name);
+            }
+            return next.size === current.size ? current : next;
+          });
+        },
+      };
     },
     close() {
       closing ??= writes.then(async () => {

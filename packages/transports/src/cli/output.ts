@@ -8,6 +8,7 @@ import {
   throwIfAborted,
 } from "@themelios/core";
 import { publishNewFile, stageFile } from "@themelios/core/files";
+import { jsonText } from "../json.js";
 
 export async function ensureNewFile(destination: string): Promise<void> {
   try {
@@ -29,13 +30,12 @@ export async function ensureNewFile(destination: string): Promise<void> {
 
 export async function publishOutput(
   destination: string,
-  text: string,
   result: unknown,
 ): Promise<void> {
   try {
     await stageFile(
       dirname(destination),
-      (file) => file.writeFile(text, "utf8"),
+      (file) => file.writeFile(jsonText(result, Infinity) + "\n", "utf8"),
       (path) => publishNewFile(path, destination),
     );
   } catch (cause) {
@@ -59,11 +59,11 @@ export async function publishOutput(
 }
 
 export async function writeStdout(
-  data: string | Uint8Array,
+  text: string,
   signal?: AbortSignal,
 ): Promise<void> {
   throwIfAborted(signal);
-  if (!process.stdout.write(data))
+  if (!process.stdout.write(text))
     await once(process.stdout, "drain", signal ? { signal } : {});
 }
 
@@ -71,6 +71,9 @@ export async function streamStdout(
   stream: ReadableStream<Uint8Array>,
   signal?: AbortSignal,
 ): Promise<void> {
-  for await (const chunk of streamChunks(stream, signal))
-    await writeStdout(new Uint8Array(chunk), signal);
+  for await (const chunk of streamChunks(stream, signal)) {
+    if (!process.stdout.write(chunk)) {
+      await once(process.stdout, "drain", signal ? { signal } : {});
+    }
+  }
 }

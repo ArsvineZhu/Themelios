@@ -221,14 +221,7 @@ test("Preparation reuses stored representations without re-running the adapter",
     };
 
     const preparation = createPreparation({
-      store: {
-        inspect: (ref) => content.materials.inspect(ref),
-        read: (ref, call) => content.materials.read(ref, call),
-        text: (sel, call) => content.materials.text(sel, call),
-        readResult: (ref, call) => content.results.read(ref, call),
-        findRepresentation: (src, purpose, recipe) =>
-          content.representations.find(src, purpose, recipe),
-      },
+      store: content,
       adapters: [adapter],
     });
     const textOnlyModel: ModelCapabilities = {
@@ -240,10 +233,12 @@ test("Preparation reuses stored representations without re-running the adapter",
     };
     const requirements = {
       minMaterials: 1,
-      inputs: [{ mediaType: "application/x-custom", needs: ["text" as const] }],
+      inputs: [
+        { mediaType: "application/x-custom", accepts: [["text" as const]] },
+      ],
     };
 
-    const first = await preparation.forModel(
+    const first = await preparation.prepare(
       [{ source: sourceSelection }],
       requirements,
       textOnlyModel,
@@ -261,7 +256,7 @@ test("Preparation reuses stored representations without re-running the adapter",
       producer: { kind: "application", name: "summary" },
     });
 
-    const second = await preparation.forModel(
+    const second = await preparation.prepare(
       [{ source: sourceSelection }],
       requirements,
       textOnlyModel,
@@ -272,6 +267,149 @@ test("Preparation reuses stored representations without re-running the adapter",
       text: "cached extracted text",
     });
     expect(second.sources.entries[0]).toEqual(first.sources.entries[0]);
+  } finally {
+    await cas.close();
+    database.close();
+  }
+});
+
+test("A selected representation keeps its original source through planning and saving", async () => {
+  const work = join("temp", "work");
+  await mkdir(work, { recursive: true });
+  const dir = await mkdtemp(join(work, "prep-reuse-"));
+  const database = Database.init({
+    path: join(dir, "main.sqlite"),
+    formatId: "test.linked_representation",
+    schemaSql: contentSchemaSql,
+  });
+  const cas = await Cas.open(join(dir, "objects"));
+  const adapters = createPdfAdapters();
+  const content = createContent({ database, cas, adapters });
+  try {
+    const document = await PDFDocument.create();
+    document.addPage().drawText("First");
+    document.addPage().drawText("Second");
+    const original = await content.materials.accept({
+      bytes: await document.save(),
+      mediaType: "application/pdf",
+      name: "paper.pdf",
+    });
+    const replacement = await content.materials.accept({
+      bytes: new TextEncoder().encode("Recorded excerpt"),
+      mediaType: "text/plain",
+      name: "excerpt.txt",
+    });
+    const sourceRange = { kind: "pages", start: 2, end: 3 } as const;
+    const source = { ...original, range: sourceRange };
+    const excerpt = await content.results.save({
+      value: "Research note",
+      inputs: [{ source, delivered: [source], role: "primary" }],
+      files: [
+        {
+          name: "excerpt.txt",
+          material: replacement,
+          sourceIndices: [0],
+          coverage: { sourceRange, extent: { kind: "text", bytes: 16 } },
+        },
+      ],
+      producer: { kind: "application", name: "research.note" },
+    });
+    const preparation = createPreparation({
+      adapters,
+      store: content,
+    });
+    const requirements = {
+      minMaterials: 1,
+      inputs: [
+        { mediaType: "application/pdf", accepts: [["text"], ["visual"]] },
+      ],
+    } as const;
+    const model: ModelCapabilities = {
+      operations: ["generate"],
+      inputMimeTypes: ["text/plain", "image/png"],
+      needs: ["text", "visual"],
+      structuredOutput: false,
+      streaming: false,
+    };
+    const imageOptions = {
+      preparation: {
+        representations: [
+          { mediaType: "application/pdf", recipe: "pdf.render" },
+        ],
+      },
+    };
+    const imagePlan = await preparation.preview(
+      [{ source }],
+      requirements,
+      model,
+      imageOptions,
+    );
+    expect(imagePlan.pending).toEqual([
+      { sourceKey: "S1", action: "pdf.render", requiresModel: false },
+    ]);
+    expect(
+      (
+        await preparation.prepare(
+          [{ source }],
+          requirements,
+          model,
+          imageOptions,
+        )
+      ).sources.entries[0]!.delivered[0]!,
+    ).toMatchObject({
+      mediaType: "image/png",
+      sourceRange,
+    });
+
+    const representation = { result: excerpt.ref, output: "excerpt.txt" };
+    await expect(
+      preparation.prepare(
+        [
+          {
+            source: { ...original, range: { kind: "pages", start: 1, end: 2 } },
+            representation,
+          },
+        ],
+        requirements,
+        model,
+      ),
+    ).rejects.toMatchObject({ code: "content.representation_mismatch" });
+
+    const materials = [{ source, representation }];
+    const linked = await preparation.preview(materials, requirements, model);
+    expect(linked.readyParts[1]).toEqual({
+      kind: "text",
+      text: "Recorded excerpt",
+    });
+    const delivered = await preparation.prepare(materials, requirements, model);
+    const used = delivered.uses[0]!;
+    expect(used).toMatchObject({
+      key: "S1",
+      original: { mediaType: "application/pdf", name: "paper.pdf" },
+      source,
+      delivered: [representation],
+      coverage: {
+        originalExtent: { kind: "pages", pages: 2 },
+        requestedRange: sourceRange,
+        delivered: [
+          {
+            mediaType: "text/plain",
+            sourceRange,
+            extent: { kind: "text", bytes: 16 },
+          },
+        ],
+      },
+    });
+    expect(linked.sources.entries).toEqual(delivered.sources.entries);
+    const saved = await content.results.save({
+      value: "See S1",
+      inputs: delivered.uses,
+      files: [],
+      producer: { kind: "application", name: "research.review" },
+    });
+    expect((await content.results.read(saved.ref)).inputs).toEqual([
+      { ...used, source, delivered: [replacement] },
+    ]);
   } finally {
     await cas.close();
     database.close();

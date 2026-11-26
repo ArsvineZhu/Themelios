@@ -1,15 +1,15 @@
 import {
   completedSchema,
+  formatJsonPointer,
   type ArtifactRef,
   type Completed,
   type InlineMaterial,
   type Material,
-  type SavedFile,
   type SavedResult,
-  type Selection,
 } from "@themelios/core";
 import type { SourceLink } from "./artifacts.js";
-import { contentError, pointer, validated } from "./validation.js";
+import { checkInlineImportSize } from "./imports.js";
+import { contentError, validated } from "./validation.js";
 
 /** Snapshots mutable caller values before preparing bytes, keeping shared graph identities. */
 export function captureResult(
@@ -26,12 +26,7 @@ export function captureResult(
   ): InlineMaterial {
     const reused = inlines.get(original);
     if (reused) return reused;
-    if (material.bytes.byteLength > maxInlineBytes) {
-      throw contentError("storage.limit_exceeded", {
-        maxBytes: maxInlineBytes,
-        sizeBytes: material.bytes.byteLength,
-      });
-    }
+    checkInlineImportSize(material.bytes, maxInlineBytes);
     const inline = { ...material, bytes: new Uint8Array(material.bytes) };
     inlines.set(original, inline);
     return inline;
@@ -56,7 +51,9 @@ export function captureResult(
     path: (string | number)[],
   ): Completed {
     if (active.has(original))
-      throw contentError("content.result_cycle", { path: pointer(path) });
+      throw contentError("content.result_cycle", {
+        path: formatJsonPointer(path),
+      });
     const reused = captured.get(original);
     if (reused) return reused;
     active.add(original);
@@ -104,22 +101,6 @@ export function captureResult(
   return copyResult(root, []);
 }
 
-export function selectOutput(
-  ref: ArtifactRef,
-  files: Readonly<Record<string, SavedFile>>,
-  output = "$value",
-): Selection {
-  if (output === "$value")
-    return { ref, range: { kind: "json", pointer: "/value" } };
-  if (!Object.hasOwn(files, output)) {
-    throw contentError("content.output_not_found", {
-      output,
-      availableNames: ["$value", ...Object.keys(files)],
-    });
-  }
-  return files[output]!.material;
-}
-
 export function resultLinks(
   result: Pick<SavedResult, "inputs" | "files">,
   upstream: readonly ArtifactRef[],
@@ -131,7 +112,7 @@ export function resultLinks(
         relation: "input" as const,
       })),
     ),
-    ...Object.values(result.files).map((file) => ({
+    ...result.files.map((file) => ({
       selection: file.material,
       relation: "file" as const,
     })),

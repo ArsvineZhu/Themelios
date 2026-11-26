@@ -15,7 +15,7 @@ export {
   type InstallationOptions,
   type Instance,
 } from "./installation.js";
-export type { Endpoints } from "./lock.js";
+export type { EndpointPublication, Endpoints } from "./lock.js";
 export { createNetwork, type Network, type NetworkOptions } from "./network.js";
 export type { InstanceInfo, InstancePaths } from "./paths.js";
 export { createSecrets, type CredentialRef, type Secrets } from "./secrets.js";
@@ -28,7 +28,7 @@ export type {
 } from "./session.js";
 export {
   combineSettings,
-  extractRuntimeSettings,
+  defineSettings,
   runtimeSettings,
   type Configuration,
   type ConfigurationChange,
@@ -42,4 +42,5 @@ export {
   type SettingPath,
   type SettingScope,
   type SettingsDefinition,
+  type SettingsValues,
 } from "./settings.js";

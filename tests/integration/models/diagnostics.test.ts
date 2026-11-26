@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { mkdtemp, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { createModels } from "@themelios/models";
+import { createModels, textOutput } from "@themelios/models";
 import {
   Installation,
   runtimeSettings,
@@ -79,39 +79,44 @@ test("model diagnostics follow real attempts and keep secrets and media bytes ou
     async provision() {},
     async open(env: OpenEnvironment<RuntimeSettings>) {
       const models = env.own(
-        createModels({
-          connections: {
-            local: {
-              protocol: "openai-compatible",
-              baseURL: new URL("/v1", provider.url).href,
-              credential: "env:THEMELIOS_TEST_MODELS_SECRET",
-            },
-          },
-          bindings: {
-            demo: {
-              connection: "local",
-              providerModel: "local-model",
-              capabilities: {
-                operations: ["generate"],
-                inputMimeTypes: ["text/plain", "image/png"],
-                needs: ["text", "visual"],
-                structuredOutput: false,
-                streaming: false,
+        createModels(
+          {
+            connections: {
+              local: {
+                protocol: "openai-compatible",
+                baseURL: new URL("/v1", provider.url).href,
+                credential: "env:THEMELIOS_TEST_MODELS_SECRET",
               },
             },
+            bindings: {
+              demo: {
+                connection: "local",
+                providerModel: "local-model",
+                capabilities: {
+                  operations: ["generate"],
+                  inputMimeTypes: ["text/plain", "IMAGE/PNG"],
+                  needs: ["text", "visual"],
+                  structuredOutput: false,
+                  streaming: false,
+                },
+              },
+            },
+            maxAttempts: 2,
+            concurrency: 1,
           },
-          defaults: { maxAttempts: 2, concurrency: 1 },
-          fetch: env.network.fetch,
-          resolveCredential: env.secrets.resolve,
-          diagnostics: env.diagnostics,
-        }),
+          {
+            fetch: env.network.fetch,
+            resolveCredential: env.secrets.resolve,
+            diagnostics: env.diagnostics,
+          },
+        ),
       );
       return (withImage: boolean) =>
         env.execution.run("test.generate", (signal) =>
           models.generate(
             {
               model: "demo",
-              output: "text",
+              output: textOutput,
               messages: [
                 {
                   role: "user",
@@ -121,7 +126,7 @@ test("model diagnostics follow real attempts and keep secrets and media bytes ou
                       ? [
                           {
                             kind: "media" as const,
-                            mediaType: "image/png",
+                            mediaType: "Image/PNG",
                             bytes: binary,
                           },
                         ]

@@ -1,4 +1,9 @@
-import { appError, type Json } from "@themelios/core";
+import {
+  appError,
+  formatJsonPointer,
+  parseJsonPointer,
+  type Json,
+} from "@themelios/core";
 
 export type SettingValues = Record<string, Json>;
 const unsafe = new Set(["__proto__", "constructor", "prototype"]);
@@ -9,23 +14,9 @@ export const isObject = (value: unknown): value is SettingValues =>
   (Object.getPrototypeOf(value) === Object.prototype ||
     Object.getPrototypeOf(value) === null);
 
-export function pointer(parts: readonly string[]): string {
-  return parts
-    .map((key) => "/" + key.replaceAll("~", "~0").replaceAll("/", "~1"))
-    .join("");
-}
-
 export function pathParts(path: string): string[] {
-  const parts = path.startsWith("/")
-    ? path
-        .slice(1)
-        .split("/")
-        .map((key) => key.replace(/~1/g, "/").replace(/~0/g, "~"))
-    : path.split(".");
-  if (
-    parts.some((key) => !key || unsafe.has(key)) ||
-    (path.startsWith("/") && /~(?![01])/.test(path))
-  ) {
+  const parts = path.startsWith("/") ? parseJsonPointer(path) : path.split(".");
+  if (!parts || parts.some((key) => !key || unsafe.has(key))) {
     throw appError("config.unknown_setting", { details: { path } });
   }
   return parts;
@@ -106,7 +97,7 @@ export function assertValues(
       if (unsafe.has(key))
         throw appError("config.unknown_setting", {
           details: {
-            path: pointer([...path, key]),
+            path: formatJsonPointer([...path, key]),
           },
         });
       assertValues(child, [...path, key]);
@@ -122,7 +113,9 @@ export function assertValues(
   )) {
     throw appError("config.invalid", {
       details: {
-        issues: [{ path: pointer(path), messageKey: "config.invalid_value" }],
+        issues: [
+          { path: formatJsonPointer(path), messageKey: "config.invalid_value" },
+        ],
       },
     });
   }

@@ -19,6 +19,18 @@ export interface MediaAdapterOptions {
   readonly maxPixels?: number | undefined;
 }
 
+const millisecondsPerSecond = 1_000;
+const timestampDecimals = 6;
+export const ffmpegTicksPerSecond = 10 ** timestampDecimals;
+export const ffmpegTicksPerMillisecond =
+  ffmpegTicksPerSecond / millisecondsPerSecond;
+export function ffmpegTime(milliseconds: number): string {
+  return (milliseconds / millisecondsPerSecond).toFixed(timestampDecimals);
+}
+
+const converter = "ffmpeg";
+const probe = "ffprobe";
+
 const demuxers =
   "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,mp3,aac,ogg,wav,flac,avi,mpeg,mpegts,aiff,asf,amr,ac3,eac3";
 const localMedia = [
@@ -40,12 +52,21 @@ const metadata = z.object({
 });
 
 export function mediaTools(options: MediaAdapterOptions) {
-  const ffmpeg = Bun.which(options.ffmpeg ?? "ffmpeg");
+  const ffmpeg = Bun.which(options.ffmpeg ?? converter);
   const paths = [ffmpeg && dirname(ffmpeg), process.env.PATH].filter(Boolean);
-  const ffprobe = Bun.which(options.ffprobe ?? "ffprobe", {
+  const ffprobe = Bun.which(options.ffprobe ?? probe, {
     PATH: paths.join(delimiter),
   });
   return { ffmpeg, ffprobe };
+}
+
+export function missingMediaTools(
+  tools: ReturnType<typeof mediaTools>,
+): string[] {
+  return [
+    ...(!tools.ffmpeg ? [converter] : []),
+    ...(!tools.ffprobe ? [probe] : []),
+  ];
 }
 
 /** Identifies the resolved binaries, including replacement at an unchanged path. */
@@ -87,10 +108,9 @@ async function run(
 }
 
 export interface MediaWorkspace {
-  readonly input: string;
   readonly directory: string;
-  readonly maxBytes: number;
-  durationMs(path: string): Promise<number | undefined>;
+  durationMs(path?: string): Promise<number | undefined>;
+  readOutput(path: string): Promise<Uint8Array>;
   convert(
     inputFlags: readonly string[],
     outputFlags: readonly string[],
@@ -122,10 +142,9 @@ export async function withMedia<T>(
     const source = join(directory, "source");
     await Bun.write(source, data);
     return await work({
-      input: source,
       directory,
-      maxBytes,
-      async durationMs(path) {
+      readOutput: (path) => outputBytes(path, maxBytes),
+      async durationMs(path = source) {
         const output = await run(
           ffprobe,
           [
@@ -142,7 +161,8 @@ export async function withMedia<T>(
         const { duration } = metadata.parse(value).format;
         return duration === undefined
           ? undefined
-          : Math.round(duration * 1_000_000) / 1000;
+          : Math.round(duration * ffmpegTicksPerSecond) /
+              ffmpegTicksPerMillisecond;
       },
       async convert(inputFlags, outputFlags, path) {
         await run(
@@ -181,7 +201,7 @@ export async function withMedia<T>(
   }
 }
 
-export async function outputBytes(path: string, maxBytes: number) {
+async function outputBytes(path: string, maxBytes: number) {
   const file = Bun.file(path);
   if (!(await file.exists()) || file.size === 0) {
     throw appError("content.range_invalid", {

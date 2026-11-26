@@ -46,6 +46,11 @@ export interface WriteTransaction {
   registerBlob(blob: BlobInfo): BlobRef;
 }
 
+export type TransactionMode = "read" | "write";
+
+/** The synchronous return value of a transaction callback. */
+export type TransactionResult<T> = T & Exclude<T, PromiseLike<unknown>>;
+
 export function registerBlob(
   sql: WriteTransaction["sql"],
   blob: BlobInfo,
@@ -142,7 +147,7 @@ export function borrowSql(
   };
 }
 
-export function synchronousResult<T>(value: T, operation: "read" | "write"): T {
+export function synchronousResult<T>(value: T, operation: TransactionMode): T {
   if (
     ((typeof value === "object" && value !== null) ||
       typeof value === "function") &&
@@ -154,6 +159,14 @@ export function synchronousResult<T>(value: T, operation: "read" | "write"): T {
     throw appError("storage.async_transaction", { details: { operation } });
   }
   return value;
+}
+
+function historyFloor(sql: ReadSql): bigint {
+  return sql
+    .query<{ history_floor: bigint }>(
+      "SELECT history_floor FROM store_meta WHERE singleton = 1",
+    )
+    .get()!.history_floor;
 }
 
 export function resolveCut(tx: ReadTransaction, at?: CommitPoint): bigint {
@@ -168,11 +181,7 @@ export function resolveCut(tx: ReadTransaction, at?: CommitPoint): bigint {
     });
   }
   const requested = BigInt(parsed.data);
-  const { history_floor: floor } = tx.sql
-    .query<{ history_floor: bigint }>(
-      "SELECT history_floor FROM store_meta WHERE singleton = 1",
-    )
-    .get()!;
+  const floor = historyFloor(tx.sql);
   if (requested < floor) {
     throw appError("storage.history_unavailable", {
       details: {
@@ -182,4 +191,15 @@ export function resolveCut(tx: ReadTransaction, at?: CommitPoint): bigint {
     });
   }
   return requested;
+}
+
+/** Advances retention to a previously committed cut within the collection transaction. */
+export function advanceHistory(tx: WriteTransaction, at?: CommitPoint): bigint {
+  if (at === undefined) return historyFloor(tx.sql);
+  const floor = resolveCut({ sql: tx.sql, cut: tx.seq - 1n }, at);
+  tx.sql.run(
+    "UPDATE store_meta SET history_floor = ? WHERE singleton = 1",
+    floor,
+  );
+  return floor;
 }

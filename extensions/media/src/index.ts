@@ -1,6 +1,9 @@
 import { join } from "node:path";
 import {
   appError,
+  defaultImagePixels,
+  defaultMediaInputBytes,
+  mediaRangeFits,
   parseValue,
   rangeSchema,
   type MediaInput,
@@ -11,9 +14,12 @@ import {
 } from "@themelios/core";
 import { z } from "zod";
 import {
+  ffmpegTicksPerMillisecond,
+  ffmpegTicksPerSecond,
+  ffmpegTime,
   mediaTools,
   mediaToolsIdentity,
-  outputBytes,
+  missingMediaTools,
   withMedia,
   type MediaAdapterOptions,
   type MediaWorkspace,
@@ -22,9 +28,10 @@ import {
 export type { MediaAdapterOptions } from "./ffmpeg.js";
 
 const clipParameters = z.strictObject({});
+const frameDimension = z.int().positive().default(1600);
 const frameParameters = z.strictObject({
-  maxWidth: z.int().positive().default(1600),
-  maxHeight: z.int().positive().default(1600),
+  maxWidth: frameDimension,
+  maxHeight: frameDimension,
 });
 const audio = "media.audio";
 const video = "video.clip";
@@ -32,25 +39,31 @@ const frame = "video.frame";
 const version = "1";
 const videoMime = ["video/*"];
 const audioMime = ["audio/*", ...videoMime];
-
-function ffmpegTime(ms: number) {
-  return (ms / 1000).toFixed(6);
-}
+const framePrefix = "frame-";
+const pngSuffix = ".png";
 
 type TimeRange = Extract<NonNullable<MediaInput["range"]>, { kind: "time" }>;
-type Cut = { start: number; end: number };
+type Cut = Readonly<Pick<TimeRange, "startMs" | "endMs">>;
 
-function timestampCut(range: TimeRange, durationMs = Infinity): Cut {
-  const start = Math.ceil(range.startMs * 1000) / 1000;
-  const end = Math.floor(range.endMs * 1000) / 1000;
-  if (start >= end || range.endMs > durationMs)
+function timestampCut(range: TimeRange, durationMs?: number): Cut {
+  const startMs =
+    Math.ceil(range.startMs * ffmpegTicksPerMillisecond) /
+    ffmpegTicksPerMillisecond;
+  const endMs =
+    Math.floor(range.endMs * ffmpegTicksPerMillisecond) /
+    ffmpegTicksPerMillisecond;
+  if (
+    startMs >= endMs ||
+    (durationMs !== undefined &&
+      !mediaRangeFits(range, { kind: "time", durationMs }))
+  )
     throw appError("content.range_invalid", {
       details: {
         range,
-        durationMs: Number.isFinite(durationMs) ? durationMs : null,
+        durationMs: durationMs ?? null,
       },
     });
-  return { start, end };
+  return { startMs, endMs };
 }
 
 async function selection(
@@ -66,9 +79,7 @@ async function selection(
   const { extent } = input.info;
   return timestampCut(
     parsed.data,
-    extent.kind === "time"
-      ? extent.durationMs
-      : await work.durationMs(work.input),
+    extent.kind === "time" ? extent.durationMs : await work.durationMs(),
   );
 }
 
@@ -135,14 +146,14 @@ async function clip(
   const bounds = selected
     ? [
         "-ss",
-        ffmpegTime(selected.start),
+        ffmpegTime(selected.startMs),
         "-t",
-        ffmpegTime(selected.end - selected.start),
+        ffmpegTime(selected.endMs - selected.startMs),
       ]
     : [];
   // Decode leading packets so codecs with a bit reservoir can reconstruct the start of the cut.
   await work.convert([], [...flags, ...bounds], path);
-  const bytes = await outputBytes(path, work.maxBytes);
+  const bytes = await work.readOutput(path);
   const durationMs = await work.durationMs(path);
   if (!durationMs)
     throw appError("content.range_invalid", {
@@ -151,8 +162,8 @@ async function clip(
   const sourceRange = selected
     ? {
         kind: "time" as const,
-        startMs: selected.start,
-        endMs: Math.min(selected.end, selected.start + durationMs),
+        startMs: selected.startMs,
+        endMs: Math.min(selected.endMs, selected.startMs + durationMs),
       }
     : null;
   return representation(
@@ -165,20 +176,22 @@ async function clip(
 
 async function inspectFrame(
   work: MediaWorkspace,
-  { start, end }: Cut = { start: 0, end: Infinity },
+  { startMs, endMs }: Cut = { startMs: 0, endMs: Infinity },
 ) {
   const [entry = ""] = await Array.fromAsync(
-    new Bun.Glob("frame-*.png").scan({ cwd: work.directory }),
+    new Bun.Glob(framePrefix + "*" + pngSuffix).scan({ cwd: work.directory }),
   );
-  const atMs = Number.parseInt(entry.slice(6, -4), 10) / 1000;
-  if (!(atMs >= start && atMs < end)) {
+  const atMs =
+    Number.parseInt(entry.slice(framePrefix.length, -pngSuffix.length), 10) /
+    ffmpegTicksPerMillisecond;
+  if (!(atMs >= startMs && atMs < endMs)) {
     throw appError("content.range_invalid", {
       details: { reason: "No decoded frame in the selected time range" },
     });
   }
   return {
     atMs,
-    bytes: await outputBytes(join(work.directory, entry), work.maxBytes),
+    bytes: await work.readOutput(join(work.directory, entry)),
   };
 }
 
@@ -190,7 +203,7 @@ async function extractFrame(
 ) {
   const selected = await selection(input, work);
   const trim = selected
-    ? `trim=start=${ffmpegTime(selected.start)}:end=${ffmpegTime(selected.end)},`
+    ? `trim=start=${ffmpegTime(selected.startMs)}:end=${ffmpegTime(selected.endMs)},`
     : "";
   const { maxWidth, maxHeight } = settings;
   const scale = `scale=w='min(iw,${maxWidth})':h='min(ih,${maxHeight})':force_original_aspect_ratio=decrease`;
@@ -206,11 +219,11 @@ async function extractFrame(
       "-fps_mode",
       "passthrough",
       "-enc_time_base",
-      "1:1000000",
+      "1:" + ffmpegTicksPerSecond,
       "-frame_pts",
       "1",
     ],
-    join(work.directory, "frame-%d.png"),
+    join(work.directory, framePrefix + "%d" + pngSuffix),
   );
   const { atMs, bytes } = await inspectFrame(work, selected);
   // The PNG IHDR dimensions describe the actual encoded frame after scaling.
@@ -242,16 +255,13 @@ export function createMediaAdapters(
   options: MediaAdapterOptions = {},
 ): readonly RepresentationAdapter[] {
   const tools = mediaTools(options);
-  const maxBytes = options.maxBytes ?? 67_108_864;
-  const maxPixels = options.maxPixels ?? 40_000_000;
-  const missing = [
-    !tools.ffmpeg && "ffmpeg",
-    !tools.ffprobe && "ffprobe",
-  ].filter((name): name is string => Boolean(name));
+  const maxBytes = options.maxBytes ?? defaultMediaInputBytes;
+  const maxPixels = options.maxPixels ?? defaultImagePixels;
+  const missing = missingMediaTools(tools);
   const available = async () => ({ available: missing.length === 0, missing });
   const probe: RepresentationAdapter["probe"] = (input, call) =>
     withMedia(tools, input, maxBytes, call, async (work) => {
-      const durationMs = await work.durationMs(work.input);
+      const durationMs = await work.durationMs();
       return durationMs === undefined
         ? { kind: "unknown" }
         : { kind: "time", durationMs };

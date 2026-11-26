@@ -11,6 +11,7 @@ import {
   Cas,
   collectStorage,
   Database,
+  databaseFileName,
   resolveCut,
   restoreStorage,
   verifyStorage,
@@ -24,7 +25,7 @@ const app = {
   settings: runtimeSettings,
   async provision({ paths }: { paths: { state: string } }) {
     Database.init({
-      path: join(paths.state, "main.sqlite"),
+      path: join(paths.state, databaseFileName),
       formatId,
       schemaSql: `
         CREATE TABLE stock_versions (
@@ -45,9 +46,9 @@ const ledger = installation.instance("ledger");
 const backup = join(root, "backup");
 await ledger.init();
 
-await withOfflineInstance(ledger, async ({ id, paths }) => {
+await withOfflineInstance(ledger, async ({ paths }) => {
   const database = Database.open({
-    path: join(paths.state, "main.sqlite"),
+    path: join(paths.state, databaseFileName),
     formatId,
   });
   const cas = await Cas.open(paths.objects);
@@ -96,12 +97,7 @@ await withOfflineInstance(ledger, async ({ id, paths }) => {
     );
     const verified = await verifyStorage(database, cas);
     const saved = await backupStorage({
-      database,
-      cas,
       destination: backup,
-      applicationId: app.id,
-      instanceId: id,
-      formatId,
       instanceRoot: paths.root,
       paths: ["config/warehouse.toml"],
     });
@@ -118,7 +114,7 @@ await withOfflineInstance(
   installation.external(destination),
   async ({ paths }) => {
     const database = Database.open({
-      path: join(paths.state, "main.sqlite"),
+      path: join(paths.state, databaseFileName),
       formatId,
       readonly: true,
     });

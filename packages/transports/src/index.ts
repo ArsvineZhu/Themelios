@@ -22,8 +22,14 @@ export { defaultMaxJsonBytes, jsonText } from "./json.js";
 export { createHttpHandler } from "./http/server.js";
 export { createMcpEndpoint, serveMcpStdio } from "./mcp/server.js";
 export {
+  cliServeMode,
   runApplicationCli,
   type CliOptions,
+  type CliServeMode,
   type OfflineRequest,
 } from "./cli/index.js";
-export { serveApplication, type ApplicationListeners } from "./host.js";
+export {
+  httpIdleTimeoutSecondsSchema,
+  serveApplication,
+  type ApplicationListeners,
+} from "./host.js";

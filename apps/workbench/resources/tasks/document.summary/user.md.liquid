@@ -9,9 +9,9 @@
 ## {{ source.key }}{% if source.name %} · {{ source.name }}{% endif %}
 角色：{{ source.role }}
 媒体类型：{{ source.mediaType }}
-原件范围：{{ source.originalExtent }}
-请求选区：{{ source.requestedRange }}
-实际交付：{% if source.deliveredExtent.size == 0 %}准备中{% else %}{{ source.deliveredExtent | join: '；' }}{% endif %}
+原件范围：{{ source.originalExtent | extent }}
+请求选区：{{ source.requestedRange | range }}
+实际交付：{% for part in source.delivered %}{{ part | delivery }}{% unless forloop.last %}；{% endunless %}{% else %}准备中{% endfor %}
 {% endfor %}
 
 各来源的实际内容由程序按同一顺序附加在本消息之后。

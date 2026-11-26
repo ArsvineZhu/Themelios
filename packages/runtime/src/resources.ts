@@ -1,15 +1,15 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { isDeepStrictEqual } from "node:util";
 import { appError, type Json } from "@themelios/core";
 import type { RuntimeDiagnostics } from "./diagnostics.js";
 import type {
   Closable,
   OperationResources,
-  ResourceContext,
   ResourceSlot,
 } from "./execution.js";
 import type { Network } from "./network.js";
 import type { Secrets } from "./secrets.js";
-import { extractRuntimeSettings, type RuntimeSettings } from "./settings.js";
+import { runtimeSettings, type RuntimeSettings } from "./settings.js";
 
 export interface ResourceUpdate {
   activate(): void;
@@ -33,7 +33,7 @@ class Shared<T extends Closable> {
 class Resources<S> implements OperationResources<S> {
   #users = 1;
   readonly #completed = Promise.withResolvers<void>();
-  app: Shared<Closable> | undefined;
+  readonly applications = new Map<Binding<S>, BoundResource<S>>();
 
   constructor(
     readonly settings: Readonly<S>,
@@ -57,9 +57,9 @@ class Resources<S> implements OperationResources<S> {
     return this.#completed.promise;
   }
 
-  useApplication(resource: Shared<Closable>) {
-    resource.hold();
-    this.app = resource;
+  useApplication(binding: Binding<S>, entry: BoundResource<S>) {
+    entry.resource.hold();
+    this.applications.set(binding, entry);
   }
 
   hold(): () => void {
@@ -72,22 +72,33 @@ class Resources<S> implements OperationResources<S> {
   }
 
   async #dispose(): Promise<void> {
-    if (this.app) await this.closeShared(this.app);
+    for (const { resource } of [...this.applications.values()].reverse())
+      await this.closeShared(resource);
     await this.closeShared(this.transport);
     await this.closeShared(this.diary);
     this.#completed.resolve();
   }
 }
 
+type Binding<S> = {
+  select: (settings: Readonly<S>) => Json;
+  create: (context: OperationResources<S>) => Promise<Closable>;
+};
+
+type BoundResource<S> = {
+  readonly key: Json;
+  readonly resource: Shared<Closable>;
+  readonly dependencies: ReadonlyMap<Binding<S>, BoundResource<S>>;
+};
+
 export class SessionResources<S> {
   readonly #generations = new Set<Resources<S>>();
   #active: Resources<S> | undefined;
-  #slot:
-    | {
-        select: (settings: Readonly<S>) => Json;
-        create: (context: ResourceContext<S>) => Promise<Closable>;
-      }
-    | undefined;
+  readonly #bindings: Binding<S>[] = [];
+  readonly #building = new AsyncLocalStorage<{
+    dependencies: Map<Binding<S>, BoundResource<S>>;
+    active: boolean;
+  }>();
 
   constructor(
     readonly secrets: Secrets,
@@ -113,30 +124,53 @@ export class SessionResources<S> {
 
   async bind<T extends Closable>(
     select: (settings: Readonly<S>) => Json,
-    create: (context: ResourceContext<S>) => Promise<T>,
+    create: (context: OperationResources<S>) => Promise<T>,
     current: () => OperationResources<S> | undefined,
   ): Promise<ResourceSlot<T>> {
-    if (this.#slot) throw appError("runtime.resource_bound");
     const generation = this.#current();
+    const binding = { select, create };
+    const key = select(generation.settings);
     generation.useApplication(
-      new Shared("application", await create(generation)),
+      binding,
+      await this.#build(binding, generation, key),
     );
-    this.#slot = { select, create };
+    this.#bindings.push(binding);
     return {
       get: () => {
         const generation = current() as Resources<S> | undefined;
-        const value = (generation ?? this.#current()).app?.value;
-        if (!value)
+        const entry = (generation ?? this.#current()).applications.get(binding);
+        if (!entry)
           throw appError("runtime.closed", { details: { state: "closed" } });
-        return value as T;
+        const build = this.#building.getStore();
+        if (build?.active) build.dependencies.set(binding, entry);
+        return entry.resource.value as T;
       },
     };
+  }
+
+  async #build(binding: Binding<S>, generation: Resources<S>, key: Json) {
+    const build = {
+      dependencies: new Map<Binding<S>, BoundResource<S>>(),
+      active: true,
+    };
+    try {
+      const resource = await this.#building.run(build, () =>
+        binding.create(generation),
+      );
+      return {
+        key,
+        resource: new Shared("application", resource),
+        dependencies: build.dependencies,
+      };
+    } finally {
+      build.active = false;
+    }
   }
 
   /** Creates a complete resource generation before adopting it synchronously. */
   async prepare(settings: Readonly<S>): Promise<ResourceUpdate> {
     const old = this.#active;
-    const next = extractRuntimeSettings(settings);
+    const next = runtimeSettings.select(settings as object);
     const makeDiagnostics =
       !old || !isDeepStrictEqual(diagSettings(old.runtime), diagSettings(next));
     const makeNetwork =
@@ -169,17 +203,15 @@ export class SessionResources<S> {
     this.#generations.add(candidate);
     void candidate.closed.then(() => this.#generations.delete(candidate));
     try {
-      if (this.#slot) {
-        const { select, create } = this.#slot;
-        const previousApp = old?.app;
-        const recreate =
-          !previousApp ||
-          makeNetwork ||
-          makeDiagnostics ||
-          !isDeepStrictEqual(select(old.settings), select(settings));
+      for (const binding of this.#bindings) {
+        const key = binding.select(settings);
+        const previousApp = old?.applications.get(binding);
         candidate.useApplication(
-          recreate
-            ? new Shared("application", await create(candidate))
+          binding,
+          makeNetwork ||
+            makeDiagnostics ||
+            !canReuse(previousApp, key, candidate)
+            ? await this.#build(binding, candidate, key)
             : previousApp,
         );
       }
@@ -222,6 +254,21 @@ export class SessionResources<S> {
       this.closeFailure(resource.name, error);
     }
   }
+}
+
+function canReuse<S>(
+  entry: BoundResource<S> | undefined,
+  key: Json,
+  generation: Resources<S>,
+): entry is BoundResource<S> {
+  return (
+    entry !== undefined &&
+    isDeepStrictEqual(entry.key, key) &&
+    [...entry.dependencies].every(
+      ([binding, dependency]) =>
+        generation.applications.get(binding) === dependency,
+    )
+  );
 }
 
 function networkSettings({ network }: RuntimeSettings) {

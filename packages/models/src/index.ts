@@ -1,30 +1,34 @@
 import {
   appError,
   createFlow,
+  parseJson,
   parseValue,
-  type CallOptions,
   type CallScope,
-  type Completed,
   type Json,
 } from "@themelios/core";
 import { createHash } from "node:crypto";
 import { createNetwork, type Network } from "@themelios/runtime/network";
 import { createSecrets } from "@themelios/runtime/secrets";
-import { z } from "zod";
 import {
-  generate,
+  modelConfigurationIssues,
+  modelConfigurationSchema,
+  type ModelConfiguration,
+  type ModelConfigurationInput,
+} from "./configuration.js";
+import {
   prepareGeneration,
+  prepareStreamingGeneration,
   providerOutputSchema,
-  streamGeneration,
   validateGeneration,
 } from "./generation.js";
 import { ModelCalls, queuedStream } from "./model-call.js";
 import { ModelTelemetry } from "./model-telemetry.js";
 import { embed, rank, transcript } from "./other-model-operations.js";
-import { createPreparation } from "./preparation.js";
+import { createPreparation, createPreparationEngine } from "./preparation.js";
 import { createPrompts } from "./prompts.js";
 import {
   type BoundModel,
+  type OpenAiEndpoint,
   captureParts,
   checkOperation,
   createProvider,
@@ -36,60 +40,85 @@ import {
   modelAttemptsSchema,
   modelDefaultsSchema,
   modelNameSchema,
-  matchesMime,
   mimePatternSchema,
   modelParametersSchema,
 } from "./schema.js";
 import {
-  createTasks,
   defineTask,
   describeTask,
   mediaDescription,
-} from "./tasks.js";
+  presentTask,
+} from "./task-definition.js";
+import { createTasks } from "./task-execution.js";
 import type {
-  FetchFunction,
   GenerationCallOptions,
   GenerateRequest,
   Models,
   ModelsOptions,
-  TaskDefinition,
-  TaskRequest,
   Tasks,
 } from "./types.js";
 
 export * from "./types.js";
-export { taskRouteSchema } from "./schema.js";
+export { speechTranscriptionRecipe } from "./representation-route.js";
+export {
+  modelConfigurationIssues,
+  modelConfigurationSchema,
+  type ModelConfiguration,
+  type ModelConfigurationInput,
+};
+export {
+  previewSchema,
+  promptDescriptionSchema,
+  promptDiffSchema,
+  promptRoleSchema,
+  promptTemplatesSchema,
+  sourceDirectoryFromInputs,
+  taskDescriptionSchema,
+  taskRepresentationSchema,
+  taskRequirementsSchema,
+  taskRouteSchema,
+  textOutput,
+} from "./schema.js";
 export {
   connectionSchema,
   modelBindingSchema,
   modelDefaultsSchema,
   modelNameSchema,
   modelParametersSchema,
-  matchesMime,
   mimePatternSchema,
   providerOutputSchema,
   createPreparation,
   createPrompts,
-  createTasks,
   defineTask,
   describeTask,
   mediaDescription,
+  presentTask,
 };
 
-export function createModels(options: ModelsOptions): Models {
-  const bound = bindModels(options);
-  const defaults = parseValue(
-    modelDefaultsSchema,
-    options.defaults ?? {},
+export function createModels(
+  config: ModelConfigurationInput,
+  options: ModelsOptions = {},
+): Models {
+  const configuration = parseValue(
+    modelConfigurationSchema,
+    config,
     "config.invalid",
   );
+  const issues = modelConfigurationIssues(configuration);
+  if (issues.length)
+    throw appError("config.invalid", {
+      details: { issues: parseJson(issues) },
+    });
+  const bound = bindModels(configuration);
+  const { timeoutMs, maxAttempts, concurrency } = configuration;
+  const defaults = Object.freeze({ timeoutMs, maxAttempts, concurrency });
   const calls = new ModelCalls(defaults, options.diagnostics);
   let network: Promise<Network> | undefined;
-  const fetch: FetchFunction =
+  const fetch: Network["fetch"] =
     options.fetch ??
-    (async (input, init) => {
+    (async (request) => {
       const delegate = await (network ??= createNetwork());
-      return delegate.fetch(input, init);
+      return delegate.fetch(request);
     });
   const resolveCredential =
     options.resolveCredential ??
@@ -110,7 +139,7 @@ export function createModels(options: ModelsOptions): Models {
     model: BoundModel,
     call: CallScope,
     telemetry: ModelTelemetry,
-    api?: "chat" | "responses",
+    api?: OpenAiEndpoint,
   ) =>
     (await client(model, call, telemetry)).language?.(
       model.identity.providerModel,
@@ -125,7 +154,12 @@ export function createModels(options: ModelsOptions): Models {
   let closing: Promise<void> | undefined;
   let defaultTasks: Tasks | undefined;
   const soleBinding = bound.size === 1 ? bound.keys().next().value : undefined;
-  const routes = options.routes ?? {};
+  const routes = configuration.tasks;
+  const configuredRoute = (id: string) =>
+    Object.hasOwn(routes, id) ? routes[id] : undefined;
+  const taskRoute = (id: string) =>
+    configuredRoute(id) ??
+    (soleBinding === undefined ? undefined : { model: soleBinding });
 
   function taskExecutor() {
     const prompts =
@@ -135,24 +169,21 @@ export function createModels(options: ModelsOptions): Models {
           ? {}
           : { resourceRoot: options.resourceRoot },
       );
-    const mediaDescriptionDefaults = routes["media.describe"]?.variables;
-    const preparation =
-      options.preparation ??
-      createPreparation({
-        models,
-        prompts,
-        ...(mediaDescriptionDefaults === undefined
-          ? {}
-          : { mediaDescriptionDefaults }),
+    const preparation = createPreparationEngine(
+      {
+        ...options.preparation,
         ...(options.adapters === undefined
           ? {}
           : { adapters: options.adapters }),
-      });
+      },
+      { models, prompts, taskRoute },
+    );
     return createTasks({
       models,
       prompts,
       preparation,
-      routes,
+      taskRoute,
+      defaults,
       ...(options.diagnostics === undefined
         ? {}
         : { diagnostics: options.diagnostics }),
@@ -160,6 +191,9 @@ export function createModels(options: ModelsOptions): Models {
   }
 
   const models: Models = {
+    get tasks() {
+      return (defaultTasks ??= taskExecutor());
+    },
     describe,
     validateGeneration(request) {
       calls.assertOpen();
@@ -177,7 +211,7 @@ export function createModels(options: ModelsOptions): Models {
     ) {
       calls.assertOpen();
       const model = binding(request.model);
-      const prepared = prepareGeneration(model, request);
+      const generate = prepareGeneration(model, request);
       const attempts = attemptsFor(callOptions);
       return calls.run(
         "models.generate",
@@ -185,13 +219,8 @@ export function createModels(options: ModelsOptions): Models {
         callOptions,
         (call) => {
           const telemetry = observe(model);
-          return generate(
-            prepared,
-            call,
-            model.identity,
-            attempts,
-            telemetry,
-            () => language(model, call, telemetry, prepared.openaiApi),
+          return generate(call, attempts, telemetry, (api) =>
+            language(model, call, telemetry, api),
           );
         },
       );
@@ -205,7 +234,7 @@ export function createModels(options: ModelsOptions): Models {
           const model = binding(request.model);
           return {
             model,
-            prepared: prepareGeneration(model, request, true),
+            generate: prepareStreamingGeneration(model, request),
             attempts: attemptsFor(callOptions),
           };
         } catch (error) {
@@ -216,16 +245,11 @@ export function createModels(options: ModelsOptions): Models {
         "models.stream",
         async function* (call) {
           if ("error" in captured) throw captured.error;
-          const { model, prepared, attempts } = captured;
+          const { model, generate, attempts } = captured;
           const telemetry = observe(model);
           return yield* queuedStream(calls, call, model.identity, () =>
-            streamGeneration(
-              prepared,
-              call,
-              model.identity,
-              attempts,
-              telemetry,
-              () => language(model, call, telemetry, prepared.openaiApi),
+            generate(call, attempts, telemetry, (api) =>
+              language(model, call, telemetry, api),
             ),
           );
         },
@@ -277,19 +301,6 @@ export function createModels(options: ModelsOptions): Models {
         },
       );
     },
-    runTask<I extends Json, O extends Json, RawI>(
-      task: TaskDefinition<I, O, RawI>,
-      request: TaskRequest<RawI>,
-      callOptions?: CallOptions,
-    ): Promise<Completed<O>> {
-      const selected =
-        request.model === undefined &&
-        !Object.hasOwn(routes, task.id) &&
-        soleBinding !== undefined
-          ? { ...request, model: soleBinding }
-          : request;
-      return (defaultTasks ??= taskExecutor()).run(task, selected, callOptions);
-    },
     close() {
       return (closing ??= (async () => {
         await calls.close();
@@ -301,46 +312,13 @@ export function createModels(options: ModelsOptions): Models {
 }
 
 function bindModels({
-  connections: rawConnections,
+  connections,
   bindings,
-}: ModelsOptions): ReadonlyMap<string, BoundModel> {
-  const connections = parseValue(
-    z.record(modelNameSchema, connectionSchema),
-    rawConnections,
-    "config.invalid",
-  );
-  const configured = parseValue(
-    z.record(modelNameSchema, modelBindingSchema),
-    bindings,
-    "config.invalid",
-  );
+}: ModelConfiguration): ReadonlyMap<string, BoundModel> {
   const bound = new Map<string, BoundModel>();
-  for (const [binding, attributes] of Object.entries(configured)) {
+  for (const [binding, attributes] of Object.entries(bindings)) {
     const key = attributes.connection;
-    const connection = Object.hasOwn(connections, key)
-      ? connections[key]
-      : undefined;
-    if (
-      !connection ||
-      (attributes.capabilities.operations.includes("embed") &&
-        !attributes.embeddingSpace)
-    ) {
-      throw appError("config.invalid", {
-        details: {
-          issues: [
-            {
-              path:
-                "models.bindings." +
-                binding +
-                (connection ? ".embeddingSpace" : ".connection"),
-              messageKey: connection
-                ? "model.embedding_space_required"
-                : "model.connection_not_found",
-            },
-          ],
-        },
-      });
-    }
+    const connection = connections[key]!;
     bound.set(binding, {
       binding: structuredClone(attributes),
       connection: structuredClone(connection),

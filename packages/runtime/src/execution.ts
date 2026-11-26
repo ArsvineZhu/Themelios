@@ -73,7 +73,8 @@ type ExecutionScope<S> = {
 
 type FrameStore<S> = {
   execution?: ExecutionScope<S>;
-  trace: TraceFrame;
+  preparing?: { resources: OperationResources<S>; active: boolean };
+  trace?: TraceFrame;
 };
 
 interface ActiveOperation {
@@ -128,19 +129,38 @@ export class SessionExecution<S> implements Execution {
   current():
     | {
         call: CallScope;
-        resources: OperationResources<S>;
         trace: TraceFrame;
       }
     | undefined {
     const context = this.#local.getStore();
     const execution = context?.execution;
-    return context && execution?.active
+    return context?.trace && execution?.active
       ? {
           call: execution.call,
-          resources: execution.resources,
           trace: context.trace,
         }
       : undefined;
+  }
+
+  currentResources(): OperationResources<S> | undefined {
+    const frame = this.#local.getStore();
+    if (frame?.preparing?.active) return frame.preparing.resources;
+    return frame?.execution?.active ? frame.execution.resources : undefined;
+  }
+
+  async withPreparingResources<T>(
+    resources: OperationResources<S>,
+    work: () => Promise<T>,
+  ): Promise<T> {
+    const preparing = { resources, active: true };
+    try {
+      return await this.#local.run(
+        { ...this.#local.getStore(), preparing },
+        work,
+      );
+    } finally {
+      preparing.active = false;
+    }
   }
 
   currentTrace(): TraceFrame | undefined {
@@ -149,11 +169,7 @@ export class SessionExecution<S> implements Execution {
   }
 
   enterTrace<T>(frame: TraceFrame, work: () => Promise<T>): Promise<T> {
-    const execution = this.#local.getStore()?.execution;
-    return this.#local.run(
-      execution?.active ? { execution, trace: frame } : { trace: frame },
-      work,
-    );
+    return this.#local.run({ ...this.#local.getStore(), trace: frame }, work);
   }
 
   run<T>(
@@ -302,14 +318,11 @@ export class SessionExecution<S> implements Execution {
     }
   }
 
-  #begin(
-    name: string,
-    options: CallOptions = {},
-    parent = this.current(),
-  ): OperationLease {
+  #begin(name: string, options: CallOptions = {}): OperationLease {
+    const parent = this.current();
     if (!parent && this.#closing)
       throw appError("runtime.closed", { details: { state: "closing" } });
-    const resources = parent?.resources ?? this.getResources();
+    const resources = this.currentResources() ?? this.getResources();
     const budget = Math.min(
       options.timeoutMs ?? Infinity,
       parent?.call.remainingMs() ?? Infinity,

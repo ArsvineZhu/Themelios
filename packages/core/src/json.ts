@@ -58,6 +58,35 @@ export const jsonSchema = z.unknown().superRefine((value, ctx) => {
     ctx.addIssue({ code: "custom", path: issue.path, message: issue.reason });
 }) as z.ZodType<Json>;
 
+export const errorInfoSchema = z.strictObject({
+  code: z.string(),
+  message: z.string(),
+  retryable: z.boolean(),
+  details: jsonSchema.optional(),
+  traceId: z.string().optional(),
+});
+export type ErrorInfo = z.output<typeof errorInfoSchema>;
+
+export const base64Schema = z.base64().meta({ format: undefined });
+
+export const jsonPointerSchema = z.string().regex(/^(?:\/(?:[^~/]|~[01])*)*$/);
+
+export function formatJsonPointer(parts: readonly PropertyKey[]): string {
+  return parts
+    .map((key) => `/${String(key).replaceAll("~", "~0").replaceAll("/", "~1")}`)
+    .join("");
+}
+
+/** Returns the pointer's tokens, or undefined for invalid syntax. */
+export function parseJsonPointer(pointer: string): string[] | undefined {
+  if (!jsonPointerSchema.safeParse(pointer).success) return undefined;
+  if (pointer === "") return [];
+  return pointer
+    .slice(1)
+    .split("/")
+    .map((key) => key.replaceAll("~1", "/").replaceAll("~0", "~"));
+}
+
 export function parseJson(value: unknown): Json {
   return parseValue(jsonSchema, value);
 }

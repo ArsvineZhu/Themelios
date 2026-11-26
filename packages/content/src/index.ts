@@ -1,3 +1,7 @@
+import {
+  defaultInlineMaterialBytes,
+  type RepresentationAdapter,
+} from "@themelios/core";
 import type { Cas, Database } from "@themelios/storage";
 import { createMaterials, type Materials } from "./materials.js";
 import {
@@ -7,17 +11,31 @@ import {
 import { createResults, type Results } from "./results.js";
 
 export {
+  artifactInfoSchema,
   originSchema,
+  sourceLinkSchema,
   type ArtifactInfo,
-  type ArtifactRow,
   type Origin,
   type SourceLink,
 } from "./artifacts.js";
 export type { AcceptInput } from "./imports.js";
-export type { MaterialRead, Materials, PreparedMaterial } from "./materials.js";
+export {
+  materialOperationIds,
+  retainedListOptionsSchema,
+  sourceTraceOptionsSchema,
+  type AnalyzedMaterialAdoption,
+  type CapturedMaterial,
+  type MaterialAttachment,
+  type MaterialRead,
+  type Materials,
+} from "./materials.js";
 export type { Representation, Representations } from "./representations.js";
-export type { PreparedResult, ResultManifest, Results } from "./results.js";
-export type { TextBlock } from "./text-structure.js";
+export {
+  resultOperationIds,
+  type ResultAttachment,
+  type Results,
+} from "./results.js";
+export { textBlockSchema, type TextBlock } from "./text-structure.js";
 export { createImageAdapter, type ImageAdapterOptions } from "./image.js";
 export { createWaveAdapter } from "./wave.js";
 export { verifyContent } from "./verify.js";
@@ -29,25 +47,33 @@ export interface Content {
   readonly representations: Representations;
 }
 
+export const defaultContentImportBytes = 1_073_741_824;
+
 /** Binds content operations to the application's existing database and CAS. */
 export function createContent(options: {
   database: Database;
   cas: Cas;
   maxImportBytes?: number;
   maxInlineBytes?: number;
+  /** Optional probes for media whose original extent is unknown at capture. */
+  adapters?: readonly RepresentationAdapter[];
 }): Content {
   const { database, cas } = options;
-  const limits = {
-    get maxImportBytes() {
-      return options.maxImportBytes ?? 1_073_741_824;
-    },
-    get maxInlineBytes() {
-      return options.maxInlineBytes ?? 8_388_608;
-    },
+  const limits = () => {
+    const maxImportBytes = options.maxImportBytes ?? defaultContentImportBytes;
+    return {
+      maxImportBytes,
+      maxInlineBytes: Math.min(
+        maxImportBytes,
+        options.maxInlineBytes ?? defaultInlineMaterialBytes,
+      ),
+      adapters: [...(options.adapters ?? [])],
+    };
   };
+  const results = createResults(database, cas, limits);
   return {
     materials: createMaterials(database, cas, limits),
-    results: createResults(database, cas, limits),
-    representations: createRepresentations(database, cas),
+    results,
+    representations: createRepresentations(database, results),
   };
 }

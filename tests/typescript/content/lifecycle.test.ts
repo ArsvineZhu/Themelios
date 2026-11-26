@@ -1,7 +1,11 @@
 import { expect, test } from "bun:test";
 import { lstat, mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { type Completed, type InlineMaterial } from "@themelios/core";
+import {
+  instanceManifestFile,
+  type Completed,
+  type InlineMaterial,
+} from "@themelios/core";
 import {
   backupStorage,
   Cas,
@@ -29,8 +33,14 @@ test("real bytes, upstream results, and business rows share durable storage sema
   await mkdir(state, { recursive: true });
   await mkdir(join(configuration, "prompts", "example"), { recursive: true });
   await writeFile(
-    join(root, "instance.json"),
-    JSON.stringify({ id: instanceId, applicationId, formatId }),
+    join(root, instanceManifestFile),
+    JSON.stringify({
+      id: instanceId,
+      name: "current",
+      applicationId,
+      formatId,
+      createdAt: new Date().toISOString(),
+    }),
   );
   await writeFile(
     join(configuration, "prompts", "example", "user.md.liquid"),
@@ -57,23 +67,22 @@ test("real bytes, upstream results, and business rows share durable storage sema
       "\uFEFF# 中文😀\r\n\r\n组合e\u0301\r\n\r\n```js\r\nlet a = 1\r\n```\r\n";
     const inputPath = join(directory, "原件.md");
     await writeFile(inputPath, text);
-    const prepared = await materials.prepare({ file: inputPath });
-    expect(prepared.info.mediaType).toBe("text/markdown");
-    expect(() =>
-      database.write((tx) => {
-        const source = prepared.adopt(tx);
+    await expect(
+      materials.adopt({ file: inputPath }, (tx, source) => {
         tx.sql.run("INSERT INTO imports VALUES (?, ?)", source.ref, 0);
       }),
-    ).toThrow();
+    ).rejects.toThrow();
     expect(database.cut()).toBe("0");
-    expect(materials.list()).toEqual([]);
+    expect(materials.listRetained()).toEqual([]);
 
-    const source = database.write((tx) => {
-      const selection = prepared.adopt(tx);
-      tx.sql.run("INSERT INTO imports VALUES (?, ?)", selection.ref, 1);
-      return selection;
-    });
-    await prepared.close();
+    const source = await materials.adopt(
+      { file: inputPath },
+      (tx, selection) => {
+        tx.sql.run("INSERT INTO imports VALUES (?, ?)", selection.ref, 1);
+        return selection;
+      },
+    );
+    expect(materials.inspect(source.ref).mediaType).toBe("text/markdown");
     const duplicate = await materials.accept({ file: inputPath });
     expect(duplicate.ref).not.toBe(source.ref);
     const agentShort = materials.agentRef(source.ref);
@@ -131,13 +140,18 @@ test("real bytes, upstream results, and business rows share durable storage sema
       .sources(saved.ref)
       .find((link) => link.relation === "representation-source")!;
     const original = await results.read(upstreamSource.selection.ref);
-    expect(original.files["summary.txt"]!.material).toEqual(
-      original.inputs[0]!.delivered[1]!,
-    );
-    expect(original.files["__proto__"]?.material).toEqual(
-      saved.inputs[0]?.delivered[1],
-    );
-    expect(original.files["summary.txt"]!.sourceIndices).toEqual([0]);
+    expect(original.files).toEqual([
+      {
+        name: "summary.txt",
+        material: original.inputs[0]!.delivered[1]!,
+        sourceIndices: [0],
+      },
+      {
+        name: "__proto__",
+        material: saved.inputs[0]!.delivered[1]!,
+        sourceIndices: [0],
+      },
+    ]);
     expect(
       await materials.text({
         ref: original.ref,
@@ -151,7 +165,25 @@ test("real bytes, upstream results, and business rows share durable storage sema
     expect(await results.read(saved.ref)).toEqual(saved);
     await verifyContent(database, cas);
 
-    representations.set({
+    const wrongSource = {
+      source,
+      recipe: "test.recipe",
+      outputs: ["summary.txt"],
+    };
+    await expect(
+      representations.set({
+        ...wrongSource,
+        purpose: "model-input",
+        result: original.ref,
+      }),
+    ).rejects.toMatchObject(
+      expect.objectContaining({ code: "content.representation_mismatch" }),
+    );
+    await expect(
+      results.save({ ...upstream, representation: wrongSource }),
+    ).rejects.toMatchObject({ code: "content.representation_mismatch" });
+
+    await representations.set({
       source: duplicate,
       purpose: "model-input",
       recipe: "test.recipe",
@@ -159,24 +191,19 @@ test("real bytes, upstream results, and business rows share durable storage sema
       outputs: ["summary.txt"],
     });
     expect(
-      representations.find(duplicate, "model-input", "test.recipe")?.result,
-    ).toBe(original.ref);
+      await representations.read(duplicate, "model-input", "test.recipe"),
+    ).toEqual({ result: original, outputs: ["summary.txt"] });
     materials.release(duplicate.ref);
     await collectContent(database, cas, { retainSince: database.cut() });
-    expect(() => materials.list({ at: previousCut })).toThrow(
+    expect(() => materials.listRetained({ at: previousCut })).toThrow(
       expect.objectContaining({ code: "storage.history_unavailable" }),
     );
     expect(await materials.text(duplicate)).toBe(text);
 
     const archive = join(directory, "backup");
     const manifest = await backupStorage({
-      database,
-      cas,
       destination: archive,
       instanceRoot: root,
-      applicationId,
-      instanceId,
-      formatId,
       installationConfigPath,
     });
     const target = join(directory, "迁移后 的实例");
@@ -257,6 +284,112 @@ test("real bytes, upstream results, and business rows share durable storage sema
     expect(() => materials.inspect(duplicate.ref)).toThrow(
       expect.objectContaining({ code: "content.not_found" }),
     );
+  } finally {
+    await cas.close();
+    database.close();
+  }
+});
+
+test("sharing and draft history retain captured sources until their final owner is removed", async () => {
+  const workspace = join("temp", "work");
+  await mkdir(workspace, { recursive: true });
+  const directory = await mkdtemp(join(workspace, "content-owners-"));
+  const database = Database.init({
+    path: join(directory, "main.sqlite"),
+    formatId: "test.content-owners",
+    schemaSql:
+      contentSchemaSql +
+      `
+      CREATE TABLE case_materials (id TEXT PRIMARY KEY, source TEXT REFERENCES artifacts);
+      CREATE TABLE "draft""history" ("draft-ref" TEXT NOT NULL REFERENCES ARTIFACTS(REF));
+    `,
+  });
+  const cas = await Cas.open(join(directory, "objects"));
+  const { materials, results } = createContent({ database, cas });
+  try {
+    const original = "SQLite 使用中文索引 and ranking\n";
+    const file = join(directory, "notes.txt");
+    await writeFile(file, original);
+    let openCapture!: () => Promise<ReadableStream<Uint8Array>>;
+    const {
+      selection: source,
+      text,
+      cut,
+    } = await materials.adoptAnalyzed(
+      { file },
+      {
+        async analyze(capture) {
+          openCapture = capture.read;
+          await writeFile(file, "A later edit to the local file\n");
+          return new Response(await capture.read()).text();
+        },
+        attach(tx, selection, text) {
+          tx.sql.run(
+            "INSERT INTO case_materials VALUES ('first', ?), ('second', ?)",
+            selection.ref,
+            selection.ref,
+          );
+          return { selection, text, cut: tx.seq.toString() };
+        },
+      },
+    );
+    expect(text).toBe(original);
+    expect(cut).toBe(database.cut());
+    await expect(openCapture()).rejects.toMatchObject({
+      code: "call.cancelled",
+    });
+
+    const afterOneCase = await collectContent(database, cas, {
+      prune: (tx) => {
+        tx.sql.run("DELETE FROM case_materials WHERE id = 'first'");
+      },
+    });
+    expect(afterOneCase.removedArtifacts).toBe(0);
+    expect(await materials.text(source)).toBe(original);
+
+    const completed = {
+      value: "Research draft",
+      inputs: [{ source, delivered: [source], role: "primary" as const }],
+      files: [],
+      producer: { kind: "application" as const, name: "case.report" },
+    };
+    const beforeDraft = database.cut();
+    await expect(
+      results.adopt(
+        completed,
+        // @ts-expect-error Verify rejection when an untyped caller supplies a Promise.
+        async (tx, result) => {
+          tx.sql.run('INSERT INTO "draft""history" VALUES (?)', result.ref);
+        },
+      ),
+    ).rejects.toMatchObject({ code: "storage.async_transaction" });
+    expect(database.cut()).toBe(beforeDraft);
+    const draftRef = await results.adopt(completed, (tx, result) => {
+      tx.sql.run('INSERT INTO "draft""history" VALUES (?)', result.ref);
+      return result.ref;
+    });
+    const afterBothCases = await collectContent(database, cas, {
+      prune: (tx) => {
+        tx.sql.run("DELETE FROM case_materials WHERE id = 'second'");
+      },
+    });
+    expect(afterBothCases.removedArtifacts).toBe(0);
+    expect((await results.read(draftRef)).inputs[0]?.source).toEqual(source);
+    expect(await materials.text(source)).toBe(original);
+
+    const afterHistoryRemoved = await collectContent(database, cas, {
+      prune: (tx) => {
+        tx.sql.run('DELETE FROM "draft""history"');
+      },
+    });
+    expect(afterHistoryRemoved).toMatchObject({
+      removedArtifacts: 2,
+      removedBlobs: 2,
+      sweepComplete: true,
+    });
+    await expect(materials.text(source)).rejects.toMatchObject({
+      code: "content.not_found",
+    });
   } finally {
     await cas.close();
     database.close();

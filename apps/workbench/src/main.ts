@@ -42,6 +42,7 @@ export async function runWorkbench(options: {
         offline: (request) =>
           maintain(options.installationRoot, request, application),
         serve,
+        limits: (session) => session.configuration.snapshot().transports,
       },
     );
   } finally {

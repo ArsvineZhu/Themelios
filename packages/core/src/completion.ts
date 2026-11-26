@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { jsonSchema, type Json } from "./json.js";
-import type { ErrorInfo } from "./errors.js";
+import { appError } from "./errors.js";
+import { mediaTypeSchema } from "./media-type.js";
 import {
   representationCoverageSchema,
   sourceCoverageSchema,
@@ -10,6 +11,7 @@ import {
 import {
   artifactRefSchema,
   inlineMaterialSchema,
+  selectionRangeKey,
   selectionSchema,
   type ArtifactRef,
   type InlineMaterial,
@@ -23,10 +25,21 @@ export interface ResultOutput {
 
 export type Material = Selection | InlineMaterial | ResultOutput;
 
+export const sourceKeySchema = z.string().regex(/^S[1-9]\d*$/);
+export const inputRoleSchema = z.enum(["primary", "context"]);
+export type InputRole = z.output<typeof inputRoleSchema>;
+export const inputOriginalSchema = z.strictObject({
+  mediaType: mediaTypeSchema,
+  name: z.string().min(1).optional(),
+});
+
 export interface InputUse<S = Material> {
+  /** Key assigned by a task to this original source. */
+  key?: string | undefined;
+  original?: z.output<typeof inputOriginalSchema> | undefined;
   source: S;
   delivered: readonly S[];
-  role: "primary" | "context";
+  role: InputRole;
   coverage?: SourceCoverage | undefined;
 }
 
@@ -45,15 +58,6 @@ export interface ProducedFile {
   coverage?: RepresentationCoverage | undefined;
 }
 
-export const preparedRepresentationSchema = z.strictObject({
-  source: selectionSchema,
-  recipe: z.string().min(1),
-  outputs: z.array(z.string().min(1)).min(1),
-});
-export type PreparedRepresentationIndex = z.infer<
-  typeof preparedRepresentationSchema
->;
-
 export interface Completed<T extends Json = Json> {
   value: T;
   inputs: readonly InputUse[];
@@ -63,6 +67,7 @@ export interface Completed<T extends Json = Json> {
 }
 
 export interface SavedFile {
+  name: string;
   material: Selection;
   sourceIndices: readonly number[];
   coverage?: RepresentationCoverage | undefined;
@@ -72,22 +77,97 @@ export interface SavedResult<T extends Json = Json> {
   ref: ArtifactRef;
   value: T;
   inputs: readonly InputUse<Selection>[];
-  files: Readonly<Record<string, SavedFile>>;
+  files: readonly SavedFile[];
   producer: Producer;
 }
 
-const fileName = z
+export const resultValueOutput = "$value";
+
+export function resultValueSelection(ref: ArtifactRef): Selection {
+  return { ref, range: { kind: "json", pointer: "/value" } };
+}
+
+export const resultFileNameSchema = z
   .string()
   .min(1)
   .refine(
     (name) =>
       !name.includes("\0") &&
       !/[/\\]/.test(name) &&
-      ![".", "..", "$value"].includes(name),
+      ![".", "..", resultValueOutput].includes(name),
     "Expected a file name",
   );
 const sourceIndices = z.array(z.int().nonnegative());
-export const resultOutputNameSchema = z.union([z.literal("$value"), fileName]);
+export const resultOutputNameSchema = z.union([
+  z.literal(resultValueOutput),
+  resultFileNameSchema,
+]);
+export const resultOutputNamesSchema = z
+  .array(resultOutputNameSchema)
+  .min(1)
+  .readonly();
+
+export const preparedRepresentationSchema = z.strictObject({
+  source: selectionSchema,
+  recipe: z.string().min(1),
+  outputs: resultOutputNamesSchema,
+});
+export type PreparedRepresentationIndex = z.infer<
+  typeof preparedRepresentationSchema
+>;
+
+export function resultFile<F extends { name: string }>(
+  result: { files: readonly F[] },
+  output: string,
+): F {
+  const file = result.files.find(({ name }) => name === output);
+  if (!file)
+    throw appError("content.output_not_found", {
+      details: {
+        output,
+        availableNames: [
+          resultValueOutput,
+          ...result.files.map(({ name }) => name),
+        ],
+      },
+    });
+  return file;
+}
+
+/** Matches selections and validates that the saved outputs derive from that input. */
+export function assertResultSource(
+  result: SavedResult,
+  source: Selection,
+  outputs: readonly string[],
+): readonly SavedFile[] {
+  const key = selectionRangeKey(source.range);
+  const selected = new Set<number>();
+  for (const [index, use] of result.inputs.entries()) {
+    if (
+      use.source.ref === source.ref &&
+      selectionRangeKey(use.source.range) === key
+    )
+      selected.add(index);
+  }
+  function mismatch(output?: string): never {
+    throw appError("content.representation_mismatch", {
+      details: {
+        source: { ref: source.ref, range: source.range ?? null },
+        result: result.ref,
+        ...(output === undefined ? {} : { output }),
+      },
+    });
+  }
+  if (!selected.size) mismatch();
+  return outputs
+    .filter((name) => name !== resultValueOutput)
+    .map((name) => {
+      const file = resultFile(result, name);
+      if (!file.sourceIndices.some((index) => selected.has(index)))
+        mismatch(name);
+      return file;
+    });
+}
 
 // Content resolves and validates each referenced node during the graph walk, preserving object identity.
 const completedHandle = z.custom<Completed>(
@@ -113,11 +193,13 @@ export const materialSchema: z.ZodType<Material> = z.union([
   resultOutputSchema,
 ]);
 
-function inputUseSchema<S>(schema: z.ZodType<S>) {
+export function inputUseSchema<S>(schema: z.ZodType<S>) {
   return z.strictObject({
+    key: sourceKeySchema.optional(),
+    original: inputOriginalSchema.optional(),
     source: schema,
     delivered: z.array(schema).min(1),
-    role: z.enum(["primary", "context"]),
+    role: inputRoleSchema,
     coverage: sourceCoverageSchema.optional(),
   });
 }
@@ -126,70 +208,35 @@ const manifest = {
   value: jsonSchema,
   producer: producerSchema,
 };
-const producedFileSchema = z.strictObject({
-  name: fileName,
-  material: z.union([inlineMaterialSchema, selectionSchema]),
-  sourceIndices,
-  coverage: representationCoverageSchema.optional(),
-});
-
-const savedFileSchema = z.strictObject({
-  material: selectionSchema,
-  sourceIndices,
-  coverage: representationCoverageSchema.optional(),
-});
-const savedFilesSchema = z
-  .custom<Record<string, unknown>>((value) => {
-    if (typeof value !== "object" || value === null) return false;
-    const prototype: unknown = Object.getPrototypeOf(value);
-    return prototype === null || prototype === Object.prototype;
-  })
-  .transform((files, ctx): Readonly<Record<string, SavedFile>> => {
-    // Filenames are data. Generic record parsing drops the valid filename "__proto__".
-    const entries: [string, SavedFile][] = [];
-    for (const [name, file] of Object.entries(files)) {
-      const validName = fileName.safeParse(name);
-      const validFile = savedFileSchema.safeParse(file);
-      if (!validName.success)
-        ctx.addIssue({
-          code: "custom",
-          path: [name],
-          message: "Expected a file name",
-        });
-      if (!validFile.success) {
-        for (const issue of validFile.error.issues) {
-          ctx.addIssue({
-            code: "custom",
-            path: [name, ...issue.path],
-            message: issue.message,
-          });
-        }
-      } else if (validName.success) entries.push([name, validFile.data]);
-    }
-    return Object.fromEntries(entries);
+export function resultFileSchema<S>(material: z.ZodType<S>) {
+  return z.strictObject({
+    name: resultFileNameSchema,
+    material,
+    sourceIndices,
+    coverage: representationCoverageSchema.optional(),
   });
+}
 
 function checkFiles(
-  files: Iterable<readonly [string, { sourceIndices: readonly number[] }]>,
+  files: readonly { name: string; sourceIndices: readonly number[] }[],
   inputCount: number,
   ctx: z.RefinementCtx,
 ): void {
   const seen = new Set<string>();
-  for (const [name, value] of files) {
-    if (seen.has(name))
+  for (const [index, file] of files.entries()) {
+    if (seen.has(file.name))
       ctx.addIssue({
         code: "custom",
-        path: ["files", name],
+        path: ["files", index, "name"],
         message: "Duplicate output name",
       });
-    seen.add(name);
-    if (value.sourceIndices.some((index) => index >= inputCount)) {
+    seen.add(file.name);
+    if (file.sourceIndices.some((source) => source >= inputCount))
       ctx.addIssue({
         code: "custom",
-        path: ["files", name, "sourceIndices"],
+        path: ["files", index, "sourceIndices"],
         message: "Invalid source index",
       });
-    }
   }
 }
 
@@ -198,37 +245,17 @@ export const completedSchema: z.ZodType<Completed> = z
     representation: preparedRepresentationSchema.optional(),
     ...manifest,
     inputs: z.array(inputUseSchema(materialSchema)),
-    files: z.array(producedFileSchema),
+    files: z.array(
+      resultFileSchema(z.union([inlineMaterialSchema, selectionSchema])),
+    ),
   })
-  .superRefine((data, ctx) => {
-    checkFiles(
-      data.files.map((file) => [file.name, file]),
-      data.inputs.length,
-      ctx,
-    );
-  });
+  .superRefine((data, ctx) => checkFiles(data.files, data.inputs.length, ctx));
 
 export const savedResultSchema: z.ZodType<SavedResult> = z
   .strictObject({
     ...manifest,
     ref: artifactRefSchema,
     inputs: z.array(inputUseSchema(selectionSchema)),
-    files: savedFilesSchema,
+    files: z.array(resultFileSchema(selectionSchema)),
   })
-  .superRefine((data, ctx) => {
-    checkFiles(Object.entries(data.files), data.inputs.length, ctx);
-  });
-
-export const errorInfoSchema: z.ZodType<ErrorInfo> = z
-  .strictObject({
-    code: z.string(),
-    message: z.string(),
-    retryable: z.boolean(),
-    details: jsonSchema.optional(),
-    traceId: z.string().optional(),
-  })
-  .transform(({ details, traceId, ...rest }): ErrorInfo => ({
-    ...rest,
-    ...(details === undefined ? {} : { details }),
-    ...(traceId === undefined ? {} : { traceId }),
-  }));
+  .superRefine((data, ctx) => checkFiles(data.files, data.inputs.length, ctx));

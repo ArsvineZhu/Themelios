@@ -1,12 +1,33 @@
 import {
   appError,
+  matchesMime,
+  plainTextMediaType,
   type DeliveredMedia,
   type Extent,
   type MediaInput,
   type Range,
   type RepresentationCoverage,
 } from "@themelios/core";
-import type { ModelPart } from "./types.js";
+import type { ModelCapabilities, ModelPart } from "./types.js";
+
+export function partMediaType(part: ModelPart): string {
+  return part.kind === "text" ? plainTextMediaType : part.mediaType;
+}
+
+export function partBytes(part: ModelPart): number {
+  return part.kind === "text"
+    ? Buffer.byteLength(part.text)
+    : part.bytes.byteLength;
+}
+
+export function modelAcceptsMedia(
+  model: ModelCapabilities,
+  mediaType: string,
+): boolean {
+  return model.inputMimeTypes.some((pattern) =>
+    matchesMime(pattern, mediaType),
+  );
+}
 
 function rangeBounds(
   range: Exclude<Range, { kind: "json" }>,
@@ -52,7 +73,7 @@ function within(
 export function deliveredMedia(
   original: MediaInput,
   part: ModelPart,
-  output?: { name: string; coverage?: RepresentationCoverage },
+  output?: { name?: string; coverage?: RepresentationCoverage },
 ): DeliveredMedia {
   const coverage = output
     ? output.coverage
@@ -71,10 +92,10 @@ export function deliveredMedia(
   }
   return part.kind === "text"
     ? {
-        mediaType: "text/plain",
-        ...(output ? { name: output.name } : {}),
+        mediaType: plainTextMediaType,
+        ...(output?.name === undefined ? {} : { name: output.name }),
         sourceRange: coverage.sourceRange,
-        extent: { kind: "text", bytes: Buffer.byteLength(part.text) },
+        extent: { kind: "text", bytes: partBytes(part) },
       }
     : {
         mediaType: part.mediaType,
@@ -96,4 +117,35 @@ export function extentDescription(extent: Extent): string {
     case "unknown":
       return "unknown";
   }
+}
+
+export function rangeDescription(
+  range: RepresentationCoverage["sourceRange"],
+): string {
+  if (!range) return "full";
+  switch (range.kind) {
+    case "text":
+      return `bytes ${range.start}..${range.end}`;
+    case "pages":
+      return range.end === range.start + 1
+        ? `page ${range.start}`
+        : `pages ${range.start}..${range.end - 1}`;
+    case "time":
+      return `${range.startMs}ms..${range.endMs}ms`;
+    case "image":
+      return `region ${range.x},${range.y} ${range.width}x${range.height} px`;
+    case "json":
+      return `pointer ${range.pointer}`;
+    case "timePoint":
+      return `frame at ${range.atMs} ms`;
+  }
+}
+
+export function deliveredDescription({
+  sourceRange,
+  extent,
+  mediaType,
+  name,
+}: DeliveredMedia): string {
+  return `${name ?? mediaType}: ${rangeDescription(sourceRange)} (${mediaType}, ${extentDescription(extent)})`;
 }

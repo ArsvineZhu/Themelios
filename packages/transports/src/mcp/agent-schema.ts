@@ -4,13 +4,43 @@ import {
   jsonSchema,
 } from "@themelios/core";
 import type { AgentRefBridge } from "@themelios/runtime/operations";
+import type {
+  JsonSchemaType,
+  JsonSchemaValidator,
+} from "@modelcontextprotocol/server";
+import { AjvJsonSchemaValidator } from "@modelcontextprotocol/server/validators/ajv";
 import { z } from "zod";
 import { transportError } from "../errors.js";
 
 type SchemaDef = z.core.$ZodTypes["_zod"]["def"];
 type TaggedOption = z.core.$ZodType<Record<string, unknown>>;
+export type SchemaDirection = "input" | "output";
 
-function wrappedSchema(def: SchemaDef, direction: "input" | "output") {
+const outputValidator = new AjvJsonSchemaValidator();
+const outputBranches = new WeakMap<
+  z.core.$ZodType,
+  JsonSchemaValidator<unknown>
+>();
+
+/** Chooses the outward shape of a validated result without invoking any codec. */
+function matchesOutputShape(schema: z.core.$ZodType, value: unknown): boolean {
+  let validate = outputBranches.get(schema);
+  if (!validate) {
+    const projection = z.toJSONSchema(schema, {
+      io: "output",
+      cycles: "ref",
+      unrepresentable: "any",
+    });
+    // Zod and the SDK share the dialect but declare $vocabulary differently.
+    validate = outputValidator.getValidator(
+      projection as unknown as JsonSchemaType,
+    );
+    outputBranches.set(schema, validate);
+  }
+  return validate(value).valid;
+}
+
+function wrappedSchema(def: SchemaDef, direction: SchemaDirection) {
   if (def.type === "lazy") return def.getter();
   if (def.type === "pipe") return direction === "input" ? def.in : def.out;
   if ("innerType" in def && def.type !== "success" && def.type !== "promise")
@@ -19,16 +49,16 @@ function wrappedSchema(def: SchemaDef, direction: "input" | "output") {
 
 export function agentSchema(
   schema: z.ZodType,
-  direction: "input" | "output",
+  direction: SchemaDirection,
   bridge?: AgentRefBridge,
 ) {
   const options = { io: direction, cycles: "ref" } as const;
-  if (!bridge)
-    return { advertised: schema, convert: (value: unknown) => value };
   const advertised = z.toJSONSchema(schema, {
     ...options,
+    unrepresentable: "any",
     override({ jsonSchema }) {
       if (
+        bridge &&
         jsonSchema["x-themelios-ref"] &&
         typeof jsonSchema.pattern === "string"
       ) {
@@ -37,8 +67,9 @@ export function agentSchema(
     },
   });
 
-  const convertRef: (value: string) => string =
-    direction === "input"
+  const convertRef: (value: string) => string = !bridge
+    ? (value) => value
+    : direction === "input"
       ? (value) =>
           agentArtifactRefPattern.test(value) ? bridge.resolveRef(value) : value
       : (value) =>
@@ -111,8 +142,8 @@ export function agentSchema(
     }
     const def = node._zod.def;
     if (direction === "input") return walkInputUnion(def, value);
-    const branch = def.options.find(
-      (candidate) => z.core.safeParse(candidate, value).success,
+    const branch = def.options.find((candidate) =>
+      matchesOutputShape(candidate, value),
     );
     return branch ? walk(branch, value) : value;
   }
@@ -160,6 +191,6 @@ export function agentSchema(
         },
       },
     },
-    convert: (value: unknown) => walk(schema, value),
+    convert: (value: unknown) => (bridge ? walk(schema, value) : value),
   };
 }

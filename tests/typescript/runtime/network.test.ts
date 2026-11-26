@@ -3,11 +3,13 @@ import { createNetwork } from "@themelios/runtime/network";
 
 test("HTTP deadline covers the unread response body and aborts the upstream stream", async () => {
   const cancelled = Promise.withResolvers<void>();
+  const uploaded = Promise.withResolvers<string>();
   const encoder = new TextEncoder();
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
-    fetch() {
+    async fetch(request) {
+      uploaded.resolve(await request.text());
       let ticker: ReturnType<typeof setInterval>;
       return new Response(
         new ReadableStream<Uint8Array>({
@@ -28,7 +30,10 @@ test("HTTP deadline covers the unread response body and aborts the upstream stre
   });
   const network = await createNetwork({ timeoutMs: 300 });
   try {
-    const response = await network.fetch(server.url);
+    const response = await network.fetch(
+      new Request(server.url, { method: "POST", body: "tea" }),
+    );
+    expect(await uploaded.promise).toBe("tea");
     expect(response.url).toBe(server.url.href);
     const reader = response.body!.getReader();
     expect(new TextDecoder().decode((await reader.read()).value)).toBe("first");

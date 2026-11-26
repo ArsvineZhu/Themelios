@@ -4,6 +4,7 @@ import {
 } from "@modelcontextprotocol/server/stdio";
 import { resolveDirectory } from "../directory.js";
 import { defaultMaxJsonBytes } from "../json.js";
+import { defaultLocale } from "@themelios/runtime/locales";
 import { RequestTracker, runProtectedHttp } from "../request.js";
 import type {
   HttpEndpoint,
@@ -63,7 +64,7 @@ export async function serveMcpStdio<App>(
         ...(input.translate ? { translate: input.translate } : {}),
         ...(input.agentRefs ? { agentRefs: input.agentRefs } : {}),
         request(ctx, signal) {
-          const locale = input.locale?.() ?? "zh-CN";
+          const locale = input.locale?.() ?? defaultLocale;
           return {
             principal: input.principal,
             locale,

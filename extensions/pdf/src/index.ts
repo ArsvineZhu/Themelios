@@ -1,5 +1,9 @@
 import {
   appError,
+  defaultImagePixels,
+  defaultMediaInputBytes,
+  parseValue,
+  plainTextMediaType,
   type Json,
   type MediaInput,
   type PreparedRepresentation,
@@ -8,12 +12,14 @@ import {
   type RepresentationCoverage,
   type RepresentationFile,
 } from "@themelios/core";
+import pdfLibPackage from "pdf-lib/package.json" with { type: "json" };
 import { z } from "zod";
 import {
   bounds,
-  parameters,
+  pdfMediaType,
   pdfjsVersion,
   withPdf,
+  withPdfBytes,
   type PdfAdapterOptions,
 } from "./document.js";
 import { copyPages, renderPages } from "./pages.js";
@@ -21,12 +27,16 @@ import { extractText } from "./text.js";
 
 export type { PdfAdapterOptions } from "./document.js";
 
-const inputMimeTypes = ["application/pdf"];
+const inputMimeTypes = [pdfMediaType];
+const textRecipe = "pdf.text";
+const pagesRecipe = "pdf.pages";
+const renderRecipe = "pdf.render";
 const version = "1";
 const empty = z.strictObject({});
+const renderDimension = z.int().positive().default(1600);
 const renderParameters = z.strictObject({
-  maxWidth: z.int().positive().default(1600),
-  maxHeight: z.int().positive().default(1600),
+  maxWidth: renderDimension,
+  maxHeight: renderDimension,
 });
 
 function prepared(
@@ -65,8 +75,8 @@ function file(
 
 /** PDF adapters can be registered independently of a task or model provider. */
 export function createPdfAdapters({
-  maxBytes = 67_108_864,
-  maxPixels = 40_000_000,
+  maxBytes = defaultMediaInputBytes,
+  maxPixels = defaultImagePixels,
 }: PdfAdapterOptions = {}): readonly RepresentationAdapter[] {
   const probe: RepresentationAdapter["probe"] = (input, options) =>
     withPdf(input, maxBytes, options, async (pdf) => ({
@@ -100,7 +110,13 @@ export function createPdfAdapters({
   }
   return [
     {
-      description: recipe("pdf.text", ["text"], ["text/plain"], empty, 10),
+      description: recipe(
+        textRecipe,
+        ["text"],
+        [plainTextMediaType],
+        empty,
+        10,
+      ),
       validateForModel(representation, input) {
         const value = representation.result.value as { emptyPages: number[] };
         if (value.emptyPages.length) {
@@ -116,71 +132,65 @@ export function createPdfAdapters({
       probe,
       available,
       prepare(input, raw, options) {
-        parameters(empty, raw);
-        return withPdf(
-          input,
-          maxBytes,
-          options,
-          async (pdf, _bytes, signal) => {
-            const { bytes, pages, emptyPages } = await extractText(
-              pdf,
-              bounds(input, pdf.numPages),
-              signal,
-            );
-            enforceBytes(bytes.byteLength);
-            return prepared(
-              input,
-              "pdf.text",
-              { pages, emptyPages },
-              [
-                file("text.txt", bytes, "text/plain", {
-                  sourceRange: input.range ?? null,
-                  extent: { kind: "text", bytes: bytes.byteLength },
-                }),
-              ],
-              { library: "pdfjs-dist", libraryVersion: pdfjsVersion },
-            );
-          },
-        );
-      },
-    },
-    {
-      description: recipe(
-        "pdf.pages",
-        ["text", "visual"],
-        ["application/pdf"],
-        empty,
-        40,
-      ),
-      probe,
-      available,
-      prepare(input, raw, options) {
-        parameters(empty, raw);
-        return withPdf(input, maxBytes, options, async (pdf, data, signal) => {
-          const { bytes, pages } = await copyPages(
-            data,
+        parseValue(empty, raw, "input.invalid");
+        return withPdf(input, maxBytes, options, async (pdf, signal) => {
+          const { bytes, pages, emptyPages } = await extractText(
+            pdf,
             bounds(input, pdf.numPages),
             signal,
           );
           enforceBytes(bytes.byteLength);
           return prepared(
             input,
-            "pdf.pages",
-            { pages },
+            textRecipe,
+            { pages, emptyPages },
             [
-              file("pages.pdf", bytes, "application/pdf", {
+              file("text.txt", bytes, plainTextMediaType, {
                 sourceRange: input.range ?? null,
-                extent: { kind: "pages", pages: pages.length },
+                extent: { kind: "text", bytes: bytes.byteLength },
               }),
             ],
-            { library: "pdf-lib", libraryVersion: "1.17.1" },
+            { library: "pdfjs-dist", libraryVersion: pdfjsVersion },
           );
         });
       },
     },
     {
       description: recipe(
-        "pdf.render",
+        pagesRecipe,
+        ["text", "visual"],
+        [pdfMediaType],
+        empty,
+        40,
+      ),
+      probe,
+      available,
+      prepare(input, raw, options) {
+        parseValue(empty, raw, "input.invalid");
+        return withPdfBytes(input, maxBytes, options, async (data, signal) => {
+          const { bytes, pages } = await copyPages(input, data, signal);
+          enforceBytes(bytes.byteLength);
+          return prepared(
+            input,
+            pagesRecipe,
+            { pages },
+            [
+              file("pages.pdf", bytes, pdfMediaType, {
+                sourceRange: input.range ?? null,
+                extent: { kind: "pages", pages: pages.length },
+              }),
+            ],
+            {
+              library: pdfLibPackage.name,
+              libraryVersion: pdfLibPackage.version,
+            },
+          );
+        });
+      },
+    },
+    {
+      description: recipe(
+        renderRecipe,
         ["visual"],
         ["image/png"],
         renderParameters,
@@ -196,25 +206,20 @@ export function createPdfAdapters({
         }
       },
       prepare(input, raw, options) {
-        const settings = parameters(renderParameters, raw);
-        return withPdf(
-          input,
-          maxBytes,
-          options,
-          async (pdf, _bytes, signal) => {
-            const { files, pages } = await renderPages(
-              pdf,
-              bounds(input, pdf.numPages),
-              { ...settings, maxBytes, maxPixels },
-              signal,
-            );
-            return prepared(input, "pdf.render", { pages }, files, {
-              library: "pdfjs-dist",
-              libraryVersion: pdfjsVersion,
-              parameters: settings,
-            });
-          },
-        );
+        const settings = parseValue(renderParameters, raw, "input.invalid");
+        return withPdf(input, maxBytes, options, async (pdf, signal) => {
+          const { files, pages } = await renderPages(
+            pdf,
+            bounds(input, pdf.numPages),
+            { ...settings, maxBytes, maxPixels },
+            signal,
+          );
+          return prepared(input, renderRecipe, { pages }, files, {
+            library: "pdfjs-dist",
+            libraryVersion: pdfjsVersion,
+            parameters: settings,
+          });
+        });
       },
     },
   ];

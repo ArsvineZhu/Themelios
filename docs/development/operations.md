@@ -16,7 +16,7 @@
 | `materials.text` · read | `material text --input selection.json --json` | `POST /materials/text`，正文用 `selection.json` | `materials_text` |
 | `materials.structure` · read | `material structure R --json` | `GET /materials/R/structure` | `materials_structure` |
 | `materials.sources` · read | `material sources V --depth 2 --json` | `GET /materials/V/sources?depth=2` | `materials_sources` |
-| `materials.list` · read | `material list --limit 2 --at 1 --after R --json` | `GET /materials?limit=2&at=1&after=R` | `materials_list` |
+| `materials.listRetained` · read | `material list --limit 2 --at 1 --after R --json` | `GET /materials?limit=2&at=1&after=R` | `materials_list_retained` |
 | `materials.retain` · write | `material retain R` | `POST /materials/R/retain`，正文 `{}` | |
 | `materials.release` · write | `material release R` | `POST /materials/R/release`，正文 `{}` | |
 | `results.save` · write | `result save --input value.json --json` | `POST /results`，正文用 `value.json` | |
@@ -24,7 +24,7 @@
 
 CLI 还可用 `material import --text Tea --name tea.txt`、`material import --stdin --mime text/plain` 或 `material import --input inline.json`。`inline.json` 使用 `/materials/accept` 的 Base64 正文形状。四种输入选一种。显式 `--name` 和 `--mime` 设置显示名与媒体类型，优先于 JSON 中的 `name` 和 `mediaType`。导出要求目标文件尚未存在。
 
-`structure` 返回 Markdown 标题、段落、引用、代码块和表格等块及其原文坐标。`sources` 追查输入、成果文件和派生表示与原件的关系。`list` 的 `at` 使用提交位置，`after` 取上一页的末尾引用。`release` 解除直接保留，仍被其他成果使用的材料继续受来源关系保护。
+`structure` 返回 Markdown 标题、段落、引用、代码块和表格等块及其原文坐标。`sources` 追查输入、成果文件和派生表示与原件的关系。`list` 枚举显式保留目录，`at` 使用提交位置，`after` 取上一页的末尾引用。`release` 解除直接保留，仍被其他成果使用的材料继续受来源关系保护。
 
 ## 任务和提示词
 

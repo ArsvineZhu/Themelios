@@ -2,15 +2,19 @@ import { extname } from "node:path";
 import { fileTypeFromBuffer } from "file-type";
 import { z } from "zod";
 import { appError } from "./errors.js";
+import { parseValue } from "./json.js";
 
 export const mediaTypeSchema = z
   .string()
-  .regex(/^[\w!#$&^.+-]+\/[\w!#$&^.+-]+$/);
+  .regex(/^[\w!#$&^.+-]+\/[\w!#$&^.+-]+$/)
+  .toLowerCase();
+
+export const plainTextMediaType = "text/plain";
 
 export const mediaProbeBytes = 16_384;
 
 const textExtensions: Partial<Record<string, string>> = {
-  ".txt": "text/plain",
+  ".txt": plainTextMediaType,
   ".md": "text/markdown",
   ".markdown": "text/markdown",
   ".csv": "text/csv",
@@ -18,11 +22,18 @@ const textExtensions: Partial<Record<string, string>> = {
   ".json": "application/json",
 };
 
+export function isJsonMedia(mediaType: string): boolean {
+  return mediaType === "application/json" || mediaType.endsWith("+json");
+}
+
 export function isTextMedia(mediaType: string): boolean {
+  return mediaType.startsWith("text/") || isJsonMedia(mediaType);
+}
+
+export function matchesMime(pattern: string, mediaType: string): boolean {
   return (
-    mediaType.startsWith("text/") ||
-    mediaType === "application/json" ||
-    mediaType.endsWith("+json")
+    pattern === mediaType ||
+    (pattern.endsWith("/*") && mediaType.startsWith(pattern.slice(0, -1)))
   );
 }
 
@@ -35,16 +46,25 @@ const signatureRequired = new Set([
   "image/tiff",
   "image/avif",
 ]);
+const sqliteHeader = new TextEncoder().encode("SQLite format 3\0");
 
 /** Check declared MIME against the actual binary signature of a captured prefix. */
 export async function probeMediaType(
   prefix: Uint8Array,
   declared?: string,
 ): Promise<string | undefined> {
-  const mime = declared?.toLowerCase();
+  const mime =
+    declared === undefined ? undefined : parseValue(mediaTypeSchema, declared);
   let detected: string | undefined;
   try {
     detected = (await fileTypeFromBuffer(prefix))?.mime;
+    // A prose note can begin with the shorter prefix reported by file-type.
+    if (
+      detected === "application/x-sqlite3" &&
+      !sqliteHeader.every((byte, index) => prefix[index] === byte)
+    ) {
+      detected = undefined;
+    }
   } catch (error) {
     if (!(error instanceof Error && error.name === "EndOfStreamError"))
       throw error;

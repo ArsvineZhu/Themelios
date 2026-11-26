@@ -15,16 +15,19 @@ import {
   appError,
   errorCode,
   AppError,
-  instantSchema,
+  installationDirectories,
+  instanceManifestFile,
+  instanceManifestSchema,
+  type InstanceManifest,
   throwIfAborted,
 } from "@themelios/core";
-import { z } from "zod";
 import { SettingFields } from "./configuration/definition.js";
 import { loadCandidate, readLayers } from "./configuration/load.js";
 import { bootstrapDiagnostics } from "./diagnostics.js";
 import { openInstanceLock } from "./lock.js";
 import {
   configurationFiles,
+  installationConfigurationPath,
   instancePaths,
   type InstanceInfo,
 } from "./paths.js";
@@ -42,20 +45,13 @@ export interface InstallationOptions {
 }
 
 export interface Instance<Api, S> {
+  readonly root: string;
   init(): Promise<InstanceInfo>;
   locate(): Promise<InstanceInfo>;
   open(options?: OpenOptions): Promise<Session<Api, S>>;
 }
 
 const namePattern = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
-const manifestSchema = z.strictObject({
-  id: z.uuid(),
-  name: z.string().min(1),
-  applicationId: z.string().min(1),
-  formatId: z.string().min(1),
-  createdAt: instantSchema,
-});
-type Manifest = z.infer<typeof manifestSchema>;
 
 export class Installation<Api, S> {
   private constructor(
@@ -72,9 +68,13 @@ export class Installation<Api, S> {
     const absolute = resolve(root);
     return new Installation(
       application,
-      resolve(absolute, options.configRoot ?? "config"),
-      resolve(absolute, options.dataRoot ?? "instances"),
+      resolve(absolute, options.configRoot ?? installationDirectories.config),
+      resolve(absolute, options.dataRoot ?? installationDirectories.instances),
     );
+  }
+
+  get configurationPath(): string {
+    return installationConfigurationPath(this.configRoot);
   }
 
   instance(name: string): Instance<Api, S> {
@@ -114,6 +114,9 @@ export class Installation<Api, S> {
       return { ...manifest, paths };
     };
     return {
+      get root() {
+        return root;
+      },
       init: () =>
         initialize(application, this.configRoot, root, name, createConfigRoot),
       locate,
@@ -152,10 +155,12 @@ export async function withInstanceLock<T>(
   }
 }
 
-async function readManifest(root: string): Promise<Manifest> {
-  const file = join(root, "instance.json");
+async function readManifest(root: string): Promise<InstanceManifest> {
+  const file = join(root, instanceManifestFile);
   try {
-    return manifestSchema.parse(JSON.parse(await readFile(file, "utf8")));
+    return instanceManifestSchema.parse(
+      JSON.parse(await readFile(file, "utf8")),
+    );
   } catch (error) {
     if (errorCode(error) === "ENOENT")
       throw appError("runtime.instance_not_found", { cause: error });
@@ -177,7 +182,7 @@ async function targetState(path: string): Promise<"missing" | "empty"> {
   if (directory) {
     const entries = await readdir(path);
     if (!entries.length) return "empty";
-    if (entries.includes("instance.json")) {
+    if (entries.includes(instanceManifestFile)) {
       let id: string | undefined;
       try {
         id = (await readManifest(path)).id;
@@ -222,7 +227,7 @@ async function initialize<Api, S>(
     await mkdir(join(paths.config, "prompts"));
     const files = configurationFiles(configRoot, paths);
     await writeFile(files.managed, "", { flag: "wx" });
-    const instance: Manifest = {
+    const instance: InstanceManifest = {
       id: randomUUID(),
       applicationId: application.id,
       formatId: application.formatId,
@@ -243,7 +248,7 @@ async function initialize<Api, S>(
       diagnostics,
     });
     await writeFile(
-      join(staging, "instance.json"),
+      join(staging, instanceManifestFile),
       JSON.stringify(instance, null, 2) + "\n",
       { flag: "wx", flush: true },
     );

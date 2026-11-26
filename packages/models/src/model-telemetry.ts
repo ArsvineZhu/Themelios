@@ -3,8 +3,9 @@ import type {
   Diagnostics,
   ModelAttemptDiagnostic,
 } from "@themelios/runtime/diagnostics";
+import type { Network } from "@themelios/runtime/network";
 import type { LanguageModelUsage } from "ai";
-import type { FetchFunction, ModelIdentity } from "./types.js";
+import type { ModelIdentity } from "./types.js";
 
 type Tokens = Pick<
   ModelAttemptDiagnostic,
@@ -54,11 +55,11 @@ export class ModelTelemetry {
     }
   }
 
-  observeFetch(fetch: FetchFunction, credential?: string): FetchFunction {
+  observeFetch(fetch: Network["fetch"], credential?: string): Network["fetch"] {
     if (!this.diagnostics) return fetch;
-    return async (input, init) => {
-      const event = this.#exchange(input, init, credential);
-      const response = await fetch(input, init);
+    return async (request) => {
+      const event = this.#exchange(request, credential);
+      const response = await fetch(request);
       event.status = response.status;
       return response;
     };
@@ -73,11 +74,7 @@ export class ModelTelemetry {
       await Promise.all(batch.map((exchange) => exchange.logged));
   }
 
-  #exchange(
-    input: string | URL | Request,
-    init?: RequestInit,
-    credential?: string,
-  ): Exchange {
+  #exchange(request: Request, credential?: string): Exchange {
     const diagnostics = this.diagnostics!;
     const started = performance.now();
     const previous = this.#active.at(-1);
@@ -89,11 +86,9 @@ export class ModelTelemetry {
       attempt,
     };
     const completed = Promise.withResolvers<Finish>();
-    let capture: ReturnType<typeof requestDetails> | undefined;
-    if (this.capturesContent)
-      logDiagnostic(() => {
-        capture = requestDetails(input, init, credential);
-      });
+    const capture = this.capturesContent
+      ? requestDetails(request, credential).catch(() => undefined)
+      : undefined;
     const exchange: Exchange = {
       started,
       settle: completed.resolve,
@@ -114,31 +109,28 @@ export class ModelTelemetry {
               );
               const code = error?.code;
               const providerStatus = exchange.status;
+              const status = {
+                outcome,
+                durationMs,
+                ...(code === undefined ? {} : { code }),
+                ...(providerStatus === undefined ? {} : { providerStatus }),
+              } as const;
               logDiagnostic(() =>
                 diagnostics.recordModelAttempt?.({
                   ...labels,
-                  durationMs,
-                  outcome,
-                  ...(code ? { code } : {}),
-                  ...(providerStatus === undefined ? {} : { providerStatus }),
+                  ...status,
                   ...tokens,
                 }),
               );
-              if (capture) {
+              const captured = await capture;
+              if (captured) {
                 await diagnostics.captureModelContent?.({
                   attempt,
-                  request: capture.request,
-                  secrets: capture.secrets,
+                  request: captured.request,
+                  secrets: captured.secrets,
                   ...(response === undefined ? {} : { response }),
                   ...(schema === undefined ? {} : { schema }),
-                  status: {
-                    outcome,
-                    durationMs,
-                    ...(code ? { code } : {}),
-                    ...(exchange.status === undefined
-                      ? {}
-                      : { providerStatus: exchange.status }),
-                  },
+                  status,
                 });
               }
               if (error) throw error;
@@ -166,14 +158,11 @@ export function countTokens(usage: LanguageModelUsage): Tokens {
   };
 }
 
-function requestDetails(
-  input: string | URL | Request,
-  init?: RequestInit,
+async function requestDetails(
+  request: Request,
   credential?: string,
-): { request: Json; secrets: string[] } {
-  const request = input instanceof Request ? input : undefined;
-  const headers = new Headers(init?.headers ?? request?.headers);
-  const secrets = [...headers]
+): Promise<{ request: Json; secrets: string[] }> {
+  const secrets = [...request.headers]
     .filter(([name]) =>
       /(?:auth|cookie|api[-_]?key|token|secret|signature|credential)/i.test(
         name,
@@ -181,35 +170,33 @@ function requestDetails(
     )
     .map(([, value]) => value);
   if (credential) secrets.push(credential);
-  const body = captureBody(
-    init?.body,
-    headers.get("content-type") ?? undefined,
-  );
+  const body = request.body ? await captureBody(request.clone()) : undefined;
   return {
     request: {
-      method: init?.method ?? request?.method ?? "GET",
+      method: request.method,
       ...(body === undefined ? {} : { body }),
     },
     secrets: [...new Set(secrets)],
   };
 }
 
-function captureBody(
-  body: RequestInit["body"],
-  mediaType?: string,
-): Json | undefined {
-  if (typeof body === "string") {
+async function captureBody(request: Request): Promise<Json> {
+  const mediaType =
+    request.headers.get("content-type")?.split(";")[0] ??
+    "application/octet-stream";
+  if (mediaType === "application/json" || mediaType.endsWith("+json")) {
+    const body = await request.text();
     try {
       return withoutMedia(JSON.parse(body) as Json);
     } catch {
-      return {
-        mediaType: mediaType ?? "text/plain",
-        sizeBytes: Buffer.byteLength(body),
-      };
+      return { mediaType, sizeBytes: Buffer.byteLength(body) };
     }
   }
-  if (body instanceof FormData) {
-    return [...body].map(([name, value]) => ({
+  if (
+    mediaType === "multipart/form-data" ||
+    mediaType === "application/x-www-form-urlencoded"
+  ) {
+    return [...(await request.formData())].map(([name, value]) => ({
       name,
       value:
         typeof value === "string"
@@ -217,18 +204,7 @@ function captureBody(
           : { mediaType: value.type, sizeBytes: value.size },
     }));
   }
-  if (body instanceof Blob)
-    return {
-      mediaType: body.type || mediaType || "application/octet-stream",
-      sizeBytes: body.size,
-    };
-  if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
-    return {
-      mediaType: mediaType ?? "application/octet-stream",
-      sizeBytes: body.byteLength,
-    };
-  }
-  return undefined;
+  return { mediaType, sizeBytes: (await request.blob()).size };
 }
 
 function withoutMedia(value: Json): Json {

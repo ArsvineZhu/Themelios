@@ -1,19 +1,24 @@
 import {
   appError,
+  defaultImagePixels,
+  defaultMediaInputBytes,
   mediaDecodeError,
+  mediaRangeFits,
   openCall,
   parseValue,
   rangeSchema,
   readMediaBytes,
   type CallOptions,
   type CallScope,
+  type Extent,
   type MediaInput,
   type Json,
   type RepresentationAdapter,
   type RepresentationFile,
 } from "@themelios/core";
-import sharp, { type Metadata, type Sharp } from "sharp";
+import sharp, { type Sharp } from "sharp";
 import { z } from "zod";
+import { orientedImageExtent } from "./media-metadata.js";
 export interface ImageAdapterOptions {
   maxPixels?: number;
   maxBytes?: number;
@@ -21,7 +26,7 @@ export interface ImageAdapterOptions {
 
 const id = "image.normalize";
 const version = "1";
-const defaultMaxPixels = 40_000_000;
+const outputName = "image";
 const formats = ["png", "jpeg", "webp"] as const;
 type Format = (typeof formats)[number];
 const imageType = (format: Format) => `image/${format}`;
@@ -46,7 +51,7 @@ async function loadedImage(
   input: MediaInput,
   maxPixels: number,
   options: CallOptions,
-  maxBytes = 67_108_864,
+  maxBytes = defaultMediaInputBytes,
 ) {
   const bytes = await readMediaBytes(input, options, maxBytes);
   const metadata = await sharp(bytes, { limitInputPixels: false }).metadata();
@@ -59,20 +64,17 @@ async function loadedImage(
       },
     });
   }
-  const { width, height } = metadata.autoOrient ?? metadata;
-  const frames = metadata.pages ?? 1;
-  const pixels = width * height * frames;
+  const extent = orientedImageExtent(metadata);
+  const pixels = extent.width * extent.height * extent.frames;
   if (pixels > maxPixels)
     throw appError("model.input_too_large", {
       details: { name: input.info.name ?? null, maxPixels, pixels },
     });
   return {
     bytes,
-    metadata,
     format,
-    width,
-    height,
-    frames,
+    extent,
+    hasAlpha: metadata.hasAlpha,
     rotate: (metadata.orientation ?? 1) > 1,
   };
 }
@@ -116,23 +118,25 @@ function requireSingleFrame(input: MediaInput, frames: number): void {
   });
 }
 
-function checkRange(input: MediaInput, width: number, height: number) {
+function checkRange(
+  input: MediaInput,
+  extent: Extract<Extent, { kind: "image" }>,
+) {
   const range = input.range;
   if (!range) return undefined;
   const parsed = rangeSchema.safeParse(range);
   if (
     !parsed.success ||
     parsed.data.kind !== "image" ||
-    parsed.data.x + parsed.data.width > width ||
-    parsed.data.y + parsed.data.height > height
+    !mediaRangeFits(parsed.data, extent)
   ) {
     throw appError("content.range_invalid", {
       details: {
         range,
         ...("ref" in input.source ? { ref: input.source.ref } : {}),
         reason: "invalid rectangle in the oriented image",
-        width,
-        height,
+        width: extent.width,
+        height: extent.height,
       },
     });
   }
@@ -147,11 +151,11 @@ function checkRange(input: MediaInput, width: number, height: number) {
 
 async function orient(
   bytes: Uint8Array,
-  metadata: Metadata,
+  rotate: boolean,
   maxPixels: number,
 ): Promise<Sharp> {
   const decoder = sharp(bytes, { limitInputPixels: maxPixels });
-  if ((metadata.orientation ?? 1) === 1) return decoder;
+  if (!rotate) return decoder;
   const { data, info } = await decoder
     .autoOrient()
     .raw()
@@ -190,7 +194,7 @@ function encode(
 }
 
 export function createImageAdapter({
-  maxPixels = defaultMaxPixels,
+  maxPixels = defaultImagePixels,
   maxBytes,
 }: ImageAdapterOptions = {}): RepresentationAdapter {
   return {
@@ -218,17 +222,12 @@ export function createImageAdapter({
         maxPixels,
         maxBytes,
         options,
-        ({ width, height, frames }) => ({
-          kind: "image",
-          width,
-          height,
-          frames,
-        }),
+        ({ extent }) => extent,
       );
     },
     requiresNormalization(input, options) {
       return withImage(input, maxPixels, maxBytes, options, (image) => {
-        requireSingleFrame(input, image.frames);
+        requireSingleFrame(input, image.extent.frames);
         return image.rotate;
       });
     },
@@ -257,19 +256,12 @@ export function createImageAdapter({
         maxBytes,
         options,
         async (
-          {
-            metadata,
-            bytes,
-            format: originalFormat,
-            width,
-            height,
-            frames,
-            rotate,
-          },
+          { hasAlpha, bytes, format: originalFormat, extent, rotate },
           scope,
         ) => {
+          const { width, height, frames } = extent;
           requireSingleFrame(input, frames);
-          const crop = checkRange(input, width, height);
+          const crop = checkRange(input, extent);
           const format =
             parameters.format === "source" ? originalFormat : parameters.format;
           const resize =
@@ -280,7 +272,7 @@ export function createImageAdapter({
             (format !== "png" && parameters.quality !== undefined);
           let output = { bytes, width, height };
           if (rotate || crop || resize || reencode) {
-            const image = await orient(bytes, metadata, maxPixels);
+            const image = await orient(bytes, rotate, maxPixels);
             scope.throwIfAborted();
             if (crop) image.extract(crop);
             if (resize)
@@ -292,7 +284,7 @@ export function createImageAdapter({
               image,
               format,
               parameters,
-              metadata.hasAlpha,
+              hasAlpha,
             ).toBuffer({ resolveWithObject: true });
             output = { bytes: data, width: info.width, height: info.height };
           }
@@ -304,7 +296,7 @@ export function createImageAdapter({
           };
           const files: RepresentationFile[] = [
             {
-              name: "image",
+              name: outputName,
               sourceIndices: [0],
               coverage: {
                 sourceRange: input.range ?? null,
@@ -318,12 +310,12 @@ export function createImageAdapter({
               material: {
                 bytes: output.bytes,
                 mediaType: imageType(format),
-                name: `image.${format}`,
+                name: `${outputName}.${format}`,
               },
             },
           ];
           return {
-            outputs: ["image"],
+            outputs: [outputName],
             result: {
               value: { width: output.width, height: output.height, format },
               inputs: [

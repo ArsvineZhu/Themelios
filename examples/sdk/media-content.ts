@@ -2,6 +2,7 @@ import { mkdtemp, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  applicationSettings,
   createApplicationModule,
   standardOperations,
 } from "@themelios/application";
@@ -19,8 +20,17 @@ import {
   defineOperation,
 } from "@themelios/runtime/operations";
 import { createPdfAdapters } from "@themelios/pdf";
-import { createPreparation, defineTask, z } from "@themelios/models";
-import { probeMediaType, type MediaInput } from "@themelios/core";
+import {
+  createPreparation,
+  defineTask,
+  textOutput,
+  z,
+} from "@themelios/models";
+import {
+  probeMediaType,
+  representationPurposeSchema,
+  type MediaInput,
+} from "@themelios/core";
 import { createHttpHandler, createMcpEndpoint } from "@themelios/transports";
 import { createSecrets } from "@themelios/runtime/secrets";
 
@@ -29,7 +39,12 @@ const dir = await mkdtemp(
 );
 const db = Database.init({
   path: join(dir, "main.sqlite"),
-  schemaSql: contentSchemaSql,
+  schemaSql:
+    contentSchemaSql +
+    `
+    CREATE TABLE notes (ref TEXT PRIMARY KEY REFERENCES artifacts(ref));
+    CREATE TABLE reports (ref TEXT PRIMARY KEY REFERENCES artifacts(ref));
+    `,
   formatId: "sample",
 });
 const cas = await Cas.open(join(dir, "objects"));
@@ -41,9 +56,10 @@ const note = {
   name: "notes.md",
   mediaType: "text/markdown",
 };
-const prepared = await materials.prepare(note);
-const a = db.write((tx) => prepared.adopt(tx));
-await prepared.close();
+const a = await materials.adopt(note, (tx, selection) => {
+  tx.sql.run("INSERT INTO notes VALUES (?)", selection.ref);
+  return selection;
+});
 const b = await materials.accept({
   body: new Blob([new Uint8Array(note.bytes)]).stream(),
   mediaType: note.mediaType,
@@ -67,7 +83,10 @@ console.log(
 );
 console.log(
   "snapshot",
-  materials.list({ at: materials.inspect(a.ref).createdAtCut, limit: 1 }),
+  materials.listRetained({
+    at: materials.inspect(b.ref).createdAtCut,
+    limit: 1,
+  }),
 );
 console.log(
   "stream",
@@ -104,12 +123,14 @@ const completed = {
     },
   ],
 };
-const staged = await results.prepare(completed);
-const saved = db.write((tx) => staged.adopt(tx));
-await staged.close();
+const saved = await results.adopt(completed, (tx, report) => {
+  tx.sql.run("INSERT INTO reports VALUES (?)", report.ref);
+  return report;
+});
 console.log(
   "typed",
-  (await results.read(saved.ref, z.object({ title: z.string() }))).value,
+  (await results.read(saved.ref, { schema: z.object({ title: z.string() }) }))
+    .value,
 );
 const chain = await results.save({
   value: "forwarded",
@@ -124,8 +145,8 @@ const chain = await results.save({
   ],
 });
 console.log("sources", materials.sources(chain.ref, { depth: 3 }));
-for (const purpose of ["retrieval-text", "model-input"] as const) {
-  representations.set({
+for (const purpose of representationPurposeSchema.options) {
+  await representations.set({
     source: a,
     purpose,
     recipe: "notes.text",
@@ -134,7 +155,7 @@ for (const purpose of ["retrieval-text", "model-input"] as const) {
   });
   console.log(
     "indexed",
-    representations.find(a, purpose, "notes.text")?.outputs,
+    (await representations.read(a, purpose, "notes.text"))?.outputs,
   );
   representations.remove(a, purpose, "notes.text");
 }
@@ -282,7 +303,9 @@ const counter = {
 };
 const prep = createPreparation({ adapters: [counter] });
 const requirements = {
-  inputs: [{ mediaType: "application/x-counter", needs: ["text" as const] }],
+  inputs: [
+    { mediaType: "application/x-counter", accepts: [["text" as const]] },
+  ],
   minMaterials: 1,
 };
 const caps = {
@@ -293,12 +316,13 @@ const caps = {
   streaming: false,
 };
 const specimen = [
-  { bytes: new Uint8Array(3), mediaType: "application/x-counter" },
+  { source: { bytes: new Uint8Array(3), mediaType: "application/x-counter" } },
 ];
-console.log("plan", (await prep.plan(specimen, requirements, caps)).pending);
+const counterPlan = await prep.preview(specimen, requirements, caps);
+console.log("plan", counterPlan.pending);
 console.log(
   "delivered",
-  (await prep.forModel(specimen, requirements, caps)).parts,
+  (await prep.prepare(specimen, requirements, caps)).parts,
 );
 await verifyContent(db, cas);
 db.close();
@@ -309,19 +333,20 @@ const task = defineTask({
   title: "Echo",
   purpose: "Repeat a note",
   requirements: {
-    inputs: [{ mediaType: "text/plain", needs: ["text"] }],
+    inputs: [{ mediaType: "text/plain", accepts: [["text"]] }],
     minMaterials: 1,
   },
   input: z.object({}),
-  output: "text",
+  output: textOutput,
   templates: { inline: true, user: "Repeat the note" },
 });
 const app = createApplicationModule({
+  settings: applicationSettings,
   id: "notes",
   formatId: "notes",
   resourceRoot: dir,
   tasks: [task],
-  adapters: [counter, ...pdfAdapters],
+  adapters: () => [counter, ...pdfAdapters],
 });
 const instance = Installation.at(join(dir, "app"), app).instance("default");
 await instance.init();
@@ -340,19 +365,17 @@ const ctx = {
   locale: "en",
   options: {},
 };
-console.log(
-  "dispatch",
-  await callOperation(
-    session.api,
-    createOperationDirectory(ops),
-    "notes.echo",
-    { s: "tea" },
-    ctx,
-  ),
+const echoed = callOperation(
+  session.api,
+  createOperationDirectory(ops),
+  echo.id,
+  { s: "tea" },
+  ctx,
 );
+if (echoed.kind === "unary") console.log("dispatch", await echoed.result);
 const options = {
   operations: ops,
-  allowOperations: ["notes.echo"],
+  allowOperations: [echo.id],
   policy: () => ({
     maxJsonBytes: 65536,
     allowedHosts: ["localhost"],
@@ -364,7 +387,7 @@ const options = {
 };
 const http = createHttpHandler(session.api, options);
 const response = await http.fetch(
-  new Request("http://localhost/operations/notes.echo", {
+  new Request(`http://localhost/operations/${echo.id}`, {
     method: "POST",
     headers: { host: "localhost", "content-type": "application/json" },
     body: '{"s":"tea"}',

@@ -1,21 +1,24 @@
 import remarkGfm from "remark-gfm";
 import remarkParse from "remark-parse";
 import { unified } from "unified";
-import type { ArtifactRef, Selection } from "@themelios/core";
+import { selectionSchema, type ArtifactRef } from "@themelios/core";
+import { z } from "zod";
 
-export interface TextBlock {
-  kind:
-    | "heading"
-    | "paragraph"
-    | "list"
-    | "code"
-    | "quote"
-    | "table"
-    | "thematic-break";
-  depth?: number;
-  selection: Selection;
-  text: string;
-}
+export const textBlockSchema = z.strictObject({
+  kind: z.enum([
+    "heading",
+    "paragraph",
+    "list",
+    "code",
+    "table",
+    "quote",
+    "thematic-break",
+  ]),
+  depth: z.int().min(1).max(6).optional(),
+  selection: selectionSchema,
+  text: z.string(),
+});
+export type TextBlock = z.infer<typeof textBlockSchema>;
 
 type BlockKind = TextBlock["kind"];
 interface CachedBlock {

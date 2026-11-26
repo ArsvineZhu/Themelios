@@ -1,41 +1,65 @@
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+  Installation,
+  runtimeSettings,
+  withOfflineInstance,
+  type OpenEnvironment,
+  type RuntimeSettings,
+} from "@themelios/runtime";
 import {
   Cas,
   Database,
   backupStorage,
+  databaseFileName,
   restoreStorage,
 } from "@themelios/storage";
 
 const parent = await mkdtemp(join(tmpdir(), "themelios-search-"));
-const instanceRoot = join(parent, "notes");
 const destination = join(parent, "restored");
 const backup = join(parent, "backup");
 const formatId = "example.notes";
-const identity = { id: crypto.randomUUID(), applicationId: formatId, formatId };
-const databasePath = (root: string) => join(root, "state", "main.sqlite");
 const query = process.argv[2] ?? "assam";
-
-await mkdir(join(instanceRoot, "state"), { recursive: true });
-await writeFile(join(instanceRoot, "instance.json"), JSON.stringify(identity));
-const database = Database.init({
-  path: databasePath(instanceRoot),
+const installation = Installation.at(parent, {
+  id: formatId,
   formatId,
-  schemaSql: `
-    CREATE TABLE notes (
-      id INTEGER PRIMARY KEY,
-      title TEXT NOT NULL,
-      original TEXT NOT NULL REFERENCES blobs(ref)
-    ) STRICT;
-    CREATE INDEX notes_original ON notes(original);
-    CREATE VIRTUAL TABLE notes_search USING fts5(
-      title, text, content='', contentless_delete=1
+  settings: runtimeSettings,
+  async provision({ paths, clock }) {
+    Database.init({
+      path: join(paths.state, databaseFileName),
+      formatId,
+      now: clock.now,
+      schemaSql: `
+      CREATE TABLE notes (
+        id INTEGER PRIMARY KEY,
+        title TEXT NOT NULL,
+        original TEXT NOT NULL REFERENCES blobs(ref)
+      ) STRICT;
+      CREATE INDEX notes_original ON notes(original);
+      CREATE VIRTUAL TABLE notes_search USING fts5(title, text, content='', contentless_delete=1);
+      `,
+    }).close();
+  },
+  async open(env: OpenEnvironment<RuntimeSettings>) {
+    const database = env.own(
+      Database.open({
+        path: join(env.paths.state, databaseFileName),
+        formatId,
+        readonly: env.mode === "read-only",
+        now: env.clock.now,
+      }),
     );
-  `,
+    const cas = env.own(await Cas.open(env.paths.objects));
+    return { database, cas };
+  },
 });
-const cas = await Cas.open(join(instanceRoot, "objects"));
+const source = installation.instance("notes");
+await source.init();
+const session = await source.open();
 try {
+  const { database, cas } = session.api;
+  const encoder = new TextEncoder();
   const notes = [
     { title: "Black tea", text: "Assam tea comes from northeastern India." },
     { title: "Oolong tea", text: "Tieguanyin is a traditional oolong." },
@@ -43,7 +67,7 @@ try {
   const originals = await Promise.all(
     notes.map(async (note) => ({
       ...note,
-      blob: await cas.put(new TextEncoder().encode(note.text)),
+      blob: await cas.put(encoder.encode(note.text)),
     })),
   );
   database.write((tx) => {
@@ -58,28 +82,24 @@ try {
       index.run(row.lastInsertRowid, title, text);
     }
   });
-  await backupStorage({
-    ...identity,
-    instanceId: identity.id,
-    database,
-    cas,
-    instanceRoot,
-    destination: backup,
-  });
 } finally {
-  await cas.close();
-  database.close();
+  await session.close();
 }
-
-await restoreStorage({ backup, destination, ...identity });
-const restored = Database.open({
-  path: databasePath(destination),
+await withOfflineInstance(source, ({ paths }) =>
+  backupStorage({ instanceRoot: paths.root, destination: backup }),
+);
+await restoreStorage({
+  backup,
+  destination,
+  applicationId: formatId,
   formatId,
-  readonly: true,
 });
-const objects = await Cas.open(join(destination, "objects"));
+const restored = await installation
+  .external(destination)
+  .open({ mode: "read-only" });
 try {
-  const rows = restored.read((tx) =>
+  const { database, cas } = restored.api;
+  const rows = database.read((tx) =>
     tx.sql
       .query<{ title: string; original: string }>(
         `
@@ -90,13 +110,8 @@ try {
       )
       .all(query),
   );
-  for (const row of rows) {
-    const original = await new Response(
-      await objects.read(row.original),
-    ).text();
-    console.log(row.title, original);
-  }
+  for (const { title, original } of rows)
+    console.log(title, await new Response(await cas.read(original)).text());
 } finally {
-  await objects.close();
-  restored.close();
+  await restored.close();
 }

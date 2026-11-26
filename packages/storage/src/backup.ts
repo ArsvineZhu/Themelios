@@ -12,9 +12,15 @@ import {
 import {
   AppError,
   appError,
+  blobDigestAlgorithm,
+  blobDigestHexSchema,
   commitPointSchema,
   errorCode,
+  instanceDirectories,
+  instanceManifestFile,
+  instanceManifestSchema,
   throwIfAborted,
+  type InstanceManifest,
 } from "@themelios/core";
 import {
   publishNewFile,
@@ -31,7 +37,7 @@ import {
   removeStaging,
 } from "./backup-files.js";
 import { Cas } from "./cas.js";
-import { Database } from "./database.js";
+import { Database, databaseFileName } from "./database.js";
 import { syncParent, writeChunk } from "./files.js";
 import {
   readInventory,
@@ -41,24 +47,19 @@ import {
 } from "./maintenance.js";
 
 const installationFile = "installation-config.toml";
-const instanceFile = "instance.json";
 const manifestFile = "backup.json";
-const databaseFile = join("state", "main.sqlite");
+const backupFormat = "themelios.backup";
+const databaseFile = join(instanceDirectories.state, databaseFileName);
 
-const instanceSchema = z.looseObject({
-  id: z.string().min(1),
-  applicationId: z.string().min(1),
-  formatId: z.string().min(1),
-});
 const installationConfigSchema = z.discriminatedUnion("present", [
   z.strictObject({ present: z.literal(false) }),
   z.strictObject({
     present: z.literal(true),
-    sha256: z.string().regex(/^[a-f0-9]{64}$/),
+    sha256: blobDigestHexSchema,
   }),
 ]);
 const manifestSchema = z.strictObject({
-  format: z.literal("themelios.backup"),
+  format: z.literal(backupFormat),
   applicationId: z.string().min(1),
   instanceId: z.string().min(1),
   formatId: z.string().min(1),
@@ -73,12 +74,7 @@ const manifestSchema = z.strictObject({
 export type BackupManifest = z.infer<typeof manifestSchema>;
 
 export interface BackupOptions {
-  database: Database;
-  cas: Cas;
   destination: string;
-  applicationId: string;
-  instanceId: string;
-  formatId: string;
   instanceRoot: string;
   installationConfigPath?: string;
   /** Explicit instance-relative configuration paths under config/. */
@@ -96,7 +92,7 @@ export interface RestoreOptions {
 }
 
 function digest(bytes: Uint8Array): string {
-  return createHash("sha256").update(bytes).digest("hex");
+  return createHash(blobDigestAlgorithm).update(bytes).digest("hex");
 }
 
 async function readRegular(
@@ -141,9 +137,11 @@ async function readRecord<T>(
   }
 }
 
-function checkIdentity(
-  actual: { id: string; applicationId: string; formatId: string },
-  expected: { instanceId: string; applicationId: string; formatId: string },
+type ApplicationIdentity = Pick<InstanceManifest, "applicationId" | "formatId">;
+
+function checkApplicationIdentity(
+  actual: ApplicationIdentity,
+  expected: ApplicationIdentity,
 ): void {
   if (actual.applicationId !== expected.applicationId) {
     throw appError("runtime.application_mismatch", {
@@ -161,6 +159,13 @@ function checkIdentity(
       },
     });
   }
+}
+
+function checkInstanceIdentity(
+  actual: InstanceManifest,
+  expected: BackupManifest,
+): void {
+  checkApplicationIdentity(actual, expected);
   if (actual.id !== expected.instanceId) {
     throw appError("storage.backup_invalid", {
       details: {
@@ -169,6 +174,16 @@ function checkIdentity(
         reason: "instance identity mismatch",
       },
     });
+  }
+}
+
+function readSnapshotInventory(path: string, formatId: string) {
+  const snapshot = Database.open({ path, formatId, readonly: true });
+  try {
+    verifyDatabase(snapshot);
+    return readInventory(snapshot);
+  } finally {
+    snapshot.close();
   }
 }
 
@@ -250,41 +265,49 @@ export async function backupStorage(
   options: BackupOptions,
 ): Promise<BackupManifest> {
   const destination = resolve(options.destination);
-  const { signal } = options;
+  const { signal, instanceRoot } = options;
   throwIfAborted(signal);
-  separateTrees(options.instanceRoot, destination, "backup");
+  separateTrees(instanceRoot, destination, "backup");
   let staging: string | undefined;
   try {
     staging = await workspace(destination, "backup");
-    await mkdir(join(staging, "state"));
-    throwIfAborted(signal);
-    options.database.snapshot(join(staging, databaseFile));
-    const snapshot = Database.open({
-      path: join(staging, databaseFile),
-      formatId: options.formatId,
-      readonly: true,
-    });
-    let captured: ReturnType<typeof readInventory>;
-    try {
-      verifyDatabase(snapshot);
-      captured = readInventory(snapshot);
-    } finally {
-      snapshot.close();
-    }
-    for (const record of captured.records)
-      await verifyObject(options.cas, record, signal, join(staging, "objects"));
     const instancePaths = await copyConfiguration(
-      options.instanceRoot,
+      instanceRoot,
       staging,
       options.paths ?? defaultBackupPaths,
       { required: options.paths !== undefined, ...(signal ? { signal } : {}) },
     );
     const identity = await readRecord(
-      join(staging, instanceFile),
-      instanceSchema,
+      join(staging, instanceManifestFile),
+      instanceManifestSchema,
       signal,
     );
-    checkIdentity(identity, options);
+    await mkdir(join(staging, instanceDirectories.state));
+    throwIfAborted(signal);
+    const path = join(staging, databaseFile);
+    const database = Database.open({
+      path: join(instanceRoot, databaseFile),
+      formatId: identity.formatId,
+      readonly: true,
+    });
+    try {
+      database.snapshot(path);
+    } finally {
+      database.close();
+    }
+    const captured = readSnapshotInventory(path, identity.formatId);
+    const cas = await Cas.open(join(instanceRoot, instanceDirectories.objects));
+    try {
+      for (const record of captured.records)
+        await verifyObject(
+          cas,
+          record,
+          signal,
+          join(staging, instanceDirectories.objects),
+        );
+    } finally {
+      await cas.close();
+    }
     const stats: BackupInfo = {
       ...captured.inventory,
       createdAt: new Date().toISOString(),
@@ -301,9 +324,9 @@ export async function backupStorage(
       });
     const manifest: BackupManifest = {
       ...stats,
-      format: "themelios.backup",
-      applicationId: options.applicationId,
-      instanceId: options.instanceId,
+      format: backupFormat,
+      applicationId: identity.applicationId,
+      instanceId: identity.id,
       instancePaths,
       installationConfig: installation
         ? { present: true, sha256: digest(installation) }
@@ -330,7 +353,7 @@ async function copyData(
   signal?: AbortSignal,
 ): Promise<void> {
   const original = join(backup, databaseFile);
-  const state = await existing(join(backup, "state"));
+  const state = await existing(join(backup, instanceDirectories.state));
   if (!state?.isDirectory() || !(await existing(original))?.isFile()) {
     throw appError("storage.backup_invalid", {
       details: {
@@ -339,22 +362,11 @@ async function copyData(
       },
     });
   }
-  await mkdir(join(staging, "state"));
+  await mkdir(join(staging, instanceDirectories.state));
   const copied = join(staging, databaseFile);
   await copyBackupFile(original, copied, signal);
   throwIfAborted(signal);
-  const snapshot = Database.open({
-    path: copied,
-    formatId: manifest.formatId,
-    readonly: true,
-  });
-  let captured: ReturnType<typeof readInventory>;
-  try {
-    verifyDatabase(snapshot);
-    captured = readInventory(snapshot);
-  } finally {
-    snapshot.close();
-  }
+  const captured = readSnapshotInventory(copied, manifest.formatId);
   for (const field of ["cut", "blobs", "bytes"] as const) {
     if (captured.inventory[field] !== manifest[field]) {
       throw appError("storage.backup_invalid", {
@@ -366,10 +378,15 @@ async function copyData(
       });
     }
   }
-  const source = await Cas.open(join(backup, "objects"));
+  const source = await Cas.open(join(backup, instanceDirectories.objects));
   try {
     for (const record of captured.records)
-      await verifyObject(source, record, signal, join(staging, "objects"));
+      await verifyObject(
+        source,
+        record,
+        signal,
+        join(staging, instanceDirectories.objects),
+      );
   } finally {
     await source.close();
   }
@@ -501,24 +518,22 @@ export async function restoreStorage(
       manifestSchema,
       signal,
     );
-    const identity = await readRecord(
-      join(backup, instanceFile),
-      instanceSchema,
-      signal,
-    );
-    checkIdentity(identity, { ...options, instanceId: manifest.instanceId });
-    checkIdentity(
-      { ...manifest, id: manifest.instanceId },
-      { ...options, instanceId: identity.id },
-    );
+    checkApplicationIdentity(manifest, options);
     const archivedConfig = await readArchivedConfig(backup, manifest, signal);
     staging = await workspace(destination, "restore");
-    await copyData(backup, staging, manifest, signal);
     await copyConfiguration(backup, staging, manifest.instancePaths, {
       required: true,
       ...(signal ? { signal } : {}),
     });
-    for (const name of ["cache", "logs", "run", "objects"])
+    const identity = await readRecord(
+      join(staging, instanceManifestFile),
+      instanceManifestSchema,
+      signal,
+    );
+    checkInstanceIdentity(identity, manifest);
+    await copyData(backup, staging, manifest, signal);
+    const { cache, logs, run, objects } = instanceDirectories;
+    for (const name of [cache, logs, run, objects])
       await mkdir(join(staging, name), { recursive: true });
     await publishRestoredInstance(
       staging,

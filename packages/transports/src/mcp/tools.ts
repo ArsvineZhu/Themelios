@@ -1,12 +1,14 @@
 import {
   callOperation,
+  operationInputSchema,
+  standardPermission,
   type AgentRefBridge,
-  type BinaryReadResult,
   type Operation,
   type OperationDirectory,
   type Principal,
 } from "@themelios/runtime/operations";
-import { jsonSchema, type Json } from "@themelios/core";
+import { errorInfoSchema, jsonSchema, type Json } from "@themelios/core";
+import { defaultLocale } from "@themelios/runtime/locales";
 import {
   McpServer,
   ProtocolError,
@@ -20,14 +22,6 @@ import { localizedError, transportError } from "../errors.js";
 import { checkJsonSize, defaultMaxJsonBytes } from "../json.js";
 import type { RequestTracker } from "../request.js";
 import type { McpResourceSpec, Translate } from "../types.js";
-
-const errorSchema = z.strictObject({
-  code: z.string(),
-  message: z.string(),
-  retryable: z.boolean(),
-  details: jsonSchema.optional(),
-  traceId: z.string().optional(),
-});
 
 export interface ToolServerOptions<App> {
   readonly principal: Principal;
@@ -96,10 +90,10 @@ function registerOperation<App>(
 ) {
   const outputSchema = z.strictObject({
     result: (item.output ?? jsonSchema).optional(),
-    error: errorSchema.optional(),
+    error: errorInfoSchema.optional(),
   });
   const requestSchema = agentSchema(
-    item.mcp?.input ?? item.input,
+    operationInputSchema(item, "mcp")!,
     "input",
     bridge,
   );
@@ -111,27 +105,34 @@ function registerOperation<App>(
       inputSchema: requestSchema.advertised,
       outputSchema: responseSchema.advertised,
       annotations: {
-        readOnlyHint: item.mcp?.readOnlyHint ?? item.permission === "read",
+        readOnlyHint:
+          item.mcp?.readOnlyHint ?? item.permission === standardPermission.read,
         destructiveHint: item.mcp?.destructiveHint ?? false,
-        idempotentHint: item.mcp?.idempotentHint ?? item.permission === "read",
+        idempotentHint:
+          item.mcp?.idempotentHint ??
+          item.permission === standardPermission.read,
       },
     },
     async (args, ctx) => {
       let lease: ReturnType<RequestTracker["take"]> | undefined;
-      let locale = "zh-CN";
+      let locale: string = defaultLocale;
       try {
         lease = input.tracker.take(ctx.mcpReq.signal);
         const request = input.request(ctx, lease.signal);
         locale = request.locale;
         checkJsonSize(args, request.maxJsonBytes, "request");
         const canonicalArgs = requestSchema.convert(args);
-        const rawResult = await callOperation(
+        const outcome = callOperation(
           app,
           directory,
           item.id,
           canonicalArgs,
           request,
+          { input: "mcp", accepts: ["unary"] },
         );
+        if (outcome.kind !== "unary")
+          throw transportError("internal.unexpected");
+        const rawResult = await outcome.result;
         const result = (
           responseSchema.convert({ result: rawResult }) as { result: Json }
         ).result as Json;
@@ -190,19 +191,23 @@ function registerResource<App>(
     {},
     async (uri, variables, ctx) => {
       const lease = input.tracker.take(ctx.mcpReq.signal);
-      let locale = "zh-CN";
+      let locale: string = defaultLocale;
       try {
         const request = input.request(ctx, lease.signal);
         locale = request.locale;
         const rawRef = String(variables.ref);
         const resolvedRef = bridge ? bridge.resolveRef(rawRef) : rawRef;
-        const result = (await callOperation(
+        const outcome = callOperation(
           app,
           directory,
           resource.operation,
           { ref: resolvedRef },
           request,
-        )) as BinaryReadResult;
+          { accepts: ["binary-read"] },
+        );
+        if (outcome.kind !== "binary-read")
+          throw transportError("internal.unexpected");
+        const result = await outcome.result;
         if (result.info.sizeBytes > request.maxJsonBytes) {
           await result.body.cancel();
           throw transportError("transport.result_too_large", {

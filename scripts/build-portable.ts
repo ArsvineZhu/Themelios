@@ -1,6 +1,10 @@
 import { chmod, copyFile, mkdir, mkdtemp } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
+import {
+  installationDirectories,
+  instanceConfigurationFiles,
+} from "@themelios/core";
 import { orderedWorkspaces, repoRoot, run, workspaces } from "./workspaces.js";
 import {
   materializeLinks,
@@ -146,12 +150,16 @@ export async function buildPortable(
     await stageApplication(build, app, all, closure, name);
     await materializeLinks(app);
     await copyLauncher(candidate, target);
-    await mkdir(join(candidate, "config"));
+    await mkdir(join(candidate, installationDirectories.config));
     await Bun.write(
-      join(candidate, "config", "installation.toml"),
+      join(
+        candidate,
+        installationDirectories.config,
+        instanceConfigurationFiles.installation,
+      ),
       "# Installation settings\n",
     );
-    await mkdir(join(candidate, "instances"));
+    await mkdir(join(candidate, installationDirectories.instances));
     await copyFile(join(repoRoot, "LICENSE"), join(candidate, "LICENSE"));
 
     const metadata = await workbenchMetadata(

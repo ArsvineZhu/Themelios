@@ -2,109 +2,127 @@ import { createHash } from "node:crypto";
 import {
   AppError,
   appError,
+  assertResultSource,
+  defaultInlineMaterialBytes,
+  defaultMediaInputBytes,
   isTextMedia,
+  modelInputRepresentationPurpose,
   openCall,
+  parseValue,
   readMediaBytes,
   rangeSchema,
   throwIfAborted,
   type CallOptions,
+  type CallScope,
   type Completed,
   type DeliveredMedia,
   type InputUse,
-  type Json,
   type Material,
   type MediaInput,
-  type ModalityNeed,
   type PreparedRepresentation,
   type RepresentationAdapter,
   type SavedResult,
   type Selection,
 } from "@themelios/core";
-import { deliveredMedia } from "./delivery.js";
 import {
-  detectInlineMimeType,
-  normalizeMaterialInput,
+  deliveredMedia,
+  modelAcceptsMedia,
+  partBytes,
+  partMediaType,
+} from "./delivery.js";
+import {
+  accepts,
+  adapterAcceptsSource,
+  canSend,
+  createRepresentationRouting,
+  mediaModalities,
+  ruleFor,
+  unsupported,
+  type AcceptedModalities,
+  type Route,
+} from "./representation-route.js";
+import {
   readMediaText,
   resolveMedia,
   resolveResultOutput,
   type ResolvedMediaInput,
 } from "./media-input.js";
-import { createSourceDirectory, matchesMime } from "./schema.js";
-import { createPrompts } from "./prompts.js";
+import {
+  createSourceDirectory,
+  sourceDirectoryFromInputs,
+  taskRepresentationSchema,
+} from "./schema.js";
 import { planModelRepresentation } from "./textualize.js";
 import type {
   ModelCapabilities,
   ModelPart,
+  Models,
   Preparation,
   PreparationCallOptions,
   PreparationOptions,
-  PreparationPlan,
-  PreparationPolicy,
+  PreparationPreview,
+  Prompts,
   SourceEntry,
   TaskMaterial,
-  TaskMaterialInput,
+  TaskSource,
+  TaskRepresentation,
   TaskRequirements,
+  TaskRoute,
 } from "./types.js";
 
+interface DeliveredPart {
+  readonly material: Material;
+  readonly part: ModelPart;
+  readonly coverage: DeliveredMedia;
+}
+
 interface Delivery {
-  actual: Material[];
-  parts: ModelPart[];
-  coverage: DeliveredMedia[];
+  readonly parts: readonly DeliveredPart[];
 }
 
-function partBytes(part: ModelPart): number {
-  return part.kind === "text"
-    ? Buffer.byteLength(part.text)
-    : part.bytes.byteLength;
+interface PendingDelivery {
+  readonly action: string;
+  readonly requiresModel: boolean;
+  materialize(call: CallOptions, maxBytes: number): Promise<Delivery>;
 }
 
-type Route =
-  | { kind: "native" }
-  | {
-      kind: "transform";
-      adapter: RepresentationAdapter;
-      parameters: Json;
-    }
-  | {
-      kind: "model";
-      recipe: "media.describe" | "speech.transcribe";
-      model: string;
-    };
-
-function ruleFor<T extends { mediaType: string }>(
-  mediaType: string,
-  rules?: readonly T[],
-): T | undefined {
-  return (
-    rules?.find((rule) => rule.mediaType === mediaType) ??
-    rules?.find((rule) => matchesMime(rule.mediaType, mediaType))
-  );
+interface PlannedSource {
+  readonly input: ResolvedMediaInput;
+  readonly entry: Omit<SourceEntry, "delivered">;
+  readonly delivery: Delivery | PendingDelivery;
 }
 
-function canSend(model: ModelCapabilities, mediaType: string): boolean {
-  const mime = isTextMedia(mediaType) ? "text/plain" : mediaType;
-  return model.inputMimeTypes.some((pattern) => matchesMime(pattern, mime));
-}
-
-function covers(
-  supplies: readonly ModalityNeed[],
-  needs: readonly ModalityNeed[],
-): boolean {
-  return needs.every((need) => supplies.includes(need));
-}
-
-function unsupported(
+function sourceEntry(
   input: MediaInput,
-  sourceKey: string,
-  required: string,
-): never {
-  throw appError("input.capability_missing", {
-    details: { sourceKey, mediaType: input.info.mediaType, required },
+  key: string,
+  role: SourceEntry["role"],
+  originalExtent: SourceEntry["originalExtent"],
+): PlannedSource["entry"] {
+  const { mediaType, name } = input.info;
+  return {
+    key,
+    role,
+    mediaType,
+    originalExtent,
+    requestedRange: input.range ?? null,
+    ...(name === undefined ? {} : { name }),
+  };
+}
+
+function sourceMarker(key: string): ModelPart {
+  return { kind: "text", text: "[" + key + "]\n" };
+}
+
+function preparationError(error: unknown): AppError {
+  if (error instanceof AppError) return error;
+  return appError("content.decode_failed", {
+    details: { reason: String(error) },
+    cause: error,
   });
 }
 
 function ensureCount(
-  materials: readonly TaskMaterialInput[],
+  materials: readonly TaskMaterial[],
   requirements: TaskRequirements,
 ): void {
   if (
@@ -128,171 +146,23 @@ function ensureCount(
 export function createPreparation(
   options: PreparationOptions = {},
 ): Preparation {
-  const maxMaterialBytes = options.maxMaterialBytes ?? 67_108_864;
-  const maxInlineBytes = options.maxInlineBytes ?? 8_388_608;
-  let prompts = options.prompts;
-  const adapters = [...(options.adapters ?? [])].sort(
-    (a, b) =>
-      b.description.priority - a.description.priority ||
-      a.description.id.localeCompare(b.description.id),
+  return createPreparationEngine(options);
+}
+
+export function createPreparationEngine(
+  options: PreparationOptions,
+  assistance?: {
+    readonly models: Models;
+    readonly prompts: Prompts;
+    readonly taskRoute: (taskId: string) => TaskRoute | undefined;
+  },
+): Preparation {
+  const maxMaterialBytes = options.maxMaterialBytes ?? defaultMediaInputBytes;
+  const maxInlineBytes = options.maxInlineBytes ?? defaultInlineMaterialBytes;
+  const { adapters, route } = createRepresentationRouting(
+    options.adapters,
+    assistance?.models,
   );
-  const byId = new Map(
-    adapters.map((adapter) => [adapter.description.id, adapter]),
-  );
-  if (byId.size !== adapters.length)
-    throw appError("config.invalid", {
-      details: {
-        issues: [{ path: "preparation", messageKey: "input.duplicate_recipe" }],
-      },
-    });
-  const normalizers = adapters.filter(
-    (adapter) => adapter.requiresNormalization !== undefined,
-  );
-
-  function supports(
-    adapter: RepresentationAdapter,
-    mediaType: string,
-    needs: readonly ModalityNeed[],
-    model: ModelCapabilities,
-  ) {
-    const { inputMimeTypes, supplies, outputMimeTypes } = adapter.description;
-    return (
-      inputMimeTypes.some((pattern) => matchesMime(pattern, mediaType)) &&
-      covers(supplies, needs) &&
-      outputMimeTypes.some((mime) => canSend(model, mime))
-    );
-  }
-
-  async function nativeInput(
-    input: MediaInput,
-    model: ModelCapabilities,
-    call: CallOptions,
-  ): Promise<boolean> {
-    const mime = input.info.mediaType;
-    if (!canSend(model, mime)) return false;
-    if (
-      input.range &&
-      !(
-        isTextMedia(mime) &&
-        (input.range.kind === "text" || input.range.kind === "json")
-      )
-    ) {
-      return false;
-    }
-    for (const adapter of normalizers) {
-      if (
-        adapter.description.inputMimeTypes.some((type) =>
-          matchesMime(type, mime),
-        ) &&
-        (await adapter.requiresNormalization?.(input, call))
-      )
-        return false;
-    }
-    return true;
-  }
-
-  function transform(
-    adapter: RepresentationAdapter,
-    input: MediaInput,
-    model: ModelCapabilities,
-    parameters?: Json,
-  ): Route {
-    return {
-      kind: "transform",
-      adapter,
-      parameters:
-        adapter.parametersForModel?.(
-          input.info.mediaType,
-          (mime) => canSend(model, mime),
-          parameters ?? {},
-        ) ??
-        parameters ??
-        {},
-    };
-  }
-
-  async function explicitRoute(
-    input: MediaInput,
-    key: string,
-    needs: readonly ModalityNeed[],
-    model: ModelCapabilities,
-    rule: NonNullable<PreparationPolicy["representations"]>[number],
-  ): Promise<Route> {
-    const adapter = byId.get(rule.recipe);
-    if (
-      !adapter ||
-      !covers(model.needs, needs) ||
-      !supports(adapter, input.info.mediaType, needs, model)
-    ) {
-      return unsupported(input, key, rule.recipe);
-    }
-    const availability = await adapter.available();
-    if (!availability.available)
-      return unsupported(input, key, availability.missing.join(", "));
-    return transform(adapter, input, model, rule.parameters);
-  }
-
-  async function installedRoute(
-    input: MediaInput,
-    needs: readonly ModalityNeed[],
-    model: ModelCapabilities,
-    call: CallOptions,
-  ): Promise<Route | undefined> {
-    if (!covers(model.needs, needs)) return;
-    if (await nativeInput(input, model, call)) return { kind: "native" };
-    for (const adapter of adapters) {
-      if (!supports(adapter, input.info.mediaType, needs, model)) continue;
-      if ((await adapter.available()).available)
-        return transform(adapter, input, model);
-    }
-  }
-
-  async function modelRoute(
-    input: MediaInput,
-    needs: readonly ModalityNeed[],
-    model: ModelCapabilities,
-    call: CallOptions,
-    policy?: PreparationPolicy,
-  ): Promise<Route | undefined> {
-    const rule = ruleFor(input.info.mediaType, policy?.models);
-    if (
-      !rule ||
-      !options.models ||
-      !canSend(model, "text/plain") ||
-      !model.needs.includes("text")
-    )
-      return;
-    const assist = options.models.describe(rule.model).capabilities;
-    const operation =
-      rule.recipe === "media.describe" ? "generate" : "transcribe";
-    if (
-      assist.operations.includes(operation) &&
-      (await installedRoute(input, needs, assist, call))
-    ) {
-      return { kind: "model", recipe: rule.recipe, model: rule.model };
-    }
-  }
-
-  async function route(
-    input: MediaInput,
-    key: string,
-    needs: readonly ModalityNeed[],
-    model: ModelCapabilities,
-    call: CallOptions,
-    policy?: PreparationPolicy,
-  ): Promise<Route> {
-    const rule = ruleFor(input.info.mediaType, policy?.representations);
-    if (rule) return explicitRoute(input, key, needs, model, rule);
-    return (
-      (await installedRoute(input, needs, model, call)) ??
-      (await modelRoute(input, needs, model, call, policy)) ??
-      unsupported(
-        input,
-        key,
-        needs.join(", ") || "native input or representation",
-      )
-    );
-  }
 
   async function part(
     input: ResolvedMediaInput,
@@ -326,6 +196,7 @@ export function createPreparation(
     input: MediaInput,
     key: string,
     call: CallOptions,
+    alternatives: AcceptedModalities,
   ) {
     if (choice.kind === "model") {
       const planned = await planModelRepresentation({
@@ -333,14 +204,9 @@ export function createPreparation(
         model: choice.model,
         input,
         call,
-        models: options.models!,
-        prompts: (prompts ??= createPrompts()),
+        ...assistance!,
         preparation,
-        ...(options.mediaDescriptionDefaults === undefined
-          ? {}
-          : {
-              descriptionDefaults: options.mediaDescriptionDefaults,
-            }),
+        alternatives,
       });
       const hash = createHash("sha256")
         .update(JSON.stringify(planned.identity))
@@ -378,11 +244,11 @@ export function createPreparation(
       id: `${description.id}:${hash}`,
       action: description.id,
       originalExtent: input.info.extent,
-      async run() {
+      async run(options: CallOptions) {
         const representation = await choice.adapter.prepare(
           input,
           parameters.data,
-          call,
+          options,
         );
         choice.adapter.validateForModel?.(representation, input);
         return representation;
@@ -397,15 +263,19 @@ export function createPreparation(
     maxBytes: number,
   ): Promise<Delivery | undefined> {
     const store = options.store;
-    if (!store?.findRepresentation || !("ref" in input.source)) return;
+    if (!store?.representations || !("ref" in input.source)) return;
     const source: Selection = {
       ref: input.source.ref,
       ...(input.range === undefined ? {} : { range: input.range }),
     };
-    const found = store.findRepresentation(source, "model-input", recipe);
+    const found = await store.representations.read(
+      source,
+      modelInputRepresentationPurpose,
+      recipe,
+      call,
+    );
     if (!found) return;
-    const saved = await store.readResult(found.result, call);
-    return readOutputs(saved, found.outputs, input, call, maxBytes);
+    return readOutputs(found.result, found.outputs, input, call, maxBytes);
   }
 
   async function readOutputs(
@@ -415,35 +285,53 @@ export function createPreparation(
     call: CallOptions,
     maxBytes: number,
   ): Promise<Delivery> {
-    const actual: Material[] = [];
-    const parts: ModelPart[] = [];
-    const coverage: DeliveredMedia[] = [];
+    const parts: DeliveredPart[] = [];
     let remainingBytes = maxBytes;
     for (const name of outputs) {
       const selected = resolveResultOutput(result, name, options.store);
-      const modelPart = await part(selected, call, remainingBytes);
-      remainingBytes -= partBytes(modelPart);
-      actual.push(selected.source);
-      parts.push(modelPart);
-      coverage.push(
-        deliveredMedia(input, modelPart, {
-          name,
-          ...(selected.coverage === undefined
-            ? {}
-            : { coverage: selected.coverage }),
-        }),
+      const delivered = await outputPart(
+        selected,
+        name,
+        input,
+        call,
+        remainingBytes,
       );
+      remainingBytes -= partBytes(delivered.part);
+      parts.push(delivered);
     }
-    return { actual, parts, coverage };
+    return { parts };
+  }
+
+  async function outputPart(
+    selected: ResolvedMediaInput,
+    name: string,
+    source: MediaInput,
+    call: CallOptions,
+    maxBytes: number,
+  ): Promise<DeliveredPart> {
+    const modelPart = await part(selected, call, maxBytes);
+    return {
+      material: selected.source,
+      part: modelPart,
+      coverage: deliveredMedia(source, modelPart, {
+        name,
+        ...(selected.coverage === undefined
+          ? {}
+          : { coverage: selected.coverage }),
+      }),
+    };
   }
 
   async function materialize(
-    recipe: { id: string; run(): Promise<PreparedRepresentation> },
+    recipe: {
+      id: string;
+      run(call: CallOptions): Promise<PreparedRepresentation>;
+    },
     input: MediaInput,
     call: CallOptions,
     maxBytes: number,
   ): Promise<Delivery> {
-    let { result, outputs } = await recipe.run();
+    let { result, outputs } = await recipe.run(call);
     if ("ref" in input.source) {
       result = {
         ...result,
@@ -458,11 +346,18 @@ export function createPreparation(
   }
 
   async function readSource(
-    source: Material,
+    source: TaskSource,
     key: string,
     signal: AbortSignal,
+    metadataOnly = false,
   ): Promise<ResolvedMediaInput> {
-    const input = await resolveMedia(source, options.store, { signal });
+    const input = await resolveMedia(
+      source,
+      options.store,
+      { signal },
+      maxInlineBytes,
+      key,
+    );
     if (input.range) {
       const parsed = rangeSchema.safeParse(input.range);
       if (!parsed.success)
@@ -470,22 +365,7 @@ export function createPreparation(
           details: { sourceKey: key, reason: "invalid material selection" },
         });
     }
-    if ("bytes" in input.source) {
-      if (input.source.bytes.byteLength > maxInlineBytes) {
-        throw appError("content.inline_too_large", {
-          details: {
-            sourceKey: key,
-            actualBytes: input.source.bytes.byteLength,
-            maxBytes: maxInlineBytes,
-          },
-        });
-      }
-      await detectInlineMimeType(
-        input.source.bytes,
-        input.info.mediaType,
-        input.info.name,
-      );
-    }
+    if (metadataOnly) return input;
     const byteSelection =
       isTextMedia(input.info.mediaType) && input.range?.kind === "text";
     const inputBytes = byteSelection
@@ -515,12 +395,7 @@ export function createPreparation(
       return { ...input, info: { ...input.info, extent } };
     }
     for (const adapter of adapters) {
-      if (
-        !adapter.description.inputMimeTypes.some((mime) =>
-          matchesMime(mime, input.info.mediaType),
-        )
-      )
-        continue;
+      if (!adapterAcceptsSource(adapter, input.info.mediaType)) continue;
       if (!(await adapter.available()).available) continue;
       try {
         const extent = await adapter.probe(input, call);
@@ -541,22 +416,108 @@ export function createPreparation(
     return input;
   }
 
+  async function planLinkedRepresentation(
+    source: ResolvedMediaInput,
+    entry: PlannedSource["entry"],
+    supplied: TaskRepresentation,
+    alternatives: AcceptedModalities,
+    model: ModelCapabilities,
+    call: CallOptions,
+    remainingBytes: number,
+  ): Promise<PlannedSource> {
+    const saved = await options.store!.results.read(supplied.result, call);
+    assertResultSource(saved, source.storedSelection!, [supplied.output]);
+    const represented = resolveResultOutput(
+      saved,
+      supplied.output,
+      options.store,
+    );
+    if (!represented.coverage)
+      return unsupported(
+        source,
+        entry.key,
+        "a named result output with recorded coverage",
+      );
+    if (
+      !accepts(
+        alternatives,
+        model.needs,
+        mediaModalities(represented.info.mediaType),
+      ) ||
+      !canSend(model, represented.info.mediaType)
+    )
+      return unsupported(
+        source,
+        entry.key,
+        "a selected representation that the model and task accept",
+      );
+    return {
+      input: source,
+      entry,
+      delivery: {
+        parts: [
+          await outputPart(
+            represented,
+            supplied.output,
+            source,
+            call,
+            remainingBytes,
+          ),
+        ],
+      },
+    };
+  }
+
   async function prepareSource(
     inputMaterial: TaskMaterial,
     key: string,
     requirements: TaskRequirements,
     model: ModelCapabilities,
     call: PreparationCallOptions,
-    preview: boolean,
     remainingBytes: number,
-  ) {
-    const source = await readSource(inputMaterial.source, key, call.signal!);
+  ): Promise<PlannedSource> {
+    const supplied =
+      inputMaterial.representation === undefined
+        ? undefined
+        : parseValue(
+            taskRepresentationSchema,
+            inputMaterial.representation,
+            "input.invalid",
+          );
+    if (supplied && !("ref" in inputMaterial.source))
+      throw appError("input.invalid", {
+        details: {
+          issues: [
+            {
+              path: ["materials", key, "source"],
+              reason: "A representation requires an original stored selection",
+            },
+          ],
+        },
+      });
+    const source = await readSource(
+      inputMaterial.source,
+      key,
+      call.signal!,
+      supplied !== undefined,
+    );
     const wanted = ruleFor(source.info.mediaType, requirements.inputs);
     if (!wanted) return unsupported(source, key, "task input media type");
+    const role = inputMaterial.role ?? "primary";
+    if (supplied)
+      return planLinkedRepresentation(
+        source,
+        sourceEntry(source, key, role, source.info.extent),
+        supplied,
+        wanted.accepts,
+        model,
+        call,
+        remainingBytes,
+      );
     const choice = await route(
       source,
       key,
-      wanted.needs,
+      wanted.accepts,
       model,
       call,
       call.preparation,
@@ -572,80 +533,61 @@ export function createPreparation(
     const recipe =
       choice.kind === "native"
         ? undefined
-        : await planRepresentation(choice, input, key, call);
-    const role = inputMaterial.role ?? "primary";
-    const entry: SourceEntry = {
+        : await planRepresentation(choice, input, key, call, wanted.accepts);
+    const entry = sourceEntry(
+      input,
       key,
       role,
-      mediaType: input.info.mediaType,
-      originalExtent: recipe?.originalExtent ?? input.info.extent,
-      requestedRange: input.range ?? null,
-      delivered: [],
-      ...(input.info.name === undefined ? {} : { name: input.info.name }),
-    };
-    let delivered: Delivery;
+      recipe?.originalExtent ?? input.info.extent,
+    );
     if (!recipe) {
       const native = await part(input, call, remainingBytes);
-      delivered = {
-        actual: [input.source],
-        parts: [native],
-        coverage: [deliveredMedia(input, native)],
-      };
-    } else {
-      const cached = await trySavedRepresentation(
-        recipe.id,
+      return {
+        entry,
         input,
-        call,
-        remainingBytes,
-      );
-      if (preview && !cached) {
-        const action = recipe.action;
-        return {
-          entry,
-          input,
-          pending: {
-            sourceKey: key,
-            action,
-            requiresModel: choice.kind === "model",
-          },
-          parts: [{ kind: "text" as const, text: `<pending: ${action}>` }],
-        };
-      }
-      delivered =
-        cached ?? (await materialize(recipe, input, call, remainingBytes));
-    }
-    return {
-      entry: { ...entry, delivered: delivered.coverage },
-      input,
-      parts: delivered.parts,
-      use: {
-        source: input.source,
-        delivered: delivered.actual,
-        role,
-        coverage: {
-          originalExtent: entry.originalExtent,
-          requestedRange: entry.requestedRange,
-          delivered: delivered.coverage,
+        delivery: {
+          parts: [
+            {
+              material: input.source,
+              part: native,
+              coverage: deliveredMedia(input, native),
+            },
+          ],
         },
-      } satisfies InputUse,
+      };
+    }
+    const cached = await trySavedRepresentation(
+      recipe.id,
+      input,
+      call,
+      remainingBytes,
+    );
+    return {
+      entry,
+      input,
+      delivery: cached ?? {
+        action: recipe.action,
+        requiresModel: choice.kind === "model",
+        materialize: (options, maxBytes) =>
+          materialize(recipe, input, options, maxBytes),
+      },
     };
   }
 
   function checkParts(
     previous: { bytes: number; images: number },
-    parts: readonly ModelPart[],
+    parts: readonly DeliveredPart[],
     model: ModelCapabilities,
     input: MediaInput,
     key: string,
     maxBytes: number,
   ) {
-    for (const part of parts) {
-      const mime = part.kind === "text" ? "text/plain" : part.mediaType;
-      if (!canSend(model, mime))
+    for (const { part } of parts) {
+      const mime = partMediaType(part);
+      if (!modelAcceptsMedia(model, mime))
         return unsupported(input, key, `model input supporting ${mime}`);
       previous.bytes += partBytes(part);
-      if (part.kind === "media" && part.mediaType.startsWith("image/"))
-        previous.images++;
+      if (mime.startsWith("image/")) previous.images++;
     }
     if (previous.bytes > maxBytes)
       throw appError("model.input_too_large", {
@@ -660,17 +602,18 @@ export function createPreparation(
       return unsupported(input, key, "image count ≤ " + maxImages);
   }
 
-  async function prepare(
-    inputMaterials: readonly TaskMaterialInput[],
+  async function usePlan<T>(
+    inputMaterials: readonly TaskMaterial[],
     requirements: TaskRequirements,
     model: ModelCapabilities,
     optionsForCall: PreparationCallOptions | undefined,
-    preview: boolean,
-  ) {
-    const call = openCall(
-      preview ? "tasks.preview" : "tasks.prepare",
-      optionsForCall,
-    );
+    finish: (
+      planned: readonly PlannedSource[],
+      maxBytes: number,
+      call: CallScope,
+    ) => T | Promise<T>,
+  ): Promise<T> {
+    const call = openCall("tasks.prepare", optionsForCall);
     const callOptions: PreparationCallOptions = {
       ...optionsForCall,
       signal: call.signal,
@@ -679,44 +622,31 @@ export function createPreparation(
       maxMaterialBytes,
       model.limits?.maxInputBytes ?? Infinity,
     );
-    const entries: SourceEntry[] = [];
-    const uses: InputUse[] = [];
-    const parts: ModelPart[] = [];
-    const pending: PreparationPlan["pending"][number][] = [];
+    const planned: PlannedSource[] = [];
     const budget = { bytes: 0, images: 0 };
     try {
       ensureCount(inputMaterials, requirements);
-      for (const [index, raw] of inputMaterials.entries()) {
+      for (const [index, material] of inputMaterials.entries()) {
         const key = "S" + (index + 1);
         call.throwIfAborted("prepare");
-        const normalized = await normalizeMaterialInput(
-          raw,
-          maxInlineBytes,
-          call.signal,
-        );
-        const prepared = await prepareSource(
-          normalized,
+        const source = await prepareSource(
+          material,
           key,
           requirements,
           model,
           callOptions,
-          preview,
           maxBytes - budget.bytes,
         );
-        entries.push(prepared.entry);
-        parts.push({ kind: "text", text: `[${key}]\n` }, ...prepared.parts);
-        if (prepared.pending) pending.push(prepared.pending);
-        else {
-          uses.push(prepared.use);
+        planned.push(source);
+        if ("parts" in source.delivery)
           checkParts(
             budget,
-            prepared.parts,
+            source.delivery.parts,
             model,
-            prepared.input,
+            source.input,
             key,
             maxBytes,
           );
-        }
         call.progress({
           stage: "prepare",
           completed: index + 1,
@@ -724,39 +654,103 @@ export function createPreparation(
           unit: "materials",
         });
       }
-      return { parts, uses, pending, sources: createSourceDirectory(entries) };
+      call.throwIfAborted();
+      return await finish(planned, maxBytes, call);
     } catch (error) {
       call.throwIfAborted();
-      if (error instanceof AppError) throw error;
-      throw appError("content.decode_failed", {
-        details: { reason: String(error) },
-        cause: error,
-      });
+      throw preparationError(error);
     } finally {
       call.close();
     }
   }
 
   const preparation: Preparation = {
-    async plan(materials, requirements, model, optionsForCall) {
-      const { sources, parts, pending } = await prepare(
-        materials,
+    preview(inputMaterials, requirements, model, optionsForCall) {
+      return usePlan(
+        inputMaterials,
         requirements,
         model,
         optionsForCall,
-        true,
+        (planned): PreparationPreview => {
+          const entries: SourceEntry[] = [];
+          const readyParts: ModelPart[] = [];
+          const pending: PreparationPreview["pending"][number][] = [];
+          for (const { entry, delivery } of planned) {
+            readyParts.push(sourceMarker(entry.key));
+            if ("parts" in delivery) {
+              entries.push({
+                ...entry,
+                delivered: delivery.parts.map(({ coverage }) => coverage),
+              });
+              readyParts.push(...delivery.parts.map(({ part }) => part));
+            } else {
+              const { action, requiresModel } = delivery;
+              entries.push({ ...entry, delivered: [] });
+              readyParts.push({
+                kind: "text",
+                text: "<pending: " + action + ">",
+              });
+              pending.push({ sourceKey: entry.key, action, requiresModel });
+            }
+          }
+          return {
+            sources: { entries: createSourceDirectory(entries).entries },
+            readyParts,
+            pending,
+          };
+        },
       );
-      return { sources, readyParts: parts, pending };
     },
-    async forModel(materials, requirements, model, optionsForCall) {
-      const { sources, parts, uses } = await prepare(
-        materials,
+    prepare(inputMaterials, requirements, model, optionsForCall) {
+      return usePlan(
+        inputMaterials,
         requirements,
         model,
         optionsForCall,
-        false,
+        async (planned, maxBytes, call) => {
+          const budget = { bytes: 0, images: 0 };
+          const parts: ModelPart[] = [];
+          const uses: InputUse[] = [];
+          for (const { input, entry, delivery } of planned) {
+            call.throwIfAborted("prepare");
+            const sent =
+              "parts" in delivery
+                ? delivery
+                : await delivery.materialize(
+                    { signal: call.signal },
+                    maxBytes - budget.bytes,
+                  );
+            checkParts(budget, sent.parts, model, input, entry.key, maxBytes);
+            parts.push(
+              sourceMarker(entry.key),
+              ...sent.parts.map(({ part }) => part),
+            );
+            const {
+              key,
+              mediaType,
+              name,
+              role,
+              originalExtent,
+              requestedRange,
+            } = entry;
+            uses.push({
+              key,
+              original:
+                name === undefined ? { mediaType } : { mediaType, name },
+              source: input.source,
+              delivered: sent.parts.map(({ material }) => material),
+              role,
+              coverage: {
+                originalExtent,
+                requestedRange,
+                delivered: sent.parts.map(({ coverage }) => coverage),
+              },
+            });
+          }
+          call.throwIfAborted();
+          return { sources: sourceDirectoryFromInputs(uses), parts, uses };
+        },
       );
-      return { sources, parts, uses };
     },
   };
   return preparation;

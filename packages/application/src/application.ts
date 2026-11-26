@@ -3,6 +3,8 @@ import {
   createContent,
   createImageAdapter,
   createWaveAdapter,
+  materialOperationIds,
+  resultOperationIds,
   type Materials,
   type Representations,
   type Results,
@@ -10,27 +12,26 @@ import {
 import { contentSchemaSql } from "@themelios/content/schema";
 import {
   appError,
+  instanceConfigurationFiles,
   mapFlowResult,
   parseJson,
   throwIfAborted,
   toErrorInfo,
   type CallOptions,
-  type InputUse,
+  type Completed,
+  type Flow,
   type Json,
   type RepresentationAdapter,
 } from "@themelios/core";
 import {
   createModels,
-  createPreparation,
   createPrompts,
-  createTasks,
   describeTask,
+  presentTask,
   type ApplicationPrompts,
-  type PreparationStore,
-  type SourceEntry,
+  type Models,
   type TaskDefinition,
 } from "@themelios/models";
-import { createSourceDirectory } from "@themelios/models/tasks";
 import type {
   ApplicationModule,
   InstanceInfo,
@@ -38,19 +39,24 @@ import type {
   OpenEnvironment,
 } from "@themelios/runtime";
 import type { Dictionaries } from "@themelios/runtime/locales";
-import type { Configuration } from "@themelios/runtime/settings";
-import { Cas, Database } from "@themelios/storage";
-import PQueue from "p-queue";
-import type { ZodType } from "zod";
-import { applicationSettings, type ApplicationSettings } from "./settings.js";
 import type {
-  ApplicationTasks,
-  BatchItemResult,
-  RunTaskInput,
-  TaskResult,
+  Configuration,
+  SettingsDefinition,
+} from "@themelios/runtime/settings";
+import { Cas, Database, databaseFileName } from "@themelios/storage";
+import PQueue from "p-queue";
+import {
+  preparationSettingsSchema,
+  type ApplicationSettings,
+} from "./settings.js";
+import {
+  taskOperationIds,
+  promptOperationIds,
+  type ApplicationTasks,
+  type BatchItemResult,
+  type RunTaskInput,
+  type TaskResult,
 } from "./task-operations.js";
-import type { BinaryReadResult } from "@themelios/runtime/operations";
-import type { WireInputUse } from "./wire.js";
 
 export interface ApplicationApi<S = ApplicationSettings> {
   readonly materials: Materials;
@@ -63,27 +69,47 @@ export interface ApplicationApi<S = ApplicationSettings> {
 }
 
 type RegisteredTask = ApplicationDefinition["tasks"][number];
-type Environment = OpenEnvironment<ApplicationSettings>;
+type Environment<S extends ApplicationSettings> = OpenEnvironment<S>;
 
-function modelConfiguration({ models }: Readonly<ApplicationSettings>) {
-  const { bindings, connections, timeoutMs, maxAttempts, concurrency } = models;
-  return {
-    bindings,
-    connections,
-    defaults: { timeoutMs, maxAttempts, concurrency },
-  };
-}
-
-export interface ApplicationDefinition {
+export interface ApplicationDefinition<
+  S extends ApplicationSettings = ApplicationSettings,
+> {
   id: string;
   formatId: string;
+  settings: SettingsDefinition<S>;
   resourceRoot: string;
   tasks: readonly TaskDefinition<Json, Json, unknown>[];
-  adapters?: readonly RepresentationAdapter[];
-  createAdapters?(
+  schemaSql?: string;
+  adapters?(
     settings: ApplicationSettings["preparation"],
   ): readonly RepresentationAdapter[];
   locales?: Dictionaries;
+}
+
+/** Builds the standard inventory and the application's additional media recipes. */
+export function applicationAdapters(
+  settings: ApplicationSettings["preparation"] = preparationSettingsSchema.parse(
+    {},
+  ),
+  additional?: ApplicationDefinition["adapters"],
+): readonly RepresentationAdapter[] {
+  const { maxMaterialBytes, image } = settings;
+  return [
+    createImageAdapter({
+      maxPixels: image.maxPixels,
+      maxBytes: maxMaterialBytes,
+    }),
+    createWaveAdapter({ maxBytes: maxMaterialBytes }),
+    ...(additional?.(settings) ?? []),
+  ];
+}
+
+export interface ApplicationContext<S extends ApplicationSettings> {
+  readonly env: OpenEnvironment<S>;
+  readonly database: Database;
+  readonly api: ApplicationApi<S>;
+  /** Use the model client captured by the current Runtime call. */
+  models(): Models;
 }
 
 function taskCatalog(
@@ -103,61 +129,34 @@ function taskCatalog(
   return byId;
 }
 
-function describeUse(
-  use: InputUse | WireInputUse,
-  index: number,
-  materials: Materials,
-): SourceEntry {
-  const key = `S${index + 1}`;
-  const source = use.source;
-  const info =
-    "ref" in source
-      ? materials.inspect(materials.resolve(source.ref))
-      : "bytes" in source
-        ? {
-            mediaType: source.mediaType,
-            name: source.name,
-            extent: { kind: "text" as const, bytes: source.bytes.byteLength },
-          }
-        : "inline" in source
-          ? {
-              mediaType: source.inline.mediaType,
-              name: source.inline.name,
-              extent: { kind: "unknown" as const },
-            }
-          : {
-              mediaType: "application/json",
-              extent: { kind: "unknown" as const },
-            };
-  return {
-    key,
-    mediaType: info.mediaType,
-    ...("name" in info && info.name !== undefined ? { name: info.name } : {}),
-    ...(use.coverage ?? {
-      originalExtent: info.extent,
-      requestedRange: "ref" in source ? (source.range ?? null) : null,
-      delivered: [],
-    }),
-    role: use.role,
-  };
-}
-
-export function createApplicationModule(
-  definition: ApplicationDefinition,
-): ApplicationModule<ApplicationApi<ApplicationSettings>, ApplicationSettings> {
+export function createApplicationModule<S extends ApplicationSettings>(
+  definition: ApplicationDefinition<S>,
+): ApplicationModule<ApplicationApi<S>, S>;
+export function createApplicationModule<S extends ApplicationSettings, Api>(
+  definition: ApplicationDefinition<S>,
+  open: (context: ApplicationContext<S>) => Api | Promise<Api>,
+): ApplicationModule<Api, S>;
+/** The module owns the instance resources shared by standard and composed applications. */
+export function createApplicationModule<S extends ApplicationSettings, Api>(
+  definition: ApplicationDefinition<S>,
+  open?: (context: ApplicationContext<S>) => Api | Promise<Api>,
+): ApplicationModule<ApplicationApi<S> | Api, S> {
   const catalog = taskCatalog(definition.tasks);
   const { id, formatId, locales } = definition;
   return {
     id,
     formatId,
-    settings: applicationSettings,
+    settings: definition.settings,
     ...(locales === undefined ? {} : { locales }),
-    async provision({ paths, settings }) {
+    async provision({ paths, settings, clock }) {
       const database = Database.init({
-        path: join(paths.state, "main.sqlite"),
+        path: join(paths.state, databaseFileName),
         formatId,
         synchronous: settings.storage.synchronous,
-        schemaSql: contentSchemaSql,
+        schemaSql: [contentSchemaSql, definition.schemaSql]
+          .filter(Boolean)
+          .join("\n"),
+        now: clock.now,
       });
       database.close();
       const cas = await Cas.open(paths.objects);
@@ -166,7 +165,7 @@ export function createApplicationModule(
     async open(env) {
       const database = env.own(
         Database.open({
-          path: join(env.paths.state, "main.sqlite"),
+          path: join(env.paths.state, databaseFileName),
           formatId,
           synchronous: env.settings.storage.synchronous,
           readonly: env.mode === "read-only",
@@ -182,6 +181,9 @@ export function createApplicationModule(
       const content = createContent({
         database,
         cas,
+        get adapters() {
+          return modelResource.get().adapters;
+        },
         get maxImportBytes() {
           return env.settings.content.maxImportBytes;
         },
@@ -189,75 +191,6 @@ export function createApplicationModule(
           return env.settings.content.maxInlineBytes;
         },
       });
-      const store: PreparationStore = {
-        inspect: (ref) => content.materials.inspect(ref),
-        read: (ref, call) => materials.read(ref, call),
-        text: (selection, call) => materials.text(selection, call),
-        readResult: (ref, call) => results.read(ref, call),
-        findRepresentation: (source, purpose, recipe) =>
-          content.representations.find(source, purpose, recipe),
-      };
-      const modelResource = await env.bindResource(
-        (settings) => parseJson(modelConfiguration(settings)),
-        async (context) =>
-          createModels({
-            ...modelConfiguration(context.settings),
-            fetch: context.network.fetch,
-            diagnostics: context.diagnostics,
-            resolveCredential: (ref) => context.secrets.resolve(ref),
-          }),
-      );
-      const promptStore = createPrompts({
-        resourceRoot: definition.resourceRoot,
-        overrideRoot: join(env.paths.config, "prompts"),
-      });
-      const taskExecutors = new WeakMap<
-        Readonly<ApplicationSettings>,
-        ReturnType<typeof createTasks>
-      >();
-      function taskExecutor() {
-        const settings = env.settings;
-        const existing = taskExecutors.get(settings);
-        if (existing) return existing;
-        const models = modelResource.get();
-        const imageAdapter = createImageAdapter({
-          maxPixels: settings.preparation.image.maxPixels,
-          maxBytes: settings.preparation.maxMaterialBytes,
-        });
-        const preparation = createPreparation({
-          store,
-          models,
-          prompts: promptStore,
-          ...(settings.models.tasks["media.describe"]?.variables === undefined
-            ? {}
-            : {
-                mediaDescriptionDefaults:
-                  settings.models.tasks["media.describe"].variables,
-              }),
-          adapters: [
-            imageAdapter,
-            createWaveAdapter({
-              maxBytes: settings.preparation.maxMaterialBytes,
-            }),
-            ...(definition.adapters ?? []),
-            ...(definition.createAdapters?.(settings.preparation) ?? []),
-          ],
-          maxMaterialBytes: settings.preparation.maxMaterialBytes,
-          maxInlineBytes: settings.content.maxInlineBytes,
-        });
-        const tasks = createTasks({
-          models,
-          prompts: promptStore,
-          preparation,
-          diagnostics: env.diagnostics,
-          routes: settings.models.tasks,
-          concurrency: settings.models.concurrency,
-          timeoutMs: settings.models.timeoutMs,
-        });
-        taskExecutors.set(settings, tasks);
-        return tasks;
-      }
-
       const assertWritable = (operation: string) => {
         if (env.mode === "read-only") {
           throw appError("runtime.read_only", { details: { operation } });
@@ -283,13 +216,11 @@ export function createApplicationModule(
       function read(
         ref: Parameters<Materials["read"]>[0],
         options?: CallOptions,
-      ): Promise<
-        BinaryReadResult & { info: ReturnType<Materials["inspect"]> }
-      > {
+      ): ReturnType<Materials["read"]> {
         const opened =
           Promise.withResolvers<Awaited<ReturnType<Materials["read"]>>>();
         const operation = env.execution.start(
-          "materials.read",
+          materialOperationIds.read,
           (signal) =>
             queueIo(signal, async () => {
               throwIfAborted(signal);
@@ -307,51 +238,50 @@ export function createApplicationModule(
       const materials: Materials = {
         accept: (input, opts) =>
           runIo(
-            "materials.accept",
-            (call) => {
-              assertWritable("materials.accept");
-              return content.materials.accept(input, call);
-            },
+            materialOperationIds.accept,
+            (call) => content.materials.accept(input, { ...opts, ...call }),
             opts,
           ),
-        prepare: (input, opts) =>
+        adopt: (input, attach, opts) =>
           runIo(
-            "materials.prepare",
-            (call) => {
-              assertWritable("materials.prepare");
-              return content.materials.prepare(input, call);
-            },
+            materialOperationIds.adopt,
+            (call) =>
+              content.materials.adopt(input, attach, { ...opts, ...call }),
+            opts,
+          ),
+        adoptAnalyzed: (input, adoption, opts) =>
+          runIo(
+            materialOperationIds.adoptAnalyzed,
+            (call) =>
+              content.materials.adoptAnalyzed(input, adoption, {
+                ...opts,
+                ...call,
+              }),
             opts,
           ),
         inspect: (ref) => content.materials.inspect(ref),
         resolve: (ref) => content.materials.resolve(ref),
         agentRef: (ref) => content.materials.agentRef(ref),
-        read: read as Materials["read"],
+        read,
         text: (selection, opts) =>
           runIo(
-            "materials.text",
+            materialOperationIds.text,
             (call) => content.materials.text(selection, call),
             opts,
           ),
         structure: (ref, opts) =>
           runIo(
-            "materials.structure",
+            materialOperationIds.structure,
             (call) => content.materials.structure(ref, call),
             opts,
           ),
         sources: (ref, opts) => content.materials.sources(ref, opts),
-        list: (opts) => content.materials.list(opts),
-        retain(ref) {
-          assertWritable("materials.retain");
-          content.materials.retain(ref);
-        },
-        release(ref) {
-          assertWritable("materials.release");
-          content.materials.release(ref);
-        },
+        listRetained: (opts) => content.materials.listRetained(opts),
+        retain: content.materials.retain,
+        release: content.materials.release,
         export: (ref, destination, opts) =>
           runIo(
-            "materials.export",
+            materialOperationIds.export,
             (call) => content.materials.export(ref, destination, call),
             opts,
           ),
@@ -360,38 +290,64 @@ export function createApplicationModule(
       const results: Results = {
         save: (completed, opts) =>
           runIo(
-            "results.save",
-            (call) => {
-              assertWritable("results.save");
-              return content.results.save(completed, call);
-            },
+            resultOperationIds.save,
+            (call) => content.results.save(completed, { ...opts, ...call }),
             opts,
           ),
-        prepare: (completed, opts) =>
+        adopt: (completed, attach, opts) =>
           runIo(
-            "results.prepare",
-            (call) => {
-              assertWritable("results.prepare");
-              return content.results.prepare(completed, call);
-            },
+            resultOperationIds.adopt,
+            (call) =>
+              content.results.adopt(completed, attach, { ...opts, ...call }),
             opts,
           ),
-        read: (<T extends Json>(
-          ref: Parameters<Results["read"]>[0],
-          schema?: ZodType<T> | CallOptions,
-          opts?: CallOptions,
-        ) => {
-          const isSchema = schema && "safeParse" in schema;
-          return runIo(
-            "results.read",
-            (call) =>
-              isSchema
-                ? content.results.read(ref, schema, call)
-                : content.results.read(ref, call),
-            isSchema ? opts : schema,
-          );
-        }) as Results["read"],
+        read: (ref, opts) =>
+          runIo(
+            resultOperationIds.read,
+            (call) => content.results.read(ref, { ...opts, ...call }),
+            opts,
+          ),
       };
+
+      const store = {
+        materials,
+        results,
+        representations: content.representations,
+      };
+      const promptStore = createPrompts({
+        resourceRoot: definition.resourceRoot,
+        overrideRoot: join(
+          env.paths.config,
+          instanceConfigurationFiles.prompts,
+        ),
+      });
+      const modelResource = await env.bindResource(
+        (settings) =>
+          parseJson({
+            models: settings.models,
+            preparation: settings.preparation,
+            maxInlineBytes: settings.content.maxInlineBytes,
+          }),
+        async ({ settings, diagnostics, network, secrets }) => {
+          const adapters = applicationAdapters(
+            settings.preparation,
+            definition.adapters,
+          );
+          const client = createModels(settings.models, {
+            fetch: network.fetch,
+            diagnostics,
+            resolveCredential: secrets.resolve,
+            prompts: promptStore,
+            adapters,
+            preparation: {
+              store,
+              maxMaterialBytes: settings.preparation.maxMaterialBytes,
+              maxInlineBytes: settings.content.maxInlineBytes,
+            },
+          });
+          return { client, adapters, close: () => client.close() };
+        },
+      );
 
       const findTask = (name: string) => {
         const task = catalog.get(name);
@@ -401,64 +357,51 @@ export function createApplicationModule(
       };
       const prompts: ApplicationPrompts = {
         read: (task) =>
-          env.execution.run("prompts.read", () =>
+          env.execution.run(promptOperationIds.read, () =>
             promptStore.read(findTask(task)),
           ),
         describe: (task) =>
-          env.execution.run("prompts.describe", () =>
+          env.execution.run(promptOperationIds.describe, () =>
             promptStore.describe(findTask(task)),
           ),
         diff: (task) =>
-          env.execution.run("prompts.diff", () =>
+          env.execution.run(promptOperationIds.diff, () =>
             promptStore.diff(findTask(task)),
           ),
         setOverride(task, change) {
-          assertWritable("prompts.setOverride");
-          return env.execution.run("prompts.setOverride", () =>
+          assertWritable(promptOperationIds.setOverride);
+          return env.execution.run(promptOperationIds.setOverride, () =>
             promptStore.setOverride(findTask(task), change),
           );
         },
         reset(task, part) {
-          assertWritable("prompts.reset");
-          return env.execution.run("prompts.reset", () =>
+          assertWritable(promptOperationIds.reset);
+          return env.execution.run(promptOperationIds.reset, () =>
             promptStore.reset(findTask(task), part),
           );
         },
       };
 
-      taskExecutor();
       const tasks = bindTasks(
         env,
         findTask,
         catalog,
         promptStore,
-        taskExecutor,
-        content,
-        materials,
-        assertWritable,
+        () => modelResource.get().client,
+        results,
+        (operation) => database.requireWritable(operation),
         localize,
       );
-      const representations: Representations = {
-        find: content.representations.find,
-        set(representation) {
-          assertWritable("representations.set");
-          content.representations.set(representation);
-        },
-        remove(...args) {
-          assertWritable("representations.remove");
-          content.representations.remove(...args);
-        },
-      };
-
-      return {
-        materials,
-        results,
+      const api: ApplicationApi<S> = {
+        ...store,
         prompts,
         tasks,
-        representations,
         configuration: env.configuration,
         info: () => ({ ...env.instance, paths: env.paths }),
       };
+      return open
+        ? open({ env, database, api, models: () => modelResource.get().client })
+        : api;
     },
   };
 }
@@ -486,14 +429,13 @@ async function queueWork<T>(
   }
 }
 
-function bindTasks(
-  env: Environment,
+function bindTasks<S extends ApplicationSettings>(
+  env: Environment<S>,
   findTask: (name: string) => RegisteredTask,
   catalog: ReadonlyMap<string, RegisteredTask>,
   prompts: ReturnType<typeof createPrompts>,
-  getTasks: () => ReturnType<typeof createTasks>,
-  content: ReturnType<typeof createContent>,
-  materials: Materials,
+  models: () => Models,
+  results: Results,
   assertWritable: (name: string) => void,
   localize: (
     locale: string,
@@ -501,69 +443,90 @@ function bindTasks(
     params?: Record<string, string | number | boolean>,
   ) => string,
 ): ApplicationTasks {
-  const timeoutOpts = (opts?: CallOptions, task?: string): CallOptions => {
-    const { models } = env.settings;
-    const route =
-      task && Object.hasOwn(models.tasks, task)
-        ? models.tasks[task]
-        : undefined;
-    return { timeoutMs: route?.timeoutMs ?? models.timeoutMs, ...opts };
+  const timeoutOpts = (opts?: CallOptions, task?: string): CallOptions => ({
+    timeoutMs: models().tasks.timeoutMs(task),
+    ...opts,
+  });
+
+  type TaskCompletion<R extends TaskResult> = {
+    beforeRun?(): void;
+    finish(completed: Completed, signal: AbortSignal): Promise<R>;
+  };
+  const returnCompletion = {
+    finish: async (completed: Completed) => completed,
+  };
+  const saveCompletion = {
+    beforeRun: () => assertWritable(resultOperationIds.save),
+    finish: (completed: Completed, signal: AbortSignal) =>
+      results.save(completed, { signal }),
   };
 
-  async function runSingle(
+  function runSingle<R extends TaskResult>(
     captured: RunTaskInput,
-    opts?: CallOptions,
-  ): Promise<TaskResult> {
-    parseJson(captured.variables);
+    opts: CallOptions | undefined,
+    completion: TaskCompletion<R>,
+  ): Promise<R> {
     return env.execution.run(
-      "tasks.run",
+      taskOperationIds.run,
       async (signal) => {
-        if (captured.persist) assertWritable("tasks.run.save");
-        const done = await getTasks().run(findTask(captured.task), captured, {
-          signal,
-          ...(opts?.onProgress ? { onProgress: opts.onProgress } : {}),
-        });
-        return captured.persist ? content.results.save(done, { signal }) : done;
+        completion.beforeRun?.();
+        const done = await models().tasks.run(
+          findTask(captured.task),
+          captured,
+          {
+            signal,
+            ...(opts?.onProgress ? { onProgress: opts.onProgress } : {}),
+          },
+        );
+        return completion.finish(done, signal);
+      },
+      timeoutOpts(opts, captured.task),
+    );
+  }
+
+  function runStream<R extends TaskResult>(
+    input: RunTaskInput,
+    opts: CallOptions | undefined,
+    completion: TaskCompletion<R>,
+  ): Flow<R> {
+    const captured = structuredClone(input);
+    return env.execution.flow(
+      taskOperationIds.stream,
+      (signal) => {
+        completion.beforeRun?.();
+        return mapFlowResult(
+          models().tasks.stream(findTask(captured.task), captured, { signal }),
+          (done) => completion.finish(done, signal),
+        );
       },
       timeoutOpts(opts, captured.task),
     );
   }
 
   return {
-    run: (input, opts) => runSingle(structuredClone(input), opts),
-    stream(input, opts) {
-      parseJson(input.variables);
-      const captured = structuredClone(input);
-      return env.execution.flow<TaskResult>(
-        "tasks.stream",
-        (signal) => {
-          if (captured.persist) assertWritable("tasks.stream.save");
-          const flow = getTasks().stream(findTask(captured.task), captured, {
-            signal,
-          });
-          return captured.persist
-            ? mapFlowResult(flow, (result) =>
-                content.results.save(result, { signal }),
-              )
-            : flow;
-        },
-        timeoutOpts(opts, captured.task),
-      );
-    },
+    run: (input, opts) =>
+      runSingle(structuredClone(input), opts, returnCompletion),
+    runAndSave: (input, opts) =>
+      runSingle(structuredClone(input), opts, saveCompletion),
+    stream: (input, opts) => runStream(input, opts, returnCompletion),
+    streamAndSave: (input, opts) => runStream(input, opts, saveCompletion),
     runMany(inputs, opts): Promise<readonly BatchItemResult[]> {
       const captured = structuredClone(inputs);
       return env.execution.run(
-        "tasks.runMany",
+        taskOperationIds.runMany,
         async (signal) => {
           const queue = new PQueue({
-            concurrency: env.configuration.snapshot().models.concurrency,
+            concurrency: models().tasks.concurrency,
           });
           const locale = env.settings.locale;
           const outcomes = await Promise.all(
             captured.map(async (input): Promise<BatchItemResult> => {
               try {
-                const result = await queueWork(queue, signal, () =>
-                  runSingle(input, { signal }),
+                const { persist, ...request } = input;
+                const result = await queueWork<TaskResult>(queue, signal, () =>
+                  persist
+                    ? runSingle(request, { signal }, saveCompletion)
+                    : runSingle(request, { signal }, returnCompletion),
                 );
                 return { ok: true, result };
               } catch (error) {
@@ -594,19 +557,18 @@ function bindTasks(
       );
     },
     preview(input, opts) {
-      parseJson(input.variables);
       const captured = structuredClone(input);
       return env.execution.run(
-        "tasks.preview",
+        taskOperationIds.preview,
         (signal) =>
-          getTasks().preview(findTask(captured.task), captured, {
+          models().tasks.preview(findTask(captured.task), captured, {
             signal,
           }),
         timeoutOpts(opts, captured.task),
       );
     },
     describe: (name, locale) =>
-      env.execution.run("tasks.describe", () =>
+      env.execution.run(taskOperationIds.describe, () =>
         describeTask(findTask(name), prompts, (key) =>
           localize(locale ?? env.configuration.snapshot().locale, key),
         ),
@@ -631,12 +593,7 @@ function bindTasks(
         };
       }),
     present(taskName, result, locale = env.configuration.snapshot().locale) {
-      const task = findTask(taskName);
-      if (!task.present) return JSON.stringify(result, null, 2);
-      const directory = createSourceDirectory(
-        result.inputs.map((use, index) => describeUse(use, index, materials)),
-      );
-      return task.present(result.value, directory, locale);
+      return presentTask(findTask(taskName), result, locale);
     },
   };
 }

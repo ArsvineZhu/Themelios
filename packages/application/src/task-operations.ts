@@ -1,6 +1,6 @@
 import {
   mapFlowResult,
-  jsonSchema,
+  errorInfoSchema,
   type CallOptions,
   type Completed,
   type ErrorInfo,
@@ -10,23 +10,27 @@ import {
 } from "@themelios/core";
 import {
   modelNameSchema,
+  previewSchema,
+  promptRoleSchema,
+  promptTemplatesSchema,
+  promptDescriptionSchema,
+  promptDiffSchema,
+  taskDescriptionSchema,
   type ApplicationPrompts,
   type Preview,
   type TaskDescription,
   type TaskRequest,
 } from "@themelios/models";
-import { taskExampleSourceSchema } from "@themelios/models/tasks";
 import { z } from "zod";
 import {
   defineOperation,
+  standardPermission,
   type AnyOperation,
 } from "@themelios/runtime/operations";
 import {
   encodeCompleted,
-  encodePreview,
   decodeTaskMaterials,
   wirePreviewInputSchema,
-  wirePreviewSchema,
   wireResultSchema,
   wireRunTaskSchema,
   type WireBatchItemResult,
@@ -42,20 +46,22 @@ export type BatchItemResult =
 
 export interface RunTaskInput extends TaskRequest<Json> {
   readonly task: string;
+}
+
+export interface BatchTaskInput extends RunTaskInput {
   readonly persist?: boolean;
 }
 
 export interface ApplicationTasks {
-  run(input: RunTaskInput, options?: CallOptions): Promise<TaskResult>;
-  stream(input: RunTaskInput, options?: CallOptions): Flow<TaskResult>;
+  run(input: RunTaskInput, options?: CallOptions): Promise<Completed>;
+  runAndSave(input: RunTaskInput, options?: CallOptions): Promise<SavedResult>;
+  stream(input: RunTaskInput, options?: CallOptions): Flow<Completed>;
+  streamAndSave(input: RunTaskInput, options?: CallOptions): Flow<SavedResult>;
   runMany(
-    inputs: readonly RunTaskInput[],
+    inputs: readonly BatchTaskInput[],
     options?: CallOptions,
   ): Promise<readonly BatchItemResult[]>;
-  preview(
-    input: TaskRequest<Json> & { readonly task: string },
-    options?: CallOptions,
-  ): Promise<Preview>;
+  preview(input: RunTaskInput, options?: CallOptions): Promise<Preview>;
   describe(task: string, locale?: string): Promise<TaskDescription>;
   list(locale?: string): readonly {
     readonly id: string;
@@ -74,70 +80,31 @@ export interface TaskOperationTarget {
   readonly prompts: ApplicationPrompts;
 }
 
+export const taskOperationIds = {
+  list: "tasks.list",
+  describe: "tasks.describe",
+  preview: "tasks.preview",
+  run: "tasks.run",
+  stream: "tasks.stream",
+  runMany: "tasks.runMany",
+} as const;
+
+export const promptOperationIds = {
+  read: "prompts.read",
+  describe: "prompts.describe",
+  diff: "prompts.diff",
+  setOverride: "prompts.setOverride",
+  reset: "prompts.reset",
+} as const;
+
 const emptySchema = z.strictObject({});
 const taskIdSchema = z.strictObject({ task: modelNameSchema });
-const promptPartSchema = z.enum(["system", "user"]);
-
-const promptFileInfoSchema = z.strictObject({
-  role: promptPartSchema,
-  path: z.string(),
-  source: z.enum(["builtin", "override", "inline"]),
-});
-
-const promptTemplatesSchema = z.strictObject({
-  system: z.string(),
-  user: z.string(),
-  files: z.array(promptFileInfoSchema),
-});
-
-const promptDescriptionSchema = z.strictObject({
-  files: z.array(promptFileInfoSchema),
-  variablesSchema: jsonSchema,
-  outputSchema: jsonSchema.optional(),
-  requirements: jsonSchema,
-});
-
-const promptDiffSchema = z.strictObject({
-  role: promptPartSchema,
-  builtin: z.string(),
-  override: z.string().optional(),
-});
-
-const taskDescriptionSchema = z.strictObject({
-  id: z.string(),
-  title: z.string(),
-  purpose: z.string(),
-  inputSchema: jsonSchema,
-  sourcesSchema: jsonSchema,
-  output: z.union([
-    z.strictObject({ kind: z.literal("text") }),
-    z.strictObject({ kind: z.literal("json"), schema: jsonSchema }),
-  ]),
-  requirements: jsonSchema,
-  templates: z.array(promptFileInfoSchema),
-  examples: z.array(
-    z.strictObject({
-      name: z.string(),
-      variables: jsonSchema,
-      sources: z.array(taskExampleSourceSchema),
-      output: jsonSchema,
-    }),
-  ),
-  outputRules: z.array(z.string()),
-});
-
 const batchSchema = z.array(
   z.union([
     z.strictObject({ ok: z.literal(true), result: wireResultSchema }),
     z.strictObject({
       ok: z.literal(false),
-      error: z.strictObject({
-        code: z.string(),
-        message: z.string(),
-        retryable: z.boolean(),
-        details: jsonSchema.optional(),
-        traceId: z.string().optional(),
-      }),
+      error: errorInfoSchema,
     }),
   ]),
 );
@@ -153,7 +120,6 @@ function decodeRunTask(wire: WireRunTaskInput): RunTaskInput {
     materials: decodeTaskMaterials(wire.materials),
     ...(wire.model === undefined ? {} : { model: wire.model }),
     ...(wire.parameters === undefined ? {} : { parameters: wire.parameters }),
-    ...(wire.persist === undefined ? {} : { persist: wire.persist }),
   };
 }
 
@@ -162,9 +128,9 @@ export function taskOperations<
 >(): readonly AnyOperation<App>[] {
   return [
     defineOperation<App>()({
-      id: "tasks.list",
+      id: taskOperationIds.list,
       description: "List registered tasks.",
-      permission: "read",
+      permission: standardPermission.read,
       input: emptySchema,
       output: z.array(
         z.strictObject({
@@ -174,52 +140,53 @@ export function taskOperations<
         }),
       ),
       mcp: { readOnlyHint: true, idempotentHint: true },
-      http: { method: "GET", path: "/tasks" },
+      http: [{ method: "GET", path: "/tasks" }],
       execute: (app, _input, context) => app.tasks.list(context.locale),
     }),
     defineOperation<App>()({
-      id: "tasks.describe",
+      id: taskOperationIds.describe,
       description:
         "Describe variables, output, requirements and templates of a task.",
-      permission: "read",
+      permission: standardPermission.read,
       input: taskIdSchema,
       output: taskDescriptionSchema,
       mcp: { readOnlyHint: true, idempotentHint: true },
-      http: { method: "GET", path: "/tasks/:id", paramMap: { id: "task" } },
+      http: [{ method: "GET", path: "/tasks/:id", paramMap: { id: "task" } }],
       execute: (app, { task }, context) =>
         app.tasks.describe(task, context.locale),
     }),
     defineOperation<App>()({
-      id: "tasks.preview",
+      id: taskOperationIds.preview,
       description: "Compile the prompt and show planned media preparation.",
-      permission: "read",
+      permission: standardPermission.read,
       input: wirePreviewInputSchema,
-      output: wirePreviewSchema,
+      output: previewSchema,
       mcp: { readOnlyHint: true, idempotentHint: true },
-      http: {
-        method: "POST",
-        path: "/tasks/:id/preview",
-        paramMap: { id: "task" },
-        mergeParamsIntoBody: true,
-      },
-      async execute(app, wire, context) {
-        return encodePreview(
-          await app.tasks.preview(decodeRunTask(wire), context.options),
-        );
-      },
+      http: [
+        {
+          method: "POST",
+          path: "/tasks/:id/preview",
+          paramMap: { id: "task" },
+          mergeParamsIntoBody: true,
+        },
+      ],
+      execute: (app, wire, context) =>
+        app.tasks.preview(decodeRunTask(wire), context.options),
     }),
     defineOperation<App>()({
-      id: "tasks.run",
+      id: taskOperationIds.run,
       description: "Run a task on a group of materials; optionally save it.",
-      permission: "write",
+      permission: standardPermission.write,
       input: wireRunTaskSchema,
       output: wireResultSchema,
-      http: {
-        method: "POST",
-        path: "/tasks/:id/run",
-        paramMap: { id: "task" },
-        mergeParamsIntoBody: true,
-      },
+      http: [
+        {
+          method: "POST",
+          path: "/tasks/:id/run",
+          paramMap: { id: "task" },
+          mergeParamsIntoBody: true,
+        },
+      ],
       present(output, app, context) {
         if (app.tasks.present) {
           return app.tasks.present(
@@ -232,20 +199,25 @@ export function taskOperations<
       },
       async execute(app, wire, context) {
         return encodeTaskResult(
-          await app.tasks.run(decodeRunTask(wire), context.options),
+          await (wire.persist
+            ? app.tasks.runAndSave(decodeRunTask(wire), context.options)
+            : app.tasks.run(decodeRunTask(wire), context.options)),
         );
       },
     }),
     defineOperation<App>()({
-      id: "tasks.runMany",
+      id: taskOperationIds.runMany,
       description: "Run independent requests in order, with item-level errors.",
-      permission: "write",
+      permission: standardPermission.write,
       input: z.strictObject({ inputs: z.array(wireRunTaskSchema) }),
       output: batchSchema,
-      http: { method: "POST", path: "/tasks/run-many" },
+      http: [{ method: "POST", path: "/tasks/run-many" }],
       async execute(app, { inputs }, context) {
         const outcomes = await app.tasks.runMany(
-          inputs.map(decodeRunTask),
+          inputs.map((wire) => ({
+            ...decodeRunTask(wire),
+            ...(wire.persist === undefined ? {} : { persist: wire.persist }),
+          })),
           context.options,
         );
         return outcomes.map((outcome): WireBatchItemResult => {
@@ -259,100 +231,114 @@ export function taskOperations<
       },
     }),
     defineOperation<App>()({
-      id: "tasks.stream",
+      id: taskOperationIds.stream,
       description: "Stream progress, text and the final task result.",
-      permission: "write",
+      permission: standardPermission.write,
       kind: "stream",
       input: wireRunTaskSchema,
       output: wireResultSchema,
       mcp: { expose: false },
-      http: {
-        method: "POST",
-        path: "/tasks/:id/stream",
-        paramMap: { id: "task" },
-        mergeParamsIntoBody: true,
-      },
+      http: [
+        {
+          method: "POST",
+          path: "/tasks/:id/stream",
+          paramMap: { id: "task" },
+          mergeParamsIntoBody: true,
+        },
+      ],
       execute(app, wire, context) {
         return mapFlowResult(
-          app.tasks.stream(decodeRunTask(wire), context.options),
+          wire.persist
+            ? app.tasks.streamAndSave(decodeRunTask(wire), context.options)
+            : app.tasks.stream(decodeRunTask(wire), context.options),
           encodeTaskResult,
         );
       },
     }),
     defineOperation<App>()({
-      id: "prompts.read",
+      id: promptOperationIds.read,
       description: "Read the active system and user templates.",
-      permission: "read",
+      permission: standardPermission.read,
       input: taskIdSchema,
       output: promptTemplatesSchema,
       mcp: { expose: false, readOnlyHint: true },
-      http: {
-        method: "GET",
-        path: "/tasks/:id/prompts",
-        paramMap: { id: "task" },
-      },
+      http: [
+        {
+          method: "GET",
+          path: "/tasks/:id/prompts",
+          paramMap: { id: "task" },
+        },
+      ],
       execute: (app, { task }) => app.prompts.read(task),
     }),
     defineOperation<App>()({
-      id: "prompts.describe",
+      id: promptOperationIds.describe,
       description: "Describe prompt variables, output and template sources.",
-      permission: "read",
+      permission: standardPermission.read,
       input: taskIdSchema,
       output: promptDescriptionSchema,
       mcp: { expose: false, readOnlyHint: true },
-      http: {
-        method: "GET",
-        path: "/tasks/:id/prompts/describe",
-        paramMap: { id: "task" },
-      },
+      http: [
+        {
+          method: "GET",
+          path: "/tasks/:id/prompts/describe",
+          paramMap: { id: "task" },
+        },
+      ],
       execute: (app, { task }) => app.prompts.describe(task),
     }),
     defineOperation<App>()({
-      id: "prompts.diff",
+      id: promptOperationIds.diff,
       description: "Get builtin and instance override templates.",
-      permission: "read",
+      permission: standardPermission.read,
       input: taskIdSchema,
       output: z.array(promptDiffSchema),
       mcp: { expose: false, readOnlyHint: true },
-      http: {
-        method: "GET",
-        path: "/tasks/:id/prompts/diff",
-        paramMap: { id: "task" },
-      },
+      http: [
+        {
+          method: "GET",
+          path: "/tasks/:id/prompts/diff",
+          paramMap: { id: "task" },
+        },
+      ],
       execute: (app, { task }) => app.prompts.diff(task),
     }),
     defineOperation<App>()({
-      id: "prompts.setOverride",
+      id: promptOperationIds.setOverride,
       description: "Compile and save an instance template override.",
-      permission: "admin",
+      permission: standardPermission.admin,
       input: taskIdSchema.extend({
-        role: promptPartSchema,
+        role: promptRoleSchema,
         template: z.string(),
       }),
       output: promptDescriptionSchema,
       mcp: { expose: false, destructiveHint: true },
-      http: {
-        method: "POST",
-        path: "/tasks/:id/prompts/override",
-        paramMap: { id: "task" },
-        mergeParamsIntoBody: true,
-      },
+      http: [
+        {
+          method: "POST",
+          path: "/tasks/:id/prompts/override",
+          paramMap: { id: "task" },
+          mergeParamsIntoBody: true,
+        },
+      ],
       execute: (app, { task, role, template }) =>
         app.prompts.setOverride(task, { role, template }),
     }),
     defineOperation<App>()({
-      id: "prompts.reset",
+      id: promptOperationIds.reset,
       description: "Reset one or both templates to builtin values.",
-      permission: "admin",
-      input: taskIdSchema.extend({ role: promptPartSchema.optional() }),
+      permission: standardPermission.admin,
+      input: taskIdSchema.extend({ role: promptRoleSchema.optional() }),
       output: promptDescriptionSchema,
       mcp: { expose: false, destructiveHint: true },
-      http: {
-        method: "POST",
-        path: "/tasks/:id/prompts/reset",
-        paramMap: { id: "task" },
-        mergeParamsIntoBody: true,
-      },
+      http: [
+        {
+          method: "POST",
+          path: "/tasks/:id/prompts/reset",
+          paramMap: { id: "task" },
+          mergeParamsIntoBody: true,
+        },
+      ],
       execute: (app, { task, role }) => app.prompts.reset(task, role),
     }),
   ];

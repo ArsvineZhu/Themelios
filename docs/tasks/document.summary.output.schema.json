@@ -30,7 +30,7 @@
             "type": "array",
             "items": {
               "type": "string",
-              "pattern": "^S[1-9][0-9]*$"
+              "pattern": "^S[1-9]\\d*$"
             },
             "descriptionKey": "tasks.summary.fields.sourceKeys",
             "description": "实际支持本节的来源键，1 至 64 项，使用本次目录中的 S1、S2 等，保持首次引用顺序。"

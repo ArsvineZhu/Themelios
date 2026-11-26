@@ -59,27 +59,27 @@ export function createHttpHandler<App>(
     router.on(route.method, route.path, async (ctx) => {
       const call = ctx.env.operation;
       assertOperationPermission(route.operation, call.principal);
-      if (route.operation.kind === "stream") ctx.env.setIdleTimeout?.(0);
-      const result = callOperation(
+      const outcome = callOperation(
         app,
         directory,
         route.operation.id,
         await route.extractInput(ctx),
         call,
-        route.binaryBody,
+        route.binaryBody ? { input: "binary" } : undefined,
       );
-      if (route.operation.kind === "stream") {
+      if (outcome.kind === "stream") {
+        ctx.env.setIdleTimeout?.(0);
         return eventStream(
-          result as Flow<unknown>,
+          outcome.flow,
           call.maxJsonBytes,
           call.locale,
           options.translate,
         );
       }
-      const output = await result;
-      if (route.operation.kind === "binary-read") {
-        return download(output as BinaryReadResult);
+      if (outcome.kind === "binary-read") {
+        return download(await outcome.result);
       }
+      const output = await outcome.result;
       if (route.status === 204) return new Response(null, { status: 204 });
       return new Response(jsonText(output, call.maxJsonBytes), {
         status: route.status ?? 200,

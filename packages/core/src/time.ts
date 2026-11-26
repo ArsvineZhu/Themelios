@@ -100,8 +100,9 @@ export const instantSchema = z
   }, "Expected canonical UTC with millisecond precision");
 
 export const timeDomainIdSchema = z.string().regex(/^[a-z][a-z0-9._-]{0,63}$/);
+const utcDomain = "utc";
 export const customTimeDomainIdSchema = timeDomainIdSchema.refine(
-  (value) => value !== "utc",
+  (value) => value !== utcDomain,
   '"utc" is reserved for the built-in UTC domain',
 );
 
@@ -118,12 +119,7 @@ export const tickSecondsSchema = z.strictObject({
   denominator: z.string().regex(/^[1-9][0-9]*$/),
 });
 
-export const timeDomainSchema = z.discriminatedUnion("kind", [
-  z.strictObject({
-    id: z.literal("utc"),
-    kind: z.literal("utc"),
-    label: z.string().min(1),
-  }),
+const customDomains = [
   z.strictObject({
     id: customTimeDomainIdSchema,
     kind: z.literal("linear"),
@@ -135,15 +131,30 @@ export const timeDomainSchema = z.discriminatedUnion("kind", [
     kind: z.literal("opaque"),
     label: z.string().min(1),
   }),
+] as const;
+export const customTimeDomainSchema = z.discriminatedUnion(
+  "kind",
+  customDomains,
+);
+export type CustomTimeDomain = z.output<typeof customTimeDomainSchema>;
+
+const utcTimeDomainSchema = z.strictObject({
+  id: z.literal(utcDomain),
+  kind: z.literal(utcDomain),
+  label: z.string().min(1),
+});
+export const timeDomainSchema = z.discriminatedUnion("kind", [
+  utcTimeDomainSchema,
+  ...customDomains,
 ]);
 
 export type TimeDomain = z.infer<typeof timeDomainSchema>;
 export type TickSeconds = z.infer<typeof tickSecondsSchema>;
 
-export const UTC_TIME_DOMAIN: Extract<TimeDomain, { kind: "utc" }> =
+export const UTC_TIME_DOMAIN: z.output<typeof utcTimeDomainSchema> =
   Object.freeze({
-    id: "utc",
-    kind: "utc",
+    id: utcDomain,
+    kind: utcDomain,
     label: "UTC",
   });
 
@@ -155,16 +166,16 @@ export type TimePoint = z.infer<typeof timePointSchema>;
 
 export function utcPoint(iso: string): TimePoint {
   const utc = toInstant(iso);
-  return { domain: "utc", ticks: String(Date.parse(utc)) };
+  return { domain: UTC_TIME_DOMAIN.id, ticks: String(Date.parse(utc)) };
 }
 
 export function pointToUtcIso(point: TimePoint): Instant {
   if (!timePointSchema.safeParse(point).success) {
     throw appError("time.invalid", { details: { point } });
   }
-  if (point.domain !== "utc") {
+  if (point.domain !== UTC_TIME_DOMAIN.id) {
     throw appError("time.domain_mismatch", {
-      details: { expected: "utc", actual: point.domain },
+      details: { expected: UTC_TIME_DOMAIN.id, actual: point.domain },
     });
   }
   const date = new Date(Number(point.ticks));

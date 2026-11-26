@@ -14,7 +14,6 @@
   "runtime.read_only": "此操作需要可写会话。",
   "runtime.close_failed": "部分资源关闭失败。",
   "runtime.close_timeout": "取消后仍有操作未结束。",
-  "runtime.resource_bound": "应用已绑定组合资源。",
   "config.invalid": "设置无效。",
   "config.unknown_setting": "未声明此设置。",
   "config.write_failed": "无法保存程序管理的设置。",

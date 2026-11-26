@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { appError } from "./errors.js";
-import { mediaTypeSchema } from "./media-type.js";
+import { jsonPointerSchema } from "./json.js";
+import { mediaTypeSchema, plainTextMediaType } from "./media-type.js";
 
 export const artifactRefSchema = z
   .string()
@@ -8,7 +9,21 @@ export const artifactRefSchema = z
     /^art_[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/,
   )
   .meta({ "x-themelios-ref": true });
-export const blobRefSchema = z.string().regex(/^sha256:[a-f0-9]{64}$/);
+export const blobDigestAlgorithm = "sha256";
+export const blobRefPrefix = `${blobDigestAlgorithm}:`;
+export const blobDigestHexLength = 64;
+export const blobDigestHexCharacters = "0-9a-f";
+const digestHexPattern = `[${blobDigestHexCharacters}]{${blobDigestHexLength}}`;
+export const blobDigestHexSchema = z
+  .string()
+  .regex(new RegExp(`^${digestHexPattern}$`));
+export const blobRefSchema = z
+  .string()
+  .regex(new RegExp(`^${blobRefPrefix}${digestHexPattern}$`));
+
+export function blobRefFromDigest(digest: string): BlobRef {
+  return `${blobRefPrefix}${blobDigestHexSchema.parse(digest)}`;
+}
 export const commitPointSchema = z
   .string()
   .regex(/^(0|[1-9][0-9]{0,18})$/)
@@ -58,38 +73,38 @@ export const rangeSchema = z.discriminatedUnion("kind", [
   }),
   z.strictObject({
     kind: z.literal("json"),
-    pointer: z.string().regex(/^(?:\/(?:[^~/]|~[01])*)*$/),
+    pointer: jsonPointerSchema,
   }),
 ]);
 
 export type Range = z.infer<typeof rangeSchema>;
 
-export interface Selection {
-  ref: ArtifactRef;
-  range?: Range;
+/** Encodes a range independently of the caller's property order. */
+export function selectionRangeKey(range?: Range): string {
+  return range === undefined ? "" : JSON.stringify(rangeSchema.parse(range));
 }
 
-export const selectionSchema = z
-  .strictObject({ ref: artifactRefSchema, range: rangeSchema.optional() })
-  .transform(({ ref, range }): Selection =>
-    range === undefined ? { ref } : { ref, range },
-  );
+export const selectionSchema = z.strictObject({
+  ref: artifactRefSchema,
+  range: rangeSchema.optional(),
+});
+export type Selection = z.infer<typeof selectionSchema>;
 
-export interface InlineMaterial {
-  bytes: Uint8Array;
-  mediaType: string;
-  name?: string;
+export const inlineMaterialSchema = z.strictObject({
+  bytes: z.instanceof(Uint8Array<ArrayBufferLike>),
+  mediaType: mediaTypeSchema,
+  name: z.string().min(1).optional(),
+});
+export type InlineMaterial = z.output<typeof inlineMaterialSchema>;
+
+/** Constructs plain UTF-8 input for operations that consume inline material. */
+export function inlineText(text: string, name?: string): InlineMaterial {
+  return {
+    bytes: new TextEncoder().encode(text),
+    mediaType: plainTextMediaType,
+    ...(name === undefined ? {} : { name }),
+  };
 }
-
-export const inlineMaterialSchema = z
-  .strictObject({
-    bytes: z.instanceof(Uint8Array),
-    mediaType: mediaTypeSchema.toLowerCase(),
-    name: z.string().min(1).optional(),
-  })
-  .transform(({ bytes, mediaType, name }): InlineMaterial =>
-    name === undefined ? { bytes, mediaType } : { bytes, mediaType, name },
-  );
 
 const utf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
@@ -98,7 +113,7 @@ export function decodeUtf8(bytes: Uint8Array): string {
     return utf8.decode(bytes);
   } catch (cause) {
     throw appError("content.decode_failed", {
-      details: { mediaType: "text/plain", reason: "invalid UTF-8" },
+      details: { mediaType: plainTextMediaType, reason: "invalid UTF-8" },
       cause,
     });
   }

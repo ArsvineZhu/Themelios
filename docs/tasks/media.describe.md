@@ -9,9 +9,9 @@
 - `text/*`：text。
 - `application/json`：text。
 - `image/*`：visual。
-- `application/pdf`：text、visual。
+- `application/pdf`：text + visual。
 - `audio/*`：speech。
-- `video/*`：visual、speech、motion。
+- `video/*`：visual + speech + motion。
 
 变量 Schema 见 [输入合同](media.describe.input.schema.json)。本次来源以 `S1`、`S2` 等键按输入排序。模板能读取名称、类型、角色、原件范围、请求选区和实际交付，程序随后追加正文或媒体。
 
@@ -266,6 +266,7 @@
         ]
       },
       "delivered": {
+        "readOnly": true,
         "type": "array",
         "items": {
           "type": "object",
@@ -559,12 +560,13 @@
       },
       "mediaType": {
         "type": "string",
-        "pattern": "^[\\w!#$&^.+-]+\\/(?:[\\w!#$&^.+-]+|\\*)$",
+        "pattern": "^[\\w!#$&^.+-]+\\/[\\w!#$&^.+-]+$",
         "description": "Media type of the original material."
       },
       "name": {
         "description": "Display name of the original material, when known.",
-        "type": "string"
+        "type": "string",
+        "minLength": 1
       },
       "role": {
         "type": "string",

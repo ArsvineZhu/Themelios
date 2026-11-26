@@ -17,19 +17,14 @@ const db = Database.init({
   formatId: "coverage",
 });
 const cas = await Cas.open(join(root, "objects"));
-const content = createContent({ database: db, cas });
+const adapters = createPdfAdapters();
+const content = createContent({ database: db, cas, adapters });
 const pdf = await PDFDocument.create();
 for (const n of [1, 2, 3, 4]) pdf.addPage().drawText("Page " + n);
 const bytes = await pdf.save();
-const adapters = createPdfAdapters();
 const prep = createPreparation({
   adapters,
-  store: {
-    inspect: content.materials.inspect,
-    read: content.materials.read,
-    text: content.materials.text,
-    readResult: content.results.read,
-  },
+  store: content,
 });
 try {
   const text = await content.materials.accept({
@@ -44,9 +39,9 @@ try {
     [{ ...text, range: { kind: "text", start: 3, end: 5 } }, "text/plain"],
     [{ ...doc, range: { kind: "pages", start: 2, end: 3 } }, "application/pdf"],
   ] as const) {
-    const result = await prep.forModel(
-      [source],
-      { minMaterials: 1, inputs: [{ mediaType: mime, needs: ["text"] }] },
+    const result = await prep.prepare(
+      [{ source }],
+      { minMaterials: 1, inputs: [{ mediaType: mime, accepts: [["text"]] }] },
       {
         operations: ["generate"],
         inputMimeTypes: ["text/plain"],
@@ -63,18 +58,6 @@ try {
         delivered: result.parts,
       }),
     );
-    if (mime === "application/pdf") {
-      const loaded = await adapters[0]!.probe({
-        source,
-        info: {
-          mediaType: mime,
-          sizeBytes: bytes.length,
-          extent: { kind: "unknown" },
-        },
-        open: async () => new Blob([new Uint8Array(bytes)]).stream(),
-      });
-      console.log("PDF probe", loaded);
-    }
   }
 } finally {
   await cas.close();

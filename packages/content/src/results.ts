@@ -2,8 +2,11 @@ import { registerRepresentation } from "./representation-index.js";
 import type { Representation } from "./representations.js";
 import {
   artifactRefSchema,
+  modelInputRepresentationPurpose,
   openCall,
-  throwIfAborted,
+  resultFile,
+  resultValueOutput,
+  resultValueSelection,
   savedResultSchema,
   type ArtifactRef,
   type CallOptions,
@@ -12,25 +15,28 @@ import {
   type InputUse,
   type Json,
   type Material,
-  type Producer,
   type SavedFile,
   type SavedResult,
   type Selection,
 } from "@themelios/core";
-import type { Cas, Database, WriteTransaction } from "@themelios/storage";
+import type {
+  Cas,
+  Database,
+  TransactionResult,
+  WriteTransaction,
+} from "@themelios/storage";
 import { z, type ZodType } from "zod";
 import {
   addArtifact,
   addEdges,
   newArtifactRef,
-  prepareAdoption,
   retain,
   storedArtifact,
   type ArtifactDraft,
   type SourceLink,
 } from "./artifacts.js";
 import { captureImport, importArtifact, type ImportLimits } from "./imports.js";
-import { captureResult, resultLinks, selectOutput } from "./result-graph.js";
+import { captureResult, resultLinks } from "./result-graph.js";
 import {
   rawBytes,
   resultMediaType,
@@ -39,40 +45,45 @@ import {
 } from "./selections.js";
 import { jsonValue, validated } from "./validation.js";
 
-export interface ResultManifest<T extends Json = Json> {
-  format: "themelios.result";
-  value: T;
-  inputs: readonly InputUse<Selection>[];
-  files: Readonly<Record<string, SavedFile>>;
-  producer: Producer;
-  upstreamResults: readonly ArtifactRef[];
-}
+const resultManifestFormat = "themelios.result";
 
-export interface PreparedResult<T extends Json = Json> {
-  readonly ref: ArtifactRef;
-  adopt(tx: WriteTransaction): SavedResult<T>;
-  close(): Promise<void>;
-}
+type ResultManifest = Omit<SavedResult, "ref"> & {
+  format: typeof resultManifestFormat;
+  upstreamResults: readonly ArtifactRef[];
+};
+
+export type ResultAttachment<T extends Json, R> = (
+  tx: WriteTransaction,
+  saved: SavedResult<T>,
+) => TransactionResult<R>;
+
+export const resultOperationIds = {
+  read: "results.read",
+  save: "results.save",
+  adopt: "results.adopt",
+} as const;
 
 export interface Results {
-  prepare<T extends Json>(
-    completed: Completed<T>,
-    options?: CallOptions,
-  ): Promise<PreparedResult<T>>;
-  read(ref: ArtifactRef, options?: CallOptions): Promise<SavedResult>;
-  read<T extends Json>(
+  read<T extends Json = Json>(
     ref: ArtifactRef,
-    schema: ZodType<T>,
-    options?: CallOptions,
+    options?: CallOptions & { schema?: ZodType<T> },
   ): Promise<SavedResult<T>>;
+  /** Saves a standalone result and adds it to the retention catalog. */
   save<T extends Json>(
     completed: Completed<T>,
     options?: CallOptions,
   ): Promise<SavedResult<T>>;
+  /** Saves a result graph and its application ownership in one commit. */
+  adopt<T extends Json, R>(
+    completed: Completed<T>,
+    attach: ResultAttachment<T, R>,
+    options?: CallOptions,
+  ): Promise<R>;
 }
 
 const manifestEnvelope = z.looseObject({
-  format: z.literal("themelios.result"),
+  format: z.literal(resultManifestFormat),
+  ref: z.never().optional(),
   upstreamResults: z.array(artifactRefSchema),
 });
 
@@ -82,6 +93,7 @@ export function parseManifest(
 ): { result: SavedResult; upstreamResults: ArtifactRef[] } {
   const {
     format: _format,
+    ref: _ref,
     upstreamResults,
     ...record
   } = validated(manifestEnvelope, jsonValue(text, ref));
@@ -117,20 +129,20 @@ async function loadResult(
 export function createResults(
   database: Database,
   cas: Cas,
-  limits: ImportLimits,
+  importLimits: () => ImportLimits,
 ): Results {
-  async function prepare<T extends Json>(
+  async function persist<T extends Json, R>(
     completed: Completed<T>,
     operation: string,
+    attach: ResultAttachment<T, R>,
     options?: CallOptions,
-  ): Promise<PreparedResult<T>> {
+  ): Promise<R> {
     database.requireWritable(operation);
     const scope = openCall(operation, options);
     try {
-      const captured = captureResult(
-        completed,
-        Math.min(limits.maxInlineBytes, limits.maxImportBytes),
-      );
+      scope.throwIfAborted();
+      const limits = importLimits();
+      const captured = captureResult(completed, limits.maxInlineBytes);
       scope.throwIfAborted();
       const plan = await buildPlan(
         database,
@@ -140,73 +152,58 @@ export function createResults(
         scope.signal,
       );
       const saved = plan.root as SavedResult<T>;
-      return {
-        ref: saved.ref,
-        ...prepareAdoption(database, operation, (tx) => {
-          for (const [ref, item] of plan.newArtifacts) {
-            if (!addArtifact(tx, item.artifact)) continue;
-            for (const link of item.edges)
-              storedArtifact(tx.sql, link.selection.ref);
-            addEdges(tx, ref, item.edges);
-            if (ref === saved.ref) retain(tx.sql, ref, tx.seq);
-          }
-          for (const entry of plan.representations)
-            registerRepresentation(tx, entry);
-          return structuredClone(saved);
-        }),
-      };
+      scope.throwIfAborted();
+      return database.write<R>((tx) => {
+        for (const [ref, item] of plan.newArtifacts) {
+          if (!addArtifact(tx, item.artifact)) continue;
+          for (const link of item.edges)
+            storedArtifact(tx.sql, link.selection.ref);
+          addEdges(tx, ref, item.edges);
+        }
+        for (const { saved, entry } of plan.representations)
+          registerRepresentation(tx, saved, entry);
+        return attach(tx, saved);
+      });
     } finally {
       scope.close();
     }
   }
 
-  async function read(
+  async function read<T extends Json = Json>(
     ref: ArtifactRef,
-    options?: CallOptions,
-  ): Promise<SavedResult>;
-  async function read<T extends Json>(
-    ref: ArtifactRef,
-    schema: ZodType<T>,
-    options?: CallOptions,
-  ): Promise<SavedResult<T>>;
-  async function read<T extends Json>(
-    ref: ArtifactRef,
-    schemaOrOptions?: CallOptions | ZodType<T>,
-    options?: CallOptions,
-  ) {
-    const schema =
-      schemaOrOptions && "safeParse" in schemaOrOptions
-        ? schemaOrOptions
-        : undefined;
-    const scope = openCall(
-      "content.read_result",
-      schema ? options : (schemaOrOptions as CallOptions | undefined),
-    );
+    options?: CallOptions & { schema?: ZodType<T> },
+  ): Promise<SavedResult<T>> {
+    const scope = openCall(resultOperationIds.read, options);
     try {
       scope.throwIfAborted();
       const result = await loadResult(database, cas, ref, scope.signal);
       scope.throwIfAborted();
-      return schema
-        ? { ...result, value: validated(schema, result.value, ["value"]) }
-        : result;
+      return options?.schema
+        ? {
+            ...result,
+            value: validated(options.schema, result.value, ["value"]),
+          }
+        : (result as SavedResult<T>);
     } finally {
       scope.close();
     }
   }
 
   return {
-    prepare<T extends Json>(completed: Completed<T>, options?: CallOptions) {
-      return prepare<T>(completed, "results.prepare", options);
-    },
     read,
-    async save<T extends Json>(completed: Completed<T>, options?: CallOptions) {
-      const prepared = await prepare<T>(completed, "results.save", options);
-      try {
-        throwIfAborted(options?.signal);
-        return database.write((tx) => prepared.adopt(tx));
-      } finally {
-        await prepared.close();
-      }
+    save(completed, options) {
+      return persist(
+        completed,
+        resultOperationIds.save,
+        (tx, saved) => {
+          retain(tx.sql, saved.ref, tx.seq);
+          return saved;
+        },
+        options,
+      );
+    },
+    adopt(completed, attach, options) {
+      return persist(completed, resultOperationIds.adopt, attach, options);
     },
   };
 }
@@ -226,7 +223,10 @@ async function buildPlan(
   const newArtifacts = new Map<ArtifactRef, PlannedArtifact>();
   const inlines = new WeakMap<InlineMaterial, ArtifactRef>();
   const results = new WeakMap<Completed, SavedResult>();
-  const representations: Representation[] = [];
+  const representations: {
+    saved: SavedResult;
+    entry: Omit<Representation, "result">;
+  }[] = [];
   const existingResults = new Map<ArtifactRef, SavedResult>();
   const lookup = (ref: ArtifactRef): ArtifactDraft =>
     newArtifacts.get(ref)?.artifact ??
@@ -263,7 +263,10 @@ async function buildPlan(
       result = await build(material.result);
     }
     upstreamResults.add(result.ref);
-    return selectOutput(result.ref, result.files, material.output);
+    const output = material.output ?? resultValueOutput;
+    return output === resultValueOutput
+      ? resultValueSelection(result.ref)
+      : resultFile(result, output).material;
   }
 
   async function build(node: Completed): Promise<SavedResult> {
@@ -278,34 +281,24 @@ async function buildPlan(
         delivered.push(await resolve(material, upstream));
       inputs.push({ ...use, source, delivered });
     }
-    const files: Record<string, SavedFile> = Object.create(null) as Record<
-      string,
-      SavedFile
-    >;
+    const files: SavedFile[] = [];
     for (const file of node.files) {
-      files[file.name] = {
+      files.push({
+        name: file.name,
         material: await resolve(file.material, upstream),
         sourceIndices: file.sourceIndices,
         ...(file.coverage === undefined ? {} : { coverage: file.coverage }),
-      };
+      });
     }
     const { value, producer } = node;
+    const body = { value, inputs, files, producer };
     const manifest: ResultManifest = {
-      format: "themelios.result",
-      value,
-      inputs,
-      files,
-      producer,
+      format: resultManifestFormat,
+      ...body,
       upstreamResults: [...upstream],
     };
     const ref = newArtifactRef();
-    const result: SavedResult = {
-      ref,
-      value,
-      inputs,
-      files,
-      producer,
-    };
+    const result: SavedResult = { ref, ...body };
     const { ref: blob, sizeBytes } = await cas.put(
       new TextEncoder().encode(JSON.stringify(manifest)),
       { signal },
@@ -325,13 +318,14 @@ async function buildPlan(
     results.set(node, result);
     const key = node.representation;
     if (key) {
-      for (const output of key.outputs) selectOutput(ref, files, output);
       representations.push({
-        source: key.source,
-        purpose: "model-input",
-        recipe: key.recipe,
-        result: ref,
-        outputs: key.outputs,
+        saved: result,
+        entry: {
+          source: key.source,
+          purpose: modelInputRepresentationPurpose,
+          recipe: key.recipe,
+          outputs: key.outputs,
+        },
       });
     }
     return result;

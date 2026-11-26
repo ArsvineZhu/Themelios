@@ -2,21 +2,16 @@ import { resolve } from "node:path";
 import {
   assertOperationPermission,
   callOperation,
+  standardPermission,
   type AnyOperation,
-  type BinaryReadResult,
-  type OperationDirectory,
-  type Operation,
   type OperationContext,
+  type OperationOutcome,
   type Permission,
   type Principal,
 } from "@themelios/runtime/operations";
-import {
-  appError,
-  openCall,
-  type CallOptions,
-  type Flow,
-} from "@themelios/core";
+import { appError, openCall, type CallOptions } from "@themelios/core";
 import type { Installation, Session } from "@themelios/runtime";
+import { defaultLocale } from "@themelios/runtime/locales";
 import { Command, CommanderError } from "commander";
 import { resolveDirectory } from "../directory.js";
 import {
@@ -26,7 +21,12 @@ import {
 } from "../errors.js";
 import { defaultMaxJsonBytes, jsonText } from "../json.js";
 import type { TransportLimits } from "../types.js";
-import { streamStdout, writeStdout } from "./output.js";
+import {
+  ensureNewFile,
+  publishOutput,
+  streamStdout,
+  writeStdout,
+} from "./output.js";
 import { nonnegativeInt, readCliInput } from "./input.js";
 export {
   cliInputError,
@@ -35,20 +35,13 @@ export {
   objectCliInput,
   readCliInput,
 } from "./input.js";
-export {
-  ensureNewFile,
-  publishOutput,
-  streamStdout,
-  writeStdout,
-} from "./output.js";
+export { writeStdout } from "./output.js";
 
 export interface CliWiring<App> {
   readonly program: Command;
   readonly cwd: string;
   readonly signal: AbortSignal | undefined;
-  readonly directory: OperationDirectory<App>;
   isJson(): boolean;
-  baseLimit(): number;
   emit(value: unknown, max?: number): Promise<void>;
   permission(id: string): void;
   session<T>(
@@ -57,9 +50,11 @@ export interface CliWiring<App> {
       ctx: OperationContext & { maxJsonBytes: number },
     ) => Promise<T>,
   ): Promise<T>;
-  unary(
+  /** Invokes an operation and delivers stdout or publishes its final JSON result to a new file. */
+  invoke(
     id: string,
     get: (max: number) => unknown | Promise<unknown>,
+    options?: { output?: string },
   ): Promise<void>;
 }
 
@@ -72,6 +67,13 @@ export interface OfflineRequest {
   readonly signal?: AbortSignal;
 }
 
+export const cliServeMode = Object.freeze({
+  serve: "serve",
+  stdio: "stdio",
+} as const);
+
+export type CliServeMode = (typeof cliServeMode)[keyof typeof cliServeMode];
+
 export interface CliOptions<App = unknown, S = unknown> {
   readonly name?: string;
   readonly description?: string;
@@ -79,14 +81,14 @@ export interface CliOptions<App = unknown, S = unknown> {
   readonly operations: readonly AnyOperation<App>[];
   readonly signal?: AbortSignal;
   readonly cwd?: string;
-  readonly limits?: () => Readonly<TransportLimits>;
+  readonly limits?: (session: Session<App, S>) => Readonly<TransportLimits>;
   readonly useInstallation?: (path: string) => Installation<App, S>;
   readonly configure?: (wiring: CliWiring<App>) => void;
   readonly mountOperationCommands?: boolean;
   readonly offline?: (request: OfflineRequest) => Promise<unknown>;
   readonly serve?: (
     session: Session<App, S>,
-    mode: "serve" | "stdio",
+    mode: CliServeMode,
     signal?: AbortSignal,
   ) => Promise<void>;
 }
@@ -105,9 +107,12 @@ export async function runApplicationCli<App, S>(
   argv: readonly string[],
   options: CliOptions<App, S>,
 ): Promise<number> {
-  const program = new Command(options.name ?? "application")
-    .description(options.description ?? "Application commands.")
-    .option("--installation <path>", "installation root")
+  const program = new Command(options.name ?? "application").description(
+    options.description ?? "Application commands.",
+  );
+  if (options.useInstallation)
+    program.option("--installation <path>", "installation root");
+  program
     .option("--instance <name>", "instance name", "default")
     .option("--json", "machine-readable JSON or NDJSON")
     .option("--debug", "print the local error cause")
@@ -134,9 +139,7 @@ export async function runApplicationCli<App, S>(
       ? {}
       : { timeoutMs: flags().timeoutMs! }),
   });
-  const baseLimit = () =>
-    options.limits?.().maxJsonBytes ?? defaultMaxJsonBytes;
-  const emit = (value: unknown, max = baseLimit()) =>
+  const emit = (value: unknown, max = defaultMaxJsonBytes) =>
     writeStdout(
       flags().json
         ? jsonText(value, max) + "\n"
@@ -157,11 +160,7 @@ export async function runApplicationCli<App, S>(
     const opened = await current().open(
       options.signal ? { signal: options.signal } : {},
     );
-    const config = opened.configuration.snapshot() as {
-      locale?: string;
-      transports?: TransportLimits;
-    };
-    const locale = flags().locale ?? config.locale ?? "zh-CN";
+    const locale = flags().locale ?? opened.locale;
     errorPresentation = {
       locale,
       local: true,
@@ -175,9 +174,7 @@ export async function runApplicationCli<App, S>(
           locale,
           options: localOptions(),
           maxJsonBytes:
-            options.limits?.().maxJsonBytes ??
-            config.transports?.maxJsonBytes ??
-            defaultMaxJsonBytes,
+            options.limits?.(opened).maxJsonBytes ?? defaultMaxJsonBytes,
         },
         opened,
       );
@@ -193,60 +190,73 @@ export async function runApplicationCli<App, S>(
   }
 
   async function printFlow(
-    flow: Flow<unknown>,
-    operation: Operation<App, unknown, unknown>,
-    api: App,
+    outcome: Extract<OperationOutcome, { kind: "stream" }>,
     ctx: OperationContext & { maxJsonBytes: number },
+    output?: string,
   ) {
     const json = flags().json;
     const limit = ctx.maxJsonBytes;
-    for await (const event of flow) {
+    let wroteText = false;
+    for await (const event of outcome.flow) {
+      if (event.type === "result" && output !== undefined)
+        await publishOutput(output, event.value);
       if (json) await emit(event, limit);
-      else if (event.type === "text-delta") await writeStdout(event.text);
-      else if (event.type === "result")
-        await emit(
-          operation.present
-            ? await operation.present(event.value, api, ctx)
-            : event.value,
-          limit,
-        );
+      else if (event.type === "text-delta") {
+        await writeStdout(event.text, ctx.options.signal);
+        wroteText = true;
+      } else if (event.type === "result")
+        await finishTextStream(outcome, event.value, ctx, wroteText, output);
     }
   }
 
-  async function unary(
+  async function finishTextStream(
+    outcome: Extract<OperationOutcome, { kind: "stream" }>,
+    value: unknown,
+    ctx: OperationContext & { maxJsonBytes: number },
+    wroteText: boolean,
+    output?: string,
+  ) {
+    const text =
+      output === undefined ? await outcome.present(value) : undefined;
+    if (text !== undefined) await emit(text, ctx.maxJsonBytes);
+    else if (wroteText) await writeStdout("\n", ctx.options.signal);
+    else if (output === undefined) await emit(value, ctx.maxJsonBytes);
+  }
+
+  const invoke: CliWiring<App>["invoke"] = async (
     id: string,
     get: (max: number) => unknown | Promise<unknown>,
-  ) {
+    invocation = {},
+  ) => {
+    const { output } = invocation;
+    if (output !== undefined) await ensureNewFile(output);
     await runSession(async (api, ctx) => {
-      const limit = ctx.maxJsonBytes ?? baseLimit();
+      const limit = ctx.maxJsonBytes;
       const data = await get(limit);
-      const op = directory.get(id);
-      const outcome = callOperation(api, directory, id, data, ctx);
-      if (op?.kind === "stream")
-        return printFlow(outcome as Flow<unknown>, op, api, ctx);
-      const value = await outcome;
-      if (op?.kind === "binary-read") {
-        await streamStdout(
-          (value as BinaryReadResult).body,
-          ctx.options.signal,
-        );
-        return;
+      const outcome = callOperation(
+        api,
+        directory,
+        id,
+        data,
+        ctx,
+        output === undefined ? undefined : { accepts: ["unary", "stream"] },
+      );
+      if (outcome.kind === "stream") return printFlow(outcome, ctx, output);
+      if (outcome.kind === "binary-read") {
+        return streamStdout((await outcome.result).body, ctx.options.signal);
       }
-      if (!flags().json && op?.present) {
-        await emit(await op.present(value, api, ctx), limit);
-      } else {
-        await emit(value, limit);
-      }
+      const value = await outcome.result;
+      if (output !== undefined) return publishOutput(output, value);
+      const text = flags().json ? undefined : await outcome.present();
+      await emit(text ?? value, limit);
     });
-  }
+  };
 
   const wiring: CliWiring<App> = {
     program,
     cwd,
     signal: options.signal,
-    directory,
     isJson: () => Boolean(flags().json),
-    baseLimit,
     emit,
     permission(id) {
       const operation = directory.get(id);
@@ -255,14 +265,14 @@ export async function runApplicationCli<App, S>(
       assertOperationPermission(operation, options.principal);
     },
     session: (work) => runSession((api, ctx) => work(api, ctx)),
-    unary,
+    invoke,
   };
   program
     .command("instance")
     .description("Initialize or inspect an instance")
     .command("init")
     .action(async () => {
-      permission("instance.init", "admin");
+      permission("instance.init", standardPermission.admin);
       await emit(await current().init());
     });
   options.configure?.(wiring);
@@ -276,7 +286,7 @@ export async function runApplicationCli<App, S>(
       path?: string,
       retainSince?: string,
     ) => {
-      permission("storage." + action, "admin");
+      permission("storage." + action, standardPermission.admin);
       const root = flags().installation;
       const call = openCall("storage." + action, localOptions());
       try {
@@ -302,15 +312,16 @@ export async function runApplicationCli<App, S>(
     storage.command("verify").action(() => offline("verify"));
   }
 
-  if (options.serve) {
-    for (const entry of ["serve", "mcp"] as const) {
-      program.command(entry).action(async () => {
+  const serve = options.serve;
+  if (serve) {
+    const commands = {
+      [cliServeMode.serve]: cliServeMode.serve,
+      mcp: cliServeMode.stdio,
+    };
+    for (const [command, mode] of Object.entries(commands)) {
+      program.command(command).action(async () => {
         await runSession((_api, _ctx, opened) =>
-          options.serve!(
-            opened,
-            entry === "mcp" ? "stdio" : "serve",
-            options.signal,
-          ),
+          serve(opened, mode, options.signal),
         );
       });
     }
@@ -318,7 +329,7 @@ export async function runApplicationCli<App, S>(
 
   if (options.mountOperationCommands !== false) {
     try {
-      mountCustomOperations(program, directory, cwd, unary);
+      mountCustomOperations(program, directory, cwd, invoke);
     } catch (error) {
       try {
         program.parseOptions([...argv]);
@@ -358,10 +369,7 @@ function mountCustomOperations<App>(
   program: Command,
   directory: ReturnType<typeof resolveDirectory<App>>,
   cwd: string,
-  unary: (
-    id: string,
-    get: (max: number) => unknown | Promise<unknown>,
-  ) => Promise<void>,
+  invoke: CliWiring<App>["invoke"],
 ) {
   const groups = new Map(
     program.commands
@@ -369,7 +377,7 @@ function mountCustomOperations<App>(
       .map((command) => [command.name(), command]),
   );
   for (const op of directory.values()) {
-    if (op.cli === false) continue;
+    if (op.cli === null) continue;
     if (op.cli) {
       const cmd = registerOperationCommand(
         program,
@@ -385,7 +393,7 @@ function mountCustomOperations<App>(
         const args = actionArgs
           .slice(0, -2)
           .map((a) => (a === undefined ? undefined : String(a)));
-        return unary(op.id, async (max) =>
+        return invoke(op.id, async (max) =>
           spec.parseInput
             ? spec.parseInput(args, opts, {
                 cwd,
@@ -409,7 +417,7 @@ function mountCustomOperations<App>(
       .description(op.description)
       .option("--input <file|->")
       .action((opts) =>
-        unary(op.id, (max) =>
+        invoke(op.id, (max) =>
           opts.input === undefined ? {} : readCliInput(opts.input, cwd, max),
         ),
       );
@@ -448,7 +456,7 @@ function reportFailure(
     : error;
   const normalized = normalizeError(cause, {
     ...presentation,
-    locale: flags.locale ?? presentation.locale ?? "zh-CN",
+    locale: flags.locale ?? presentation.locale ?? defaultLocale,
   });
   const human =
     normalized.code +

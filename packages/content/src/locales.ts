@@ -1,8 +1,5 @@
 export const locales = {
   en: {
-    "content.transaction_mismatch":
-      "The material belongs to another database transaction.",
-    "content.prepared_closed": "The prepared content has already closed.",
     "content.not_found": "The material or result was not found.",
     "content.text_unavailable": "This material has no directly readable text.",
     "content.range_invalid":
@@ -16,10 +13,10 @@ export const locales = {
     "content.decode_failed": "The material could not be decoded.",
     "content.output_not_found":
       "The result does not have the requested output.",
+    "content.representation_mismatch":
+      "The saved result does not link the requested output to this source selection.",
   },
   "zh-CN": {
-    "content.transaction_mismatch": "材料与当前事务所属数据库不同。",
-    "content.prepared_closed": "待采用内容已关闭。",
     "content.not_found": "未找到材料或成果。",
     "content.text_unavailable": "此材料没有可直接读取的文本。",
     "content.range_invalid": "选区超出材料范围或边界无效。",
@@ -29,5 +26,6 @@ export const locales = {
     "content.media_mismatch": "声明的媒体类型与材料字节不符。",
     "content.decode_failed": "无法解码材料。",
     "content.output_not_found": "成果没有请求的输出。",
+    "content.representation_mismatch": "已保存成果的输出与请求的来源选区不符。",
   },
 } as const;

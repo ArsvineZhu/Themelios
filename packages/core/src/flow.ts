@@ -51,13 +51,12 @@ export interface CallScope {
 }
 
 function cancelled(reason?: unknown): AppError {
-  return appError("call.cancelled", {
-    ...(typeof reason === "string" &&
-    reason.length <= 120 &&
-    !/[\r\n]/.test(reason)
+  return appError(
+    "call.cancelled",
+    typeof reason === "string" && reason.length <= 120 && !/[\r\n]/.test(reason)
       ? { details: { reason } }
-      : {}),
-  });
+      : {},
+  );
 }
 
 export function throwIfAborted(signal?: AbortSignal): void {
@@ -256,14 +255,9 @@ export function createFlow<T>(
 
 /** Iterates input bytes and releases the owned stream reader on completion or cancellation. */
 export async function* streamChunks(
-  source: Uint8Array | ReadableStream<Uint8Array>,
+  source: ReadableStream<Uint8Array>,
   signal?: AbortSignal,
 ): AsyncGenerator<Uint8Array> {
-  if (source instanceof Uint8Array) {
-    throwIfAborted(signal);
-    yield source;
-    return;
-  }
   const reader = source.getReader();
   let cancellation: Promise<void> | undefined;
   const cancel = () => {

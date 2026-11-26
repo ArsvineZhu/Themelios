@@ -1,9 +1,15 @@
 import { throwIfAborted } from "@themelios/core";
-import type { PDFDocumentProxy } from "pdfjs-dist/legacy/build/pdf.mjs";
+import type {
+  PDFDocumentProxy,
+  PDFPageProxy,
+} from "pdfjs-dist/legacy/build/pdf.mjs";
+import type { PageBounds } from "./document.js";
 
-function joinItems(
-  items: readonly ({ str: string; hasEOL: boolean } | { type: string })[],
-): string {
+type TextItems = Awaited<ReturnType<PDFPageProxy["getTextContent"]>>["items"];
+const pageSeparator = "\n\n";
+const separatorBytes = Buffer.byteLength(pageSeparator);
+
+function joinItems(items: Readonly<TextItems>): string {
   let text = "";
   for (const item of items) {
     if (!("str" in item)) continue;
@@ -17,7 +23,7 @@ function joinItems(
 
 export async function extractText(
   pdf: PDFDocumentProxy,
-  range: { start: number; end: number },
+  range: PageBounds,
   signal: AbortSignal,
 ) {
   const pages: { page: number; start: number; end: number }[] = [];
@@ -30,7 +36,7 @@ export async function extractText(
     const page = await pdf.getPage(number);
     try {
       const text = joinItems((await page.getTextContent()).items);
-      if (number !== range.start) offset += 2;
+      if (number !== range.start) offset += separatorBytes;
       const start = offset;
       offset += encoder.encode(text).byteLength;
       chunks.push(text);
@@ -40,5 +46,9 @@ export async function extractText(
       page.cleanup();
     }
   }
-  return { bytes: encoder.encode(chunks.join("\n\n")), pages, emptyPages };
+  return {
+    bytes: encoder.encode(chunks.join(pageSeparator)),
+    pages,
+    emptyPages,
+  };
 }

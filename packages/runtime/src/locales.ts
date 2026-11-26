@@ -1,4 +1,4 @@
-import { appError } from "@themelios/core";
+import { appError, type MessageParams } from "@themelios/core";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import i18next from "i18next";
@@ -6,6 +6,9 @@ import i18next from "i18next";
 export type Dictionaries = Readonly<
   Record<string, Readonly<Record<string, string>>>
 >;
+
+export const defaultLocale = "zh-CN";
+export const fallbackLocale = "en";
 
 export function isLanguageTag(value: string): boolean {
   try {
@@ -30,8 +33,8 @@ function dictionary(language: string): Readonly<Record<string, string>> {
 }
 
 export const locales = Object.freeze({
-  en: dictionary("en"),
-  "zh-CN": dictionary("zh-CN"),
+  [fallbackLocale]: dictionary(fallbackLocale),
+  [defaultLocale]: dictionary(defaultLocale),
 });
 
 export function mergeLocales(
@@ -75,17 +78,14 @@ export async function createLocalizer(additions?: Dictionaries) {
         { translation },
       ]),
     ),
-    fallbackLng: "en",
+    fallbackLng: fallbackLocale,
     keySeparator: false,
     nsSeparator: false,
     initAsync: false,
     interpolation: { escapeValue: false },
   });
-  const translate = (
-    locale: string,
-    key: string,
-    params?: Readonly<Record<string, string | number | boolean>>,
-  ) => instance.getFixedT(locale, "translation")(key, params ?? {});
+  const translate = (locale: string, key: string, params?: MessageParams) =>
+    instance.getFixedT(locale, "translation")(key, params ?? {});
   return Object.assign(translate, {
     languages: Object.freeze(Object.keys(merged)),
   });

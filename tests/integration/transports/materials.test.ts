@@ -8,6 +8,7 @@ import {
 } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import {
+  applicationSettings,
   createApplicationModule,
   standardOperations,
   type ApplicationApi,
@@ -27,6 +28,7 @@ test("HTTP, MCP HTTP, and MCP Stdio share operations, permissions, and Agent rea
   await mkdir(work, { recursive: true });
   const root = await mkdtemp(join(work, "protocol-material-"));
   const app = createApplicationModule({
+    settings: applicationSettings,
     id: "test.protocols",
     formatId: "test.protocols",
     resourceRoot: root,
@@ -63,6 +65,30 @@ test("HTTP, MCP HTTP, and MCP Stdio share operations, permissions, and Agent rea
     output: subject,
     execute: (_app, input) => input,
   });
+  let decodes = 0;
+  let encodes = 0;
+  const materialLink = defineOperation<object>()({
+    id: "custom.link",
+    description: "Return a material link.",
+    permission: "read",
+    input: z.strictObject({ ref: artifactRefSchema }),
+    output: z.union([
+      z.strictObject({
+        target: z.codec(z.string().startsWith("ref:"), artifactRefSchema, {
+          decode(value) {
+            decodes++;
+            return value.slice(4);
+          },
+          encode(value) {
+            encodes++;
+            return `ref:${value}`;
+          },
+        }),
+      }),
+      z.strictObject({ message: z.string() }),
+    ]),
+    execute: (_app, { ref }) => ({ target: `ref:${ref}` }),
+  });
 
   const options: RemoteTransportOptions<ApplicationApi<ApplicationSettings>> = {
     enableMcp: true,
@@ -71,7 +97,12 @@ test("HTTP, MCP HTTP, and MCP Stdio share operations, permissions, and Agent rea
       template: "themelios://materials/{ref}",
       operation: "materials.read",
     },
-    operations: [...standardOperations(), customEcho, echoSubject],
+    operations: [
+      ...standardOperations(),
+      customEcho,
+      echoSubject,
+      materialLink,
+    ],
     agentRefs: (app: typeof session.api) => ({
       resolveRef: app.materials.resolve,
       formatRef: app.materials.agentRef,
@@ -193,8 +224,8 @@ test("HTTP, MCP HTTP, and MCP Stdio share operations, permissions, and Agent rea
         inputs: [
           {
             role: "primary",
-            source: { resultOutput: { result: upstream, output: "output" } },
-            delivered: [{ inline }],
+            source: { result: upstream, output: "output" },
+            delivered: [inline],
           },
         ],
       }),
@@ -283,6 +314,12 @@ test("HTTP, MCP HTTP, and MCP Stdio share operations, permissions, and Agent rea
         })
       ).structuredContent,
     ).toEqual({ result: { kind: "material", value: agentRef } });
+    const link = await mcpClient.callTool({
+      name: "custom_link",
+      arguments: { ref: agentRef },
+    });
+    expect(link.structuredContent).toEqual({ result: { target: agentRef } });
+    expect({ decodes, encodes }).toEqual({ decodes: 1, encodes: 0 });
   } finally {
     await mcpClient.close();
     await endpoint.close();

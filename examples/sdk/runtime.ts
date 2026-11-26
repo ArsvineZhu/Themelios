@@ -11,6 +11,7 @@ import {
 } from "@themelios/runtime";
 import {
   combineSettings,
+  defineSettings,
   runtimeSettings,
   type RuntimeSettings,
 } from "@themelios/runtime/settings";
@@ -24,18 +25,21 @@ import { createNetwork } from "@themelios/runtime/network";
 import { createLocalizer, mergeLocales } from "@themelios/runtime/locales";
 
 const root = await mkdtemp(join(tmpdir(), "themelios-tea-runtime-"));
-const settings = combineSettings(runtimeSettings, {
-  schema: z.strictObject({ shelf: z.string().default("west") }),
-  fields: {
-    "/shelf": {
-      titleKey: "tea.shelf",
-      descriptionKey: "tea.shelf",
-      impactKey: "tea.shelf",
-      scopes: ["installation", "instance"],
-      effect: "reload",
+const settings = combineSettings(
+  runtimeSettings,
+  defineSettings({
+    schema: z.strictObject({ shelf: z.string().default("west") }),
+    fields: {
+      "/shelf": {
+        titleKey: "tea.shelf",
+        descriptionKey: "tea.shelf",
+        impactKey: "tea.shelf",
+        scopes: ["installation", "instance"],
+        effect: "reload",
+      },
     },
-  },
-});
+  }),
+);
 const locales = mergeLocales({
   en: { "tea.ready": "{{shelf}} shelf ready" },
   "zh-CN": { "tea.ready": "{{shelf}} 架已就绪" },
@@ -182,20 +186,19 @@ try {
     execute: (api) => api.shelf(),
   });
   const directory = createOperationDirectory([listShelf]);
-  console.log(
-    "授权的应用操作",
-    await callOperation(
-      session.api,
-      directory,
-      "tea.shelf",
-      {},
-      {
-        principal: { id: "guest", permissions: ["read"] },
-        locale: "en",
-        options: {},
-      },
-    ),
+  const currentShelf = callOperation(
+    session.api,
+    directory,
+    listShelf.id,
+    {},
+    {
+      principal: { id: "guest", permissions: [listShelf.permission] },
+      locale: "en",
+      options: {},
+    },
   );
+  if (currentShelf.kind === "unary")
+    console.log("授权的应用操作", await currentShelf.result);
 } finally {
   await session.close();
 }
@@ -240,7 +243,10 @@ const server = Bun.serve({
 });
 const network = await createNetwork({ timeoutMs: 1000, secrets });
 try {
-  console.log("受控网络", await (await network.fetch(server.url)).text());
+  console.log(
+    "受控网络",
+    await (await network.fetch(new Request(server.url))).text(),
+  );
 } finally {
   await network.close();
   await server.stop(true);

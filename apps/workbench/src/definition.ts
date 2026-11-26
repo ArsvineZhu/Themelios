@@ -1,12 +1,13 @@
 import { delimiter, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
+  applicationAdapters,
   createApplicationModule,
   describeTask,
   mediaDescription,
   type ApplicationDefinition,
 } from "@themelios/application";
-import { createImageAdapter, createWaveAdapter } from "@themelios/content";
+import type { RepresentationAdapter } from "@themelios/core";
 import { locales as contentLocales } from "@themelios/content/locales";
 import { createPrompts } from "@themelios/models/prompts";
 import { createMediaAdapters } from "@themelios/media";
@@ -19,6 +20,7 @@ import {
 import { locales as storageLocales } from "@themelios/storage/locales";
 import { locales as transportLocales } from "@themelios/transports/locales";
 import { documentSummary } from "./document-summary.js";
+import { workbenchSettings } from "./settings.js";
 
 const taskResources = fileURLToPath(
   new URL("../resources/tasks/", import.meta.url),
@@ -46,18 +48,28 @@ const locales = mergeLocales(
   transportLocales,
   ...taskDictionaries,
 );
-export const releaseRecipes = [
-  createImageAdapter(),
-  createWaveAdapter(),
-  ...createPdfAdapters(),
-  ...createMediaAdapters(),
-].map(({ description: { id, version } }) => ({ id, version }));
+const workbenchAdapters: NonNullable<ApplicationDefinition["adapters"]> = ({
+  maxMaterialBytes,
+  image,
+  media,
+}) => {
+  const limits = { maxBytes: maxMaterialBytes, maxPixels: image.maxPixels };
+  return [
+    ...createPdfAdapters(limits),
+    ...createMediaAdapters({ ...limits, ...media }),
+  ];
+};
+
+export const releaseRecipes = applicationAdapters(
+  undefined,
+  workbenchAdapters,
+).map(({ description: { id, version } }) => ({ id, version }));
 
 export const workbenchId = "themelios.workbench";
 
-type Extension = Partial<
-  Pick<ApplicationDefinition, "tasks" | "adapters" | "locales">
->;
+type Extension = Partial<Pick<ApplicationDefinition, "tasks" | "locales">> & {
+  adapters?: readonly RepresentationAdapter[];
+};
 
 async function loadExtension(path: string): Promise<Extension> {
   const extension = (await import(pathToFileURL(path).href))
@@ -77,6 +89,7 @@ export async function createWorkbench(cwd: string) {
     paths.map((path) => loadExtension(resolve(cwd, path))),
   );
   return createApplicationModule({
+    settings: workbenchSettings,
     id: workbenchId,
     formatId: workbenchId,
     resourceRoot: taskResources,
@@ -84,14 +97,10 @@ export async function createWorkbench(cwd: string) {
       ...tasks,
       ...extensions.flatMap((extension) => extension.tasks ?? []),
     ],
-    adapters: extensions.flatMap((extension) => extension.adapters ?? []),
-    createAdapters: ({ maxMaterialBytes, image, media }) => {
-      const limits = { maxBytes: maxMaterialBytes, maxPixels: image.maxPixels };
-      return [
-        ...createPdfAdapters(limits),
-        ...createMediaAdapters({ ...limits, ...media }),
-      ];
-    },
+    adapters: (settings) => [
+      ...workbenchAdapters(settings),
+      ...extensions.flatMap((extension) => extension.adapters ?? []),
+    ],
     locales: mergeLocales(
       locales,
       ...extensions.flatMap((extension) =>

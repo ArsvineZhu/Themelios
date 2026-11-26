@@ -5,7 +5,11 @@ import {
   type Json,
   type MessageParams,
 } from "@themelios/core";
-import { locales as runtimeLocales } from "@themelios/runtime/locales";
+import {
+  defaultLocale,
+  fallbackLocale,
+  locales as runtimeLocales,
+} from "@themelios/runtime/locales";
 import { locales } from "./locales.js";
 import type { Translate } from "./types.js";
 
@@ -66,7 +70,7 @@ export const transportError = (code: string, details?: Json, cause?: unknown) =>
 
 export function errorLocale(
   header: string | null | undefined,
-  fallback = "zh-CN",
+  fallback: string = defaultLocale,
   available: readonly string[] = Object.keys(runtimeLocales),
 ): string {
   const choices = (header ?? "").split(",").flatMap((item) => {
@@ -107,16 +111,16 @@ export function normalizeError(
   const appErr = toAppError(error);
   const { code, messageKey, params, details, retryable } = appErr;
   const language =
-    (options.locale ?? "zh-CN").toLowerCase().split("-")[0] === "zh"
-      ? "zh-CN"
-      : "en";
+    (options.locale ?? defaultLocale).toLowerCase().split("-")[0] === "zh"
+      ? defaultLocale
+      : fallbackLocale;
   const dictionary = runtimeLocales[language];
   const translated = options.translate?.(messageKey, params);
   const text =
     (translated && translated !== messageKey ? translated : undefined) ??
     dictionary[messageKey] ??
     locales[language][messageKey] ??
-    runtimeLocales.en[messageKey] ??
+    runtimeLocales[fallbackLocale][messageKey] ??
     code;
   const message = text.replace(
     /\{\{\s*([\w.]+)\s*\}\}/g,

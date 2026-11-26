@@ -1,27 +1,37 @@
-import { createApplicationModule } from "@themelios/application";
+import {
+  applicationSettings,
+  createApplicationModule,
+} from "@themelios/application";
 import { AppError } from "@themelios/core";
-import { defineTask, mediaDescription, z } from "@themelios/models";
+import { defineTask, mediaDescription, textOutput, z } from "@themelios/models";
 import { Installation } from "@themelios/runtime";
 import { mkdtemp, writeFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 const counts: Record<string, number> = {};
+const transcriptionsPath = "/v1/audio/transcriptions";
+const visionProviderModel = "eye";
 let lastAudio: Uint8Array | undefined;
 let visionPrompt = "";
+let visionTemperature: number | undefined;
 const gateway = Bun.serve({
   hostname: "127.0.0.1",
   port: 0,
   async fetch(req) {
     const path = new URL(req.url).pathname;
     counts[path] = (counts[path] ?? 0) + 1;
-    if (path.endsWith("/transcriptions")) {
+    if (path === transcriptionsPath) {
       const attachment = (await req.formData()).get("file");
       if (attachment instanceof Blob)
         lastAudio = new Uint8Array(await attachment.arrayBuffer());
       return Response.json({ text: "Tea at 3." });
     }
     const body = await req.json();
-    if (body.model === "eye") visionPrompt = JSON.stringify(body.messages);
+    const describeImage = body.model === visionProviderModel;
+    if (describeImage) {
+      visionPrompt = JSON.stringify(body.messages);
+      visionTemperature = body.temperature;
+    }
     return Response.json({
       id: "c-1",
       created: 1,
@@ -31,7 +41,7 @@ const gateway = Bun.serve({
           index: 0,
           message: {
             role: "assistant",
-            content: body.model === "eye" ? "Green square." : "Tea note.",
+            content: describeImage ? "Green square." : "Tea note.",
           },
           finish_reason: "stop",
         },
@@ -47,18 +57,19 @@ const app = defineTask({
   title: "Notes",
   purpose: "Summarize a material",
   input: z.strictObject({}),
-  output: "text",
+  output: textOutput,
   templates: { inline: true, user: "Summarize the sources." },
   requirements: {
     inputs: [
-      { mediaType: "image/*", needs: ["visual"] },
-      { mediaType: "audio/*", needs: ["speech"] },
-      { mediaType: "text/plain", needs: ["text"] },
+      { mediaType: "image/*", accepts: [["visual"]] },
+      { mediaType: "audio/*", accepts: [["speech"]] },
+      { mediaType: "text/plain", accepts: [["text"]] },
     ],
     minMaterials: 1,
   },
 });
 const module = createApplicationModule({
+  settings: applicationSettings,
   id: "routes",
   formatId: "routes",
   resourceRoot: root,
@@ -86,7 +97,7 @@ structuredOutput=false
 streaming=false
 [models.bindings.eye]
 connection="gateway"
-providerModel="eye"
+providerModel="${visionProviderModel}"
 [models.bindings.eye.capabilities]
 operations=["generate"]
 inputMimeTypes=["text/plain","image/png"]
@@ -114,6 +125,8 @@ recipe="speech.transcribe"
 model="ear"
 [models.tasks."media.describe"]
 model="eye"
+[models.tasks."media.describe".parameters]
+temperature=0.25
 [models.tasks."media.describe".variables]
 language="ja"
 `;
@@ -158,7 +171,7 @@ try {
     ];
     const request = { task: "notes.summary", materials, variables: {} };
     const before = await api.tasks.preview(request);
-    const completed = await api.tasks.run({ ...request, persist: true });
+    const completed = await api.tasks.runAndSave(request);
     const after = await api.tasks.preview(request);
     console.log(
       mediaType,
@@ -175,16 +188,17 @@ try {
       await api.prompts.setOverride("media.describe", {
         role: "user",
         template:
-          "Describe in {{ language }}. Source: {{ sources[0].originalExtent }}.",
+          "Describe in {{ language }}. Source: {{ sources[0].originalExtent | extent }}.",
       });
       const overridden = await api.tasks.preview(request);
       await api.tasks.run(request);
       if (
         !overridden.pending.length ||
-        !visionPrompt.includes("Describe in ja. Source: 3 × 3 px")
+        !visionPrompt.includes("Describe in ja. Source: 3 × 3 px") ||
+        visionTemperature !== 0.25
       ) {
         throw Error(
-          "Auxiliary description did not use the active template and configured language.",
+          "Auxiliary description did not use the active template, language, or model parameters.",
         );
       }
       console.log(
@@ -199,7 +213,7 @@ try {
       };
       const slice = { ...request, materials: [{ source: selected }] };
       const planned = await api.tasks.preview(slice);
-      const saved = await api.tasks.run({ ...slice, persist: true });
+      const saved = await api.tasks.runAndSave(slice);
       const posted = Buffer.from(lastAudio ?? []);
       const expected = wav.subarray(44 + 16 * 2, 44 + 32 * 2);
       if (posted.length !== 76 || !posted.subarray(44).equals(expected)) {
@@ -207,7 +221,7 @@ try {
           "Transcription attachment differs from the selected PCM frames.",
         );
       }
-      const transcriptions = counts["/v1/audio/transcriptions"];
+      const transcriptions = counts[transcriptionsPath];
       try {
         await api.tasks.run({
           ...request,
@@ -225,7 +239,7 @@ try {
         if (
           !(error instanceof AppError) ||
           error.code !== "content.range_invalid" ||
-          counts["/v1/audio/transcriptions"] !== transcriptions
+          counts[transcriptionsPath] !== transcriptions
         )
           throw error;
       }

@@ -266,6 +266,7 @@
         ]
       },
       "delivered": {
+        "readOnly": true,
         "type": "array",
         "items": {
           "type": "object",
@@ -559,12 +560,13 @@
       },
       "mediaType": {
         "type": "string",
-        "pattern": "^[\\w!#$&^.+-]+\\/(?:[\\w!#$&^.+-]+|\\*)$",
+        "pattern": "^[\\w!#$&^.+-]+\\/[\\w!#$&^.+-]+$",
         "description": "Media type of the original material."
       },
       "name": {
         "description": "Display name of the original material, when known.",
-        "type": "string"
+        "type": "string",
+        "minLength": 1
       },
       "role": {
         "type": "string",

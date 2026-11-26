@@ -67,7 +67,7 @@ themelios task run --input ./request.json --save --stream --json
 
 用 `themelios result read ARTIFACT_REF --json` 重读成果，用 `themelios material sources ARTIFACT_REF` 追溯到材料，再用 `themelios material export MATERIAL_REF ./original.md` 导出精确原件。模型服务关闭后这些操作仍然可用。`task run --output PATH` 和原件导出的目标路径必须事先不存在。
 
-要用已保存的摘要做下一次任务的上下文，在请求 `materials` 中加入 `{"source":{"resultOutput":{"result":"已保存的成果引用","output":"$value"}},"role":"context"}`。对于命名附件，将 `$value` 改成文件名。直接读取先前成果可节省重复的模型请求。
+要用已保存的摘要做下一次任务的上下文，在请求 `materials` 中加入 `{"source":{"result":"已保存的成果引用","output":"$value"},"role":"context"}`。对于命名附件，将 `$value` 改成文件名。直接读取先前成果可节省重复的模型请求。
 
 ## 连接正在运行的工作台
 

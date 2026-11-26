@@ -2,7 +2,12 @@ import { createCohere } from "@ai-sdk/cohere";
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { createOpenAI } from "@ai-sdk/openai";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
-import { appError, type Json, type CallScope } from "@themelios/core";
+import {
+  appError,
+  plainTextMediaType,
+  type Json,
+  type CallScope,
+} from "@themelios/core";
 import {
   wrapEmbeddingModel,
   type EmbeddingModel,
@@ -11,22 +16,27 @@ import {
   type RerankingModel,
   type TranscriptionModel,
 } from "ai";
+import { modelAcceptsMedia, partBytes, partMediaType } from "./delivery.js";
 import type {
   Connection,
-  FetchFunction,
   ModelBinding,
   ModelIdentity,
   ModelMessage,
   ModelOperation,
   ModelParameters,
   ModelPart,
-  ModelsOptions,
 } from "./types.js";
-import { matchesMime } from "./schema.js";
+import type { Network } from "@themelios/runtime/network";
+import type { Secrets } from "@themelios/runtime/secrets";
 import type { ModelTelemetry } from "./model-telemetry.js";
+import { z } from "zod";
 
 type ProviderOptions = Record<string, Record<string, Json>>;
 type Protocol = Connection["protocol"];
+const openAiEndpointSchema = z.enum(["chat", "responses"]);
+const optionalOpenAiEndpointSchema = openAiEndpointSchema.optional();
+export type OpenAiEndpoint = z.output<typeof openAiEndpointSchema>;
+const defaultOpenAiEndpoint: OpenAiEndpoint = "responses";
 
 const supported: Record<Protocol, readonly ModelOperation[]> = {
   "openai-compatible": ["generate", "embed"],
@@ -65,7 +75,7 @@ function adapterAccepts(
   mediaType: string,
 ): boolean {
   if (operation === "transcribe") return mediaType.startsWith("audio/");
-  if (mediaType === "text/plain") return true;
+  if (mediaType === plainTextMediaType) return true;
   if (operation === "embed") return protocol === "google";
   if (protocol === "openai-compatible") return mediaType.startsWith("image/");
   return operation === "generate";
@@ -92,20 +102,18 @@ export function checkParts(
   operation: ModelOperation,
   parts: Iterable<ModelPart>,
 ): void {
-  const { inputMimeTypes, limits } = model.binding.capabilities;
+  const capabilities = model.binding.capabilities;
+  const { limits } = capabilities;
   let size = 0;
   let images = 0;
   for (const part of parts) {
-    const mime = part.kind === "text" ? "text/plain" : part.mediaType;
+    const mime = partMediaType(part);
     if (
-      !inputMimeTypes.some((pattern) => matchesMime(pattern, mime)) ||
+      !modelAcceptsMedia(capabilities, mime) ||
       !adapterAccepts(model.connection.protocol, operation, mime)
     )
       requireCapability(model, operation + ":" + mime);
-    size +=
-      part.kind === "text"
-        ? Buffer.byteLength(part.text)
-        : part.bytes.byteLength;
+    size += partBytes(part);
     if (mime.startsWith("image/")) images++;
   }
   if (limits?.maxInputBytes !== undefined && size > limits.maxInputBytes) {
@@ -219,9 +227,8 @@ interface ClientOptions {
   fetch: typeof globalThis.fetch;
 }
 
-type ResolveCredential = NonNullable<ModelsOptions["resolveCredential"]>;
 type Provider = {
-  language?: (model: string, openaiApi?: "chat" | "responses") => LanguageModel;
+  language?: (model: string, openaiApi?: OpenAiEndpoint) => LanguageModel;
   embedding?: (model: string) => EmbeddingModel;
   reranking?: (model: string) => RerankingModel;
   transcription?: (model: string) => TranscriptionModel;
@@ -230,8 +237,8 @@ type Provider = {
 export async function createProvider(
   model: BoundModel,
   call: CallScope,
-  fetch: FetchFunction,
-  resolveCredential: ResolveCredential,
+  fetch: Network["fetch"],
+  resolveCredential: Secrets["resolve"],
   telemetry: ModelTelemetry,
 ): Promise<Provider> {
   const { connection } = model;
@@ -240,10 +247,12 @@ export async function createProvider(
     ? await resolveCredential(connection.credential)
     : undefined;
   call.throwIfAborted("request");
+  const observedFetch = telemetry.observeFetch(fetch, credential);
   const options: ClientOptions = {
     // Provider types inherit Bun's preconnect property; providers only call this function as fetch.
     baseURL: connection.baseURL,
-    fetch: telemetry.observeFetch(fetch, credential) as typeof globalThis.fetch,
+    fetch: ((input, init) =>
+      observedFetch(new Request(input, init))) as typeof globalThis.fetch,
     ...(connection.headers === undefined
       ? {}
       : { headers: { ...connection.headers } }),
@@ -275,9 +284,7 @@ export async function createProvider(
       const client = createOpenAI(options);
       return {
         language(name, explicit) {
-          return explicit === "chat"
-            ? client.chat(name)
-            : client.responses(name);
+          return client[explicit ?? defaultOpenAiEndpoint](name);
         },
         embedding: (name) =>
           indexedEmbedding(client.embedding(name), model.identity.binding),
@@ -364,19 +371,17 @@ export function requestParameters(
     });
   }
   const provider = providerOptions(model, options);
-  const openaiApi = provider.openai?.api;
-  if (
-    openaiApi !== undefined &&
-    openaiApi !== "chat" &&
-    openaiApi !== "responses"
-  ) {
+  const openaiApi = optionalOpenAiEndpointSchema.safeParse(
+    provider.openai?.api,
+  );
+  if (!openaiApi.success) {
     throw appError("model.invalid_request", {
       details: {
         binding: model.identity.binding,
         issues: [
           {
             path: ["providerOptions", "openai", "api"],
-            reason: "Expected chat or responses",
+            reason: "Expected " + openAiEndpointSchema.options.join(" or "),
           },
         ],
       },
@@ -389,11 +394,6 @@ export function requestParameters(
     ...(maxOutputTokens === undefined ? {} : { maxOutputTokens }),
     ...(seed === undefined ? {} : { seed }),
     providerOptions: provider,
-    openaiApi:
-      openaiApi === "chat"
-        ? ("chat" as const)
-        : openaiApi === "responses"
-          ? ("responses" as const)
-          : undefined,
+    openaiApi: openaiApi.data,
   };
 }

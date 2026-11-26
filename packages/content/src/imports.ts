@@ -2,9 +2,10 @@ import { open } from "node:fs/promises";
 import { basename } from "node:path";
 import {
   AppError,
-  mediaTypeSchema,
+  inlineMaterialSchema,
   openCall,
   type CallOptions,
+  type RepresentationAdapter,
 } from "@themelios/core";
 import type { BlobInfo, Cas } from "@themelios/storage";
 import { z } from "zod";
@@ -14,47 +15,25 @@ import {
   type ArtifactDraft,
   type Origin,
 } from "./artifacts.js";
-import { detectMetadata } from "./media-metadata.js";
+import { detectMetadata, probeExtent } from "./media-metadata.js";
 import { contentError, validated } from "./validation.js";
 
-export type AcceptInput =
-  | {
-      bytes: Uint8Array;
-      mediaType: string;
-      name?: string;
-      origin?: Origin;
-    }
-  | {
-      file: string;
-      mediaType?: string;
-      name?: string;
-      origin?: Origin;
-    }
-  | {
-      body: ReadableStream<Uint8Array>;
-      mediaType?: string;
-      name?: string;
-      origin?: Origin;
-    };
-
-const importFields = {
-  mediaType: mediaTypeSchema.toLowerCase(),
-  name: z.string().min(1).optional(),
+const inlineImportSchema = inlineMaterialSchema.extend({
   origin: originSchema.optional(),
-};
+});
+const externalImportSchema = inlineImportSchema
+  .omit({ bytes: true })
+  .partial({ mediaType: true });
 const acceptSchema = z.union([
-  z.strictObject({ ...importFields, bytes: z.instanceof(Uint8Array) }),
-  z.strictObject({
-    ...importFields,
-    mediaType: importFields.mediaType.optional(),
+  inlineImportSchema,
+  externalImportSchema.extend({
     file: z.string().min(1),
   }),
-  z.strictObject({
-    ...importFields,
-    mediaType: importFields.mediaType.optional(),
+  externalImportSchema.extend({
     body: z.instanceof(ReadableStream<Uint8Array>),
   }),
 ]);
+export type AcceptInput = z.output<typeof acceptSchema>;
 
 const credentialParam =
   /^(access[_-]?token|refresh[_-]?token|api[_-]?key|authorization|auth|jwt|secret|password|passwd|key|token|signature|sig|x-amz-.*|x-goog-.*)$/i;
@@ -88,6 +67,18 @@ function cleanOrigin(origin: Origin): Origin {
 export interface ImportLimits {
   maxImportBytes: number;
   maxInlineBytes: number;
+  adapters: readonly RepresentationAdapter[];
+}
+
+export function checkInlineImportSize(
+  bytes: Uint8Array,
+  maxBytes: number,
+): void {
+  if (bytes.byteLength > maxBytes)
+    throw contentError("storage.limit_exceeded", {
+      maxBytes,
+      sizeBytes: bytes.byteLength,
+    });
 }
 
 export type CapturedImport = ReturnType<typeof captureImport>;
@@ -109,12 +100,7 @@ export function captureImport(
       : undefined);
   const originInfo = origin && cleanOrigin(origin);
   if ("bytes" in accepted) {
-    if (accepted.bytes.byteLength > maxInlineBytes) {
-      throw contentError("storage.limit_exceeded", {
-        maxBytes: maxInlineBytes,
-        sizeBytes: accepted.bytes.byteLength,
-      });
-    }
+    checkInlineImportSize(accepted.bytes, maxInlineBytes);
     return {
       ...accepted,
       bytes: copyBytes ? new Uint8Array(accepted.bytes) : accepted.bytes,
@@ -134,6 +120,7 @@ export async function importArtifact(
   try {
     scope.throwIfAborted();
     const { mediaType: declared } = accepted;
+    const { adapters } = limits;
     const name =
       accepted.name ??
       ("file" in accepted ? basename(accepted.file) : undefined);
@@ -141,9 +128,7 @@ export async function importArtifact(
     const put = {
       signal: scope.signal,
       maxBytes:
-        "bytes" in accepted
-          ? Math.min(limits.maxInlineBytes, limits.maxImportBytes)
-          : limits.maxImportBytes,
+        "bytes" in accepted ? limits.maxInlineBytes : limits.maxImportBytes,
     };
     let blob: BlobInfo;
     if ("bytes" in accepted) {
@@ -165,22 +150,37 @@ export async function importArtifact(
     } else {
       blob = await cas.put(accepted.body, put);
     }
-    const { mediaType, extent } = await detectMetadata(
+    const detected = await detectMetadata(
       cas,
       blob,
       scope.signal,
       declared,
       name,
     );
+    const ref = newArtifactRef();
+    const info = {
+      sizeBytes: blob.sizeBytes,
+      ...detected,
+      ...(name === undefined ? {} : { name }),
+    };
+    const extent = await probeExtent(
+      {
+        source: { ref },
+        info,
+        open(call) {
+          return cas.read(blob.ref, call);
+        },
+      },
+      adapters,
+      { signal: scope.signal },
+    );
     scope.throwIfAborted();
     return {
-      ref: newArtifactRef(),
+      ...info,
+      ref,
       kind: "material",
       blob: blob.ref,
-      sizeBytes: blob.sizeBytes,
-      mediaType,
       extent,
-      ...(name === undefined ? {} : { name }),
       ...(originInfo === undefined ? {} : { origin: originInfo }),
     };
   } catch (error) {

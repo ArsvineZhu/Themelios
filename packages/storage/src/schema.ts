@@ -1,9 +1,20 @@
+import {
+  blobDigestHexCharacters,
+  blobDigestHexLength,
+  blobRefPrefix,
+  customTimeDomainSchema,
+  UTC_TIME_DOMAIN,
+} from "@themelios/core";
+
+const customDomainKinds = customTimeDomainSchema.options
+  .map((domain) => `'${domain.shape.kind.value}'`)
+  .join(", ");
+
 export const storageSchemaSql = `
 CREATE TABLE store_meta (
   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
   format_id TEXT NOT NULL,
-  commit_seq INTEGER NOT NULL DEFAULT 0 CHECK (commit_seq >= 0),
-  history_floor INTEGER NOT NULL DEFAULT 0 CHECK (history_floor >= 0 AND history_floor <= commit_seq)
+  history_floor INTEGER NOT NULL DEFAULT 0 CHECK (history_floor >= 0)
 ) STRICT;
 
 CREATE TABLE commits (
@@ -13,18 +24,20 @@ CREATE TABLE commits (
 
 CREATE TABLE blobs (
   ref TEXT PRIMARY KEY CHECK (
-    length(ref) = 71 AND substr(ref, 1, 7) = 'sha256:'
-    AND substr(ref, 8) NOT GLOB '*[^0-9a-f]*'
+    length(ref) = ${blobRefPrefix.length + blobDigestHexLength}
+    AND substr(ref, 1, ${blobRefPrefix.length}) = '${blobRefPrefix}'
+    AND substr(ref, ${blobRefPrefix.length + 1}) NOT GLOB '*[^${blobDigestHexCharacters}]*'
   ),
-  size_bytes INTEGER NOT NULL CHECK (size_bytes BETWEEN 0 AND 9007199254740991)
+  size_bytes INTEGER NOT NULL CHECK (size_bytes BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER})
 ) STRICT;
 
 CREATE TABLE time_domains (
-  id TEXT PRIMARY KEY,
-  kind TEXT NOT NULL CHECK (kind IN ('utc', 'linear', 'opaque')),
+  id TEXT PRIMARY KEY CHECK (id <> '${UTC_TIME_DOMAIN.id}'),
+  kind TEXT NOT NULL CHECK (kind IN (${customDomainKinds})),
   label TEXT NOT NULL,
   tick_numerator TEXT,
   tick_denominator TEXT,
-  created_seq INTEGER NOT NULL REFERENCES commits(seq)
+  created_seq INTEGER NOT NULL REFERENCES commits(seq),
+  CHECK ((tick_numerator IS NULL) = (tick_denominator IS NULL))
 ) STRICT;
 `;

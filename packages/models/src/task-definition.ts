@@ -1,49 +1,33 @@
-import { appError, parseJson, parseValue, type Json } from "@themelios/core";
+import {
+  appError,
+  parseJson,
+  parseValue,
+  plainTextMediaType,
+  type InputUse,
+  type Json,
+} from "@themelios/core";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import { mediaDescriptionRecipe } from "./representation-route.js";
 import {
   createSourceDirectory,
-  mimePatternSchema,
-  modalityNeedSchema,
   modelNameSchema,
   outputSchema,
-  sourceEntrySchema,
+  sourceDirectoryFromInputs,
   sourcesJsonSchema,
+  taskRequirementsSchema,
+  textOutput,
 } from "./schema.js";
 import type {
   CompiledPrompt,
   ModelMessage,
   ModelPart,
+  ModelOutput,
   Prompts,
   TaskDefinition,
   TaskDefinitionInput,
   TaskDescription,
-  TaskRequirements,
 } from "./types.js";
-
-export const taskExampleSourceSchema = sourceEntrySchema.extend({
-  text: z.string().optional(),
-});
-
-export const taskRequirementsSchema: z.ZodType<TaskRequirements> = z
-  .strictObject({
-    inputs: z.array(
-      z.strictObject({
-        mediaType: mimePatternSchema,
-        needs: z.array(modalityNeedSchema).min(1),
-      }),
-    ),
-    minMaterials: z.int().nonnegative(),
-    maxMaterials: z.int().nonnegative().optional(),
-  })
-  .refine(
-    (data) =>
-      data.maxMaterials === undefined || data.maxMaterials >= data.minMaterials,
-    {
-      path: ["maxMaterials"],
-      message: "Maximum must be at least the minimum",
-    },
-  ) as z.ZodType<TaskRequirements>;
 
 export function taskInputJsonSchema(schema: z.ZodType): Json {
   return parseJson(z.toJSONSchema(schema, { io: "input" }));
@@ -101,6 +85,7 @@ export function defineTask<I extends Json, O extends Json, RawI = I>(
     purpose: definition.purpose ?? definition.purposeKey ?? definition.id,
     titleKey: definition.titleKey ?? definition.title ?? definition.id,
     purposeKey: definition.purposeKey ?? definition.purpose ?? definition.id,
+    output: Object.freeze({ ...definition.output }),
     requirements: Object.freeze(requirements),
     templates: Object.freeze({ ...definition.templates }),
     examples: Object.freeze(structuredClone(definition.examples ?? [])),
@@ -131,9 +116,9 @@ function validateTaskInput(id: string, schema: z.ZodType) {
   }
 }
 
-function validateTaskOutput(id: string, schema: "text" | z.ZodType) {
-  if (schema !== "text") {
-    const shape = z.toJSONSchema(schema);
+function validateTaskOutput(id: string, output: ModelOutput<Json>) {
+  if (output.kind === "json") {
+    const shape = z.toJSONSchema(output.schema);
     if (
       shape.type !== "object" ||
       Object.keys(shape.properties ?? {}).some(
@@ -163,12 +148,8 @@ function validateTaskExamples<I extends Json, O extends Json, RawI>(
       sources.map(({ text: _text, ...entry }) => entry),
     );
     const args = inputVariables(definition, variables);
-    const value =
-      definition.output === "text"
-        ? parseValue(z.string(), output, "input.invalid")
-        : parseValue(definition.output, output, "input.invalid");
-    const issues =
-      definition.validateOutput?.(value as O, directory, args) ?? [];
+    const value = parseValue(definition.output.schema, output, "input.invalid");
+    const issues = definition.validateOutput?.(value, directory, args) ?? [];
     if (issues.length)
       throw appError("input.invalid", {
         details: { issues: parseJson(issues) },
@@ -181,7 +162,7 @@ export async function describeTask<I extends Json, O extends Json, RawI>(
   prompts: Prompts,
   translate: (key: string) => string = (key) => key,
 ): Promise<TaskDescription> {
-  const description = await prompts.describe(task);
+  const { files } = await prompts.read(task);
   const inputSchema = taskInputJsonSchema(task.input);
   const resolvedTitle =
     task.titleKey !== task.id ? translate(task.titleKey) : task.title;
@@ -197,21 +178,42 @@ export async function describeTask<I extends Json, O extends Json, RawI>(
     inputSchema: withDescriptions(inputSchema, task.input, translate),
     sourcesSchema: sourcesJsonSchema(),
     output:
-      task.output === "text"
+      task.output.kind === "text"
         ? { kind: "text" }
         : {
             kind: "json",
             schema: withDescriptions(
-              outputSchema(task.output),
-              task.output,
+              outputSchema(task.output.schema),
+              task.output.schema,
               translate,
             ),
           },
     requirements: task.requirements,
-    templates: description.files,
+    templates: files,
     examples: [...task.examples],
     outputRules: (task.outputRuleKeys ?? []).map((key) => translate(key)),
   };
+}
+
+/** Renders a task result using the original source directory recorded at execution. */
+export function presentTask<I extends Json, O extends Json, RawI>(
+  task: TaskDefinition<I, O, RawI>,
+  result: {
+    readonly value: O;
+    readonly inputs: readonly Pick<
+      InputUse,
+      "key" | "original" | "coverage" | "role"
+    >[];
+  },
+  locale?: string,
+): string {
+  return task.present
+    ? task.present(
+        result.value,
+        sourceDirectoryFromInputs(result.inputs),
+        locale,
+      )
+    : JSON.stringify(result, null, 2);
 }
 
 function isJsonObject(value: Json | undefined): value is Record<string, Json> {
@@ -294,21 +296,21 @@ export const mediaDescription = defineTask<
   string,
   z.input<typeof mediaDescriptionInput>
 >({
-  id: "media.describe",
+  id: mediaDescriptionRecipe,
   titleKey: "tasks.mediaDescription.title",
   purposeKey: "tasks.mediaDescription.purpose",
   input: mediaDescriptionInput,
-  output: "text",
+  output: textOutput,
   requirements: {
     minMaterials: 1,
     maxMaterials: 1,
     inputs: [
-      { mediaType: "text/*", needs: ["text"] },
-      { mediaType: "application/json", needs: ["text"] },
-      { mediaType: "image/*", needs: ["visual"] },
-      { mediaType: "application/pdf", needs: ["text", "visual"] },
-      { mediaType: "audio/*", needs: ["speech"] },
-      { mediaType: "video/*", needs: ["visual", "speech", "motion"] },
+      { mediaType: "text/*", accepts: [["text"]] },
+      { mediaType: "application/json", accepts: [["text"]] },
+      { mediaType: "image/*", accepts: [["visual"]] },
+      { mediaType: "application/pdf", accepts: [["text", "visual"]] },
+      { mediaType: "audio/*", accepts: [["speech"]] },
+      { mediaType: "video/*", accepts: [["visual", "speech", "motion"]] },
     ],
   },
   templates: {
@@ -325,7 +327,7 @@ export const mediaDescription = defineTask<
       sources: [
         {
           key: "S1",
-          mediaType: "text/plain",
+          mediaType: plainTextMediaType,
           role: "primary",
           originalExtent: {
             kind: "text",
@@ -334,7 +336,7 @@ export const mediaDescription = defineTask<
           requestedRange: null,
           delivered: [
             {
-              mediaType: "text/plain",
+              mediaType: plainTextMediaType,
               sourceRange: null,
               extent: {
                 kind: "text",

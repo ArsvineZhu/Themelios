@@ -1,14 +1,22 @@
 import {
   AppError,
+  extentSchema,
   hasTextControls,
   isTextMedia,
+  matchesMime,
   mediaProbeBytes,
+  plainTextMediaType,
   probeMediaType,
   textMediaForName,
+  throwIfAborted,
+  type CallOptions,
   type Extent,
+  type MediaInput,
+  type RepresentationAdapter,
 } from "@themelios/core";
 import type { BlobInfo, Cas } from "@themelios/storage";
-import { contentError } from "./validation.js";
+import type { Metadata as SharpMetadata } from "sharp";
+import { contentError, validated } from "./validation.js";
 
 export async function blobBytes(
   cas: Cas,
@@ -51,6 +59,20 @@ async function validUtf8(
 
 type Metadata = { mediaType: string; extent: Extent };
 
+export function orientedImageExtent({
+  width,
+  height,
+  autoOrient,
+  pages,
+}: SharpMetadata): Extract<Extent, { kind: "image" }> {
+  return {
+    kind: "image",
+    width: autoOrient?.width ?? width,
+    height: autoOrient?.height ?? height,
+    frames: pages ?? 1,
+  };
+}
+
 function textMetadata(mediaType: string, sizeBytes: number): Metadata {
   return { mediaType, extent: { kind: "text", bytes: sizeBytes } };
 }
@@ -70,7 +92,7 @@ async function detectTextOrBinary(
 ): Promise<Metadata> {
   const extensionType = textMediaForName(name);
   if (await validUtf8(cas, blob, signal, extensionType === undefined))
-    return textMetadata(extensionType ?? "text/plain", blob.sizeBytes);
+    return textMetadata(extensionType ?? plainTextMediaType, blob.sizeBytes);
   if (extensionType) invalidUtf8(extensionType);
   return { mediaType: "application/octet-stream", extent: { kind: "unknown" } };
 }
@@ -83,15 +105,8 @@ async function imageExtent(
 ): Promise<Extent> {
   try {
     const { default: sharp } = await import("sharp");
-    const { width, height, autoOrient, pages } = await sharp(
-      await blobBytes(cas, blob, signal),
-    ).metadata();
-    return {
-      kind: "image",
-      width: autoOrient?.width ?? width,
-      height: autoOrient?.height ?? height,
-      frames: pages ?? 1,
-    };
+    const metadata = await sharp(await blobBytes(cas, blob, signal)).metadata();
+    return orientedImageExtent(metadata);
   } catch (error) {
     if (error instanceof AppError) throw error;
     throw contentError(
@@ -125,4 +140,41 @@ export async function detectMetadata(
       extent: await imageExtent(cas, blob, signal, mediaType),
     };
   return { mediaType, extent: { kind: "unknown" } };
+}
+
+/** Records metadata when a configured, available decoder can read the original. */
+export async function probeExtent(
+  input: MediaInput,
+  adapters: readonly RepresentationAdapter[],
+  call: CallOptions,
+): Promise<Extent> {
+  if (input.info.extent.kind !== "unknown") return input.info.extent;
+  for (const adapter of adapters) {
+    throwIfAborted(call.signal);
+    if (
+      !adapter.description.inputMimeTypes.some((pattern) =>
+        matchesMime(pattern, input.info.mediaType),
+      ) ||
+      !(await adapter.available()).available
+    ) {
+      continue;
+    }
+    try {
+      const extent = validated(extentSchema, await adapter.probe(input, call));
+      if (extent.kind !== "unknown") return extent;
+    } catch (error) {
+      throwIfAborted(call.signal);
+      if (
+        !(error instanceof AppError) ||
+        ![
+          "content.decode_failed",
+          "input.capability_missing",
+          "model.input_too_large",
+          "storage.limit_exceeded",
+        ].includes(error.code)
+      )
+        throw error;
+    }
+  }
+  return input.info.extent;
 }

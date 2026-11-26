@@ -2,23 +2,32 @@ import { createHash } from "node:crypto";
 import {
   appError,
   parseJson,
+  plainTextMediaType,
   type CallOptions,
-  type Json,
   type MediaInput,
+  type ModalityNeed,
   type PreparedRepresentation,
+  type Producer,
   type RepresentationCoverage,
 } from "@themelios/core";
+import { mediaDescription } from "./task-definition.js";
 import {
-  inputVariables,
-  mediaDescription,
-  messagesWithParts,
-} from "./task-definition.js";
+  taskGenerationOptions,
+  taskGenerationInputs,
+  taskGenerationRequest,
+  taskProducer,
+} from "./task-execution.js";
+import {
+  speechTranscriptionRecipe,
+  type ModelRepresentationRecipe,
+} from "./representation-route.js";
 import type {
   ModelPart,
   Models,
   Preparation,
   PreparedInput,
   Prompts,
+  TaskRoute,
 } from "./types.js";
 
 function audioPart(prepared: PreparedInput, input: MediaInput) {
@@ -74,9 +83,8 @@ function partFingerprint(part: ModelPart) {
 }
 
 function textRepresentation(
-  name: string,
   text: string,
-  details: Json,
+  producer: Producer,
   input: PreparedInput,
   sourceRange: RepresentationCoverage["sourceRange"],
 ): PreparedRepresentation {
@@ -90,7 +98,7 @@ function textRepresentation(
       files: [
         {
           name: file,
-          material: { name: file, bytes, mediaType: "text/plain" },
+          material: { name: file, bytes, mediaType: plainTextMediaType },
           sourceIndices: [0],
           coverage: {
             sourceRange,
@@ -98,20 +106,21 @@ function textRepresentation(
           },
         },
       ],
-      producer: { kind: "model", name, details },
+      producer,
     },
   };
 }
 
 export async function planModelRepresentation(params: {
-  recipe: "media.describe" | "speech.transcribe";
+  recipe: ModelRepresentationRecipe;
   model: string;
   input: MediaInput;
   call: CallOptions;
   models: Models;
   prompts: Prompts;
+  taskRoute: (taskId: string) => TaskRoute | undefined;
   preparation: Preparation;
-  descriptionDefaults?: Readonly<Record<string, Json>>;
+  alternatives: readonly (readonly ModalityNeed[])[];
 }) {
   const {
     recipe,
@@ -120,25 +129,26 @@ export async function planModelRepresentation(params: {
     call,
     models,
     prompts,
+    taskRoute,
     preparation,
-    descriptionDefaults,
+    alternatives,
   } = params;
   const capabilities = models.describe(model).capabilities;
-  const transcription = recipe === "speech.transcribe";
-  const prepared = await preparation.forModel(
+  const transcription = recipe === speechTranscriptionRecipe;
+  const prepared = await preparation.prepare(
     [{ source: input.source }],
-    transcription
-      ? {
-          minMaterials: 1,
-          maxMaterials: 1,
-          inputs: [
-            { mediaType: "audio/*", needs: ["speech"] },
-            { mediaType: "video/*", needs: ["speech"] },
-          ],
-        }
-      : mediaDescription.requirements,
+    {
+      minMaterials: 1,
+      maxMaterials: 1,
+      inputs: [
+        {
+          mediaType: input.info.mediaType,
+          accepts: transcription ? [["speech"]] : alternatives,
+        },
+      ],
+    },
     capabilities,
-    call.signal ? { signal: call.signal } : {},
+    call,
   );
   const sourceRange = combinedRange(prepared, input);
   const originalExtent =
@@ -154,28 +164,36 @@ export async function planModelRepresentation(params: {
     return {
       identity,
       originalExtent,
-      async run() {
-        const result = await models.transcribe({ model, audio }, call);
+      async run(options: CallOptions) {
+        const result = await models.transcribe({ model, audio }, options);
         return textRepresentation(
-          recipe,
           result.text,
-          parseJson(result.model),
+          { kind: "model", name: recipe, details: parseJson(result.model) },
           prepared,
           sourceRange,
         );
       },
     };
   }
-  const variables = inputVariables(mediaDescription, {}, descriptionDefaults);
+  const route = taskRoute(mediaDescription.id);
+  const work = taskGenerationInputs(mediaDescription, { variables: {} }, route);
   const prompt = await prompts.compile(
     mediaDescription,
-    variables,
+    work.variables,
     prepared.sources,
   );
-  const messages = messagesWithParts(prompt, prepared.parts);
+  const request = taskGenerationRequest<string>(
+    model,
+    mediaDescription.output,
+    prompt,
+    prepared.parts,
+    work.parameters,
+  );
+  models.validateGeneration(request);
   const identity = {
     modelFingerprint,
-    messages: messages.map(({ role, parts }) => ({
+    parameters: request.parameters ?? null,
+    messages: request.messages.map(({ role, parts }) => ({
       role,
       parts: parts.map(partFingerprint),
     })),
@@ -184,18 +202,14 @@ export async function planModelRepresentation(params: {
   return {
     identity,
     originalExtent,
-    async run() {
-      const generated = await models.generate<string>(
-        { model, output: "text", messages },
-        call,
+    async run(options: CallOptions) {
+      const generated = await models.generate(
+        request,
+        taskGenerationOptions(route, options),
       );
       return textRepresentation(
-        recipe,
         generated.value,
-        parseJson({
-          ...generated.model,
-          prompts: prompt.files.map(({ role, source }) => ({ role, source })),
-        }),
+        taskProducer(recipe, request.output, prompt, generated),
         prepared,
         sourceRange,
       );

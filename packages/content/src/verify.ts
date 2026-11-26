@@ -1,6 +1,11 @@
 import { openCall, type ArtifactRef, type CallOptions } from "@themelios/core";
 import type { Cas, Database } from "@themelios/storage";
-import { indexEdges, storedArtifact, type SourceLink } from "./artifacts.js";
+import {
+  edgeRange,
+  indexEdges,
+  storedArtifact,
+  type SourceLink,
+} from "./artifacts.js";
 import { resultLinks } from "./result-graph.js";
 import { parseManifest } from "./results.js";
 import { rawBytes, utf8Text } from "./selections.js";
@@ -10,7 +15,7 @@ interface StoredEdge {
   relation: SourceLink["relation"];
   ordinal: bigint;
   target_ref: ArtifactRef;
-  selection_json: string;
+  range_json: string | null;
 }
 
 /** Confirms that the retained result bodies and their SQLite edge index describe the same graph. */
@@ -44,7 +49,7 @@ export async function verifyContent(
         const indexed = database.read((tx) =>
           tx.sql
             .query<StoredEdge>(
-              "SELECT relation, ordinal, target_ref, selection_json FROM artifact_edges WHERE owner_ref = ?",
+              "SELECT relation, ordinal, target_ref, range_json FROM artifact_edges WHERE owner_ref = ?",
             )
             .all(ref),
         );
@@ -55,8 +60,9 @@ export async function verifyContent(
               `${edge.relation}:${edge.ordinal}`,
             )?.selection;
             return (
-              edge.target_ref !== selected?.ref ||
-              edge.selection_json !== JSON.stringify(selected)
+              selected === undefined ||
+              edge.target_ref !== selected.ref ||
+              edge.range_json !== edgeRange(selected)
             );
           })
         ) {

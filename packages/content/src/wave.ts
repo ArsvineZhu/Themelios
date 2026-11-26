@@ -1,8 +1,10 @@
 import {
   appError,
   mediaDecodeError,
+  mediaRangeFits,
   openCall,
   parseValue,
+  rangeSchema,
   readMediaBytes,
   type CallOptions,
   type MediaInput,
@@ -130,8 +132,8 @@ export function createWaveAdapter({
       if (
         range &&
         (range.kind !== "time" ||
-          range.startMs < 0 ||
-          range.endMs > durationMs ||
+          !rangeSchema.safeParse(range).success ||
+          !mediaRangeFits(range, { kind: "time", durationMs }) ||
           start >= end)
       ) {
         throw appError("content.range_invalid", {

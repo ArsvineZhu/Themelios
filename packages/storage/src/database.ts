@@ -4,16 +4,20 @@ import { existsSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import {
   appError,
+  customTimeDomainSchema,
   errorCode,
+  parseValue,
   systemClock,
   timeDomainSchema,
   toInstant,
   UTC_TIME_DOMAIN,
   type CommitPoint,
+  type CustomTimeDomain,
   type Instant,
   type TimeDomain,
 } from "@themelios/core";
 import { publishNewFile } from "@themelios/core/files";
+import { z } from "zod";
 import { storageSchemaSql } from "./schema.js";
 import {
   borrowSql,
@@ -21,14 +25,23 @@ import {
   synchronousResult,
   type ReadSql,
   type ReadTransaction,
+  type TransactionMode,
+  type TransactionResult,
   type WriteTransaction,
 } from "./transaction.js";
+
+export const databaseFileName = "main.sqlite";
+const fullSynchronous = "FULL";
+export const sqliteSynchronousSchema = z
+  .enum([fullSynchronous, "NORMAL"])
+  .default(fullSynchronous);
+type SqliteSynchronous = z.output<typeof sqliteSynchronousSchema>;
 
 export interface DatabaseOptions {
   path: string;
   formatId: string;
   readonly?: boolean;
-  synchronous?: "FULL" | "NORMAL";
+  synchronous?: z.input<typeof sqliteSynchronousSchema>;
   busyTimeoutMs?: number;
   now?: () => Instant;
 }
@@ -39,7 +52,6 @@ export class Database {
   readonly #read: SQLite;
   readonly #write: SQLite | undefined;
   readonly #now: () => Instant;
-  #active: WriteTransaction | undefined;
   #inTransaction = false;
   #closed = false;
 
@@ -59,6 +71,7 @@ export class Database {
   static init(options: DatabaseOptions & { schemaSql: string }): Database {
     const { path, formatId } = options;
     const busyTimeoutMs = validateBusyTimeout(options.busyTimeoutMs);
+    const synchronous = validateSynchronous(options.synchronous);
     publishDatabase(path, "init", (temporary) => {
       const connection = new SQLite(temporary, {
         create: true,
@@ -66,7 +79,9 @@ export class Database {
         safeIntegers: true,
       });
       try {
-        connection.exec("PRAGMA foreign_keys = ON; PRAGMA synchronous = FULL");
+        connection.exec(
+          `PRAGMA foreign_keys = ON; PRAGMA synchronous = ${fullSynchronous}`,
+        );
         connection
           .transaction(() => {
             connection.exec(storageSchemaSql);
@@ -82,15 +97,23 @@ export class Database {
         connection.close(true);
       }
     });
-    return Database.#open(options, busyTimeoutMs);
+    return Database.#open(options, busyTimeoutMs, synchronous);
   }
 
   static open(options: DatabaseOptions): Database {
-    return Database.#open(options, validateBusyTimeout(options.busyTimeoutMs));
+    return Database.#open(
+      options,
+      validateBusyTimeout(options.busyTimeoutMs),
+      validateSynchronous(options.synchronous),
+    );
   }
 
-  static #open(options: DatabaseOptions, busyTimeoutMs: number): Database {
-    const { path, formatId, synchronous = "FULL" } = options;
+  static #open(
+    options: DatabaseOptions,
+    busyTimeoutMs: number,
+    synchronous: SqliteSynchronous,
+  ): Database {
+    const { path, formatId } = options;
     const flags = { create: false, strict: true, safeIntegers: true };
     let reader: SQLite | undefined;
     let writer: SQLite | undefined;
@@ -121,9 +144,8 @@ export class Database {
         });
       if (!options.readonly) {
         writer = new SQLite(path, flags);
-        const durability = synchronous === "NORMAL" ? "NORMAL" : "FULL";
         writer.exec(
-          `PRAGMA busy_timeout = ${busyTimeoutMs}; PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA synchronous = ${durability}`,
+          `PRAGMA busy_timeout = ${busyTimeoutMs}; PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA synchronous = ${synchronous}`,
         );
       }
       return new Database(reader, writer, options.now ?? systemClock.now);
@@ -134,27 +156,26 @@ export class Database {
     }
   }
 
-  read<T>(work: (tx: ReadTransaction) => T): T {
+  read<T>(work: (tx: ReadTransaction) => TransactionResult<T>): T {
     return this.#transact(this.#read, "read", (sql) =>
       work({
         sql,
         cut: sql
-          .query<{ commit_seq: bigint }>(
-            "SELECT commit_seq FROM store_meta WHERE singleton = 1",
+          .query<{ seq: bigint }>(
+            "SELECT COALESCE(MAX(seq), 0) AS seq FROM commits",
           )
-          .get()!.commit_seq,
+          .get()!.seq,
       }),
     );
   }
 
-  write<T>(work: (tx: WriteTransaction) => T): T {
+  write<T>(work: (tx: WriteTransaction) => TransactionResult<T>): T {
     return this.#transact(this.#writable("write"), "write", (sql) => {
       const tx = {
         sql,
         ...this.#recordCommit(sql),
         registerBlob: (blob) => registerBlob(sql, blob),
       } satisfies WriteTransaction;
-      this.#active = tx;
       return work(tx);
     });
   }
@@ -176,18 +197,15 @@ export class Database {
       });
     }
     const domain = parsed.data;
-    if (domain.kind === "utc") {
+    if (domain.kind === UTC_TIME_DOMAIN.kind) {
       if (domain.label !== UTC_TIME_DOMAIN.label) {
         throw appError("time.domain_conflict", { details: { id: domain.id } });
       }
       return UTC_TIME_DOMAIN;
     }
-    const num =
-      domain.kind === "linear" ? (domain.tickSeconds?.numerator ?? null) : null;
-    const den =
-      domain.kind === "linear"
-        ? (domain.tickSeconds?.denominator ?? null)
-        : null;
+    const scale = domain.kind === "linear" ? domain.tickSeconds : undefined;
+    const num = scale?.numerator ?? null;
+    const den = scale?.denominator ?? null;
     return this.#transact(
       this.#writable("defineTimeDomain"),
       "write",
@@ -222,7 +240,7 @@ export class Database {
   }
 
   getTimeDomain(id: string): TimeDomain | undefined {
-    if (id === "utc") return UTC_TIME_DOMAIN;
+    if (id === UTC_TIME_DOMAIN.id) return UTC_TIME_DOMAIN;
     return this.read((tx) => {
       const row = findTimeDomain(tx.sql, id);
       return row ? decodeTimeDomainRow(row) : undefined;
@@ -243,11 +261,6 @@ export class Database {
   /** Rejects write preparation before an external participant publishes bytes. */
   requireWritable(operation: string): void {
     this.#writable(operation);
-  }
-
-  /** Allows a participant to verify the exact transaction it is joining. */
-  owns(tx: WriteTransaction): boolean {
-    return this.#active === tx;
   }
 
   /** Creates an SQLite-managed snapshot including all committed WAL data. */
@@ -290,23 +303,18 @@ export class Database {
   }
 
   #recordCommit(sql: WriteTransaction["sql"]) {
-    const seq = sql
-      .query<{ commit_seq: bigint }>(
-        "UPDATE store_meta SET commit_seq = commit_seq + 1 WHERE singleton = 1 RETURNING commit_seq",
-      )
-      .get()!.commit_seq;
     const recordedAt = toInstant(this.#now());
-    sql.run(
-      "INSERT INTO commits (seq, recorded_at) VALUES (?, ?)",
-      seq,
-      recordedAt,
-    );
+    const seq = sql
+      .query<{ seq: bigint }>(
+        "INSERT INTO commits (seq, recorded_at) SELECT COALESCE(MAX(seq), 0) + 1, ? FROM commits RETURNING seq",
+      )
+      .get(recordedAt)!.seq;
     return { seq, recordedAt };
   }
 
   #transact<T>(
     connection: SQLite,
-    operation: "read" | "write",
+    operation: TransactionMode,
     work: (sql: WriteTransaction["sql"]) => T,
   ): T {
     this.#check(operation);
@@ -328,7 +336,6 @@ export class Database {
         return synchronousResult(work(sql), operation);
       } finally {
         open = false;
-        this.#active = undefined;
         this.#inTransaction = false;
         for (const cursor of cursors) cursor.return?.();
       }
@@ -337,6 +344,17 @@ export class Database {
       ? transaction.immediate()
       : transaction.deferred();
   }
+}
+
+function validateSynchronous(
+  value: DatabaseOptions["synchronous"],
+): SqliteSynchronous {
+  const parsed = sqliteSynchronousSchema.safeParse(value);
+  if (!parsed.success)
+    throw appError("storage.options_invalid", {
+      details: { field: "synchronous" },
+    });
+  return parsed.data;
 }
 
 function validateBusyTimeout(value = 5000): number {
@@ -372,7 +390,7 @@ function publishDatabase(
 
 interface TimeDomainRow {
   id: string;
-  kind: "linear" | "opaque";
+  kind: CustomTimeDomain["kind"];
   label: string;
   tick_numerator: string | null;
   tick_denominator: string | null;
@@ -386,21 +404,22 @@ function findTimeDomain(sql: ReadSql, id: string) {
     .get(id);
 }
 
-function decodeTimeDomainRow(row: TimeDomainRow): TimeDomain {
-  if (row.kind === "opaque") {
-    return { id: row.id, kind: "opaque", label: row.label };
-  }
-  return {
-    id: row.id,
-    kind: "linear",
-    label: row.label,
-    ...(row.tick_numerator !== null && row.tick_denominator !== null
-      ? {
-          tickSeconds: {
-            numerator: row.tick_numerator,
-            denominator: row.tick_denominator,
-          },
-        }
-      : {}),
-  };
+function decodeTimeDomainRow(row: TimeDomainRow): CustomTimeDomain {
+  return parseValue(
+    customTimeDomainSchema,
+    {
+      id: row.id,
+      kind: row.kind,
+      label: row.label,
+      ...(row.tick_numerator === null && row.tick_denominator === null
+        ? {}
+        : {
+            tickSeconds: {
+              numerator: row.tick_numerator,
+              denominator: row.tick_denominator,
+            },
+          }),
+    },
+    "storage.database_corrupt",
+  );
 }

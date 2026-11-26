@@ -153,10 +153,9 @@ function fromSpec<App>(
 export function httpRouteSpecs(
   operation: Pick<AnyOperation, "id" | "http">,
 ): readonly HttpRouteSpec[] {
-  if (operation.http === false) return [];
-  if (operation.http === undefined)
-    return [{ method: "POST", path: `/operations/${operation.id}` }];
-  return [operation.http].flat();
+  return (
+    operation.http ?? [{ method: "POST", path: `/operations/${operation.id}` }]
+  );
 }
 
 export function compileHttpRoutes<App>(

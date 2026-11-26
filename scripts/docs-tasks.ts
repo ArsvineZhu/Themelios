@@ -40,7 +40,11 @@ for (const task of await workbenchTaskDescriptions("zh-CN")) {
     "",
     ...task.requirements.inputs.map(
       (input) =>
-        "- `" + input.mediaType + "`：" + input.needs.join("、") + "。",
+        "- `" +
+        input.mediaType +
+        "`：" +
+        input.accepts.map((needs) => needs.join(" + ")).join(" 或 ") +
+        "。",
     ),
     "",
     "变量 Schema 见 [输入合同](" +

@@ -1,6 +1,8 @@
 export {
+  applicationAdapters,
   createApplicationModule,
   type ApplicationApi,
+  type ApplicationContext,
   type ApplicationDefinition,
 } from "./application.js";
 export { applicationSettings, type ApplicationSettings } from "./settings.js";
@@ -12,6 +14,9 @@ export {
 } from "./content-operations.js";
 export {
   taskOperations,
+  taskOperationIds,
+  promptOperationIds,
+  type BatchTaskInput,
   type ApplicationTasks,
   type BatchItemResult,
   type RunTaskInput,

@@ -14,7 +14,6 @@
   "runtime.read_only": "This operation requires a writable session.",
   "runtime.close_failed": "Some resources failed to close.",
   "runtime.close_timeout": "Operations are still active after cancellation.",
-  "runtime.resource_bound": "An application resource is already bound.",
   "config.invalid": "The settings are invalid.",
   "config.unknown_setting": "This setting is not declared.",
   "config.write_failed": "Could not save the managed settings.",

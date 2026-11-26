@@ -1,14 +1,24 @@
-import { originSchema, type Materials, type Results } from "@themelios/content";
+import {
+  artifactInfoSchema,
+  materialOperationIds,
+  resultOperationIds,
+  retainedListOptionsSchema,
+  sourceTraceOptionsSchema,
+  sourceLinkSchema,
+  textBlockSchema,
+  type Materials,
+  type Results,
+} from "@themelios/content";
 import {
   artifactRefSchema,
-  commitPointSchema,
-  extentSchema,
-  instantSchema,
+  selectionSchema,
+  savedResultSchema,
   mediaTypeSchema,
 } from "@themelios/core";
 import { z } from "zod";
 import {
   defineOperation,
+  standardPermission,
   type AnyOperation,
 } from "@themelios/runtime/operations";
 import {
@@ -16,8 +26,6 @@ import {
   decodeWireAccept,
   wireAcceptSchema,
   wireCompletedSchema,
-  wireSavedSchema,
-  wireSelectionSchema,
 } from "./wire.js";
 
 export interface ContentOperationTarget {
@@ -27,46 +35,14 @@ export interface ContentOperationTarget {
 
 const requiredRef = z.strictObject({ ref: artifactRefSchema });
 
-const artifactInfoSchema = z.strictObject({
-  ref: artifactRefSchema,
-  kind: z.enum(["material", "result"]),
-  mediaType: mediaTypeSchema,
-  sizeBytes: z.int().nonnegative(),
-  name: z.string().min(1).optional(),
-  extent: extentSchema,
-  origin: originSchema.optional(),
-  createdAt: instantSchema,
-  createdAtCut: commitPointSchema,
-});
-
-const textBlockSchema = z.strictObject({
-  kind: z.enum([
-    "heading",
-    "paragraph",
-    "list",
-    "code",
-    "table",
-    "quote",
-    "thematic-break",
-  ]),
-  selection: wireSelectionSchema,
-  depth: z.int().min(1).max(6).optional(),
-  text: z.string(),
-});
-
-const sourceLinkSchema = z.strictObject({
-  relation: z.enum(["input", "file", "representation-source"]),
-  selection: wireSelectionSchema,
-});
-
 export function contentOperations<
   App extends ContentOperationTarget,
 >(): readonly AnyOperation<App>[] {
   return [
     defineOperation<App>()({
-      id: "materials.accept",
+      id: materialOperationIds.accept,
       description: "Import bytes as immutable material.",
-      permission: "write",
+      permission: standardPermission.write,
       kind: "unary",
       input: wireAcceptSchema.transform(decodeWireAccept),
       binaryInput: z
@@ -80,7 +56,7 @@ export function contentOperations<
           ...(mediaType === undefined ? {} : { mediaType }),
           ...(name === undefined ? {} : { name }),
         })),
-      output: wireSelectionSchema,
+      output: selectionSchema,
       http: [
         {
           method: "POST",
@@ -95,66 +71,69 @@ export function contentOperations<
         app.materials.accept(input, context.options),
     }),
     defineOperation<App>()({
-      id: "materials.inspect",
+      id: materialOperationIds.inspect,
       description: "Inspect material metadata.",
-      permission: "read",
+      permission: standardPermission.read,
       input: requiredRef,
       output: artifactInfoSchema,
       mcp: { readOnlyHint: true, idempotentHint: true },
-      http: {
-        method: "GET",
-        path: "/materials/:ref",
-        paramMap: { ref: "ref" },
-      },
+      http: [
+        {
+          method: "GET",
+          path: "/materials/:ref",
+          paramMap: { ref: "ref" },
+        },
+      ],
       execute(app, { ref }) {
         return app.materials.inspect(app.materials.resolve(ref));
       },
     }),
     defineOperation<App>()({
-      id: "materials.read",
+      id: materialOperationIds.read,
       description: "Read original bytes and metadata.",
-      permission: "read",
+      permission: standardPermission.read,
       kind: "binary-read",
       input: requiredRef,
       mcp: { expose: false },
-      http: {
-        method: "GET",
-        path: "/materials/:ref/content",
-        paramMap: { ref: "ref" },
-      },
+      http: [
+        {
+          method: "GET",
+          path: "/materials/:ref/content",
+          paramMap: { ref: "ref" },
+        },
+      ],
       execute(app, { ref }, context) {
         return app.materials.read(app.materials.resolve(ref), context.options);
       },
     }),
     defineOperation<App>()({
-      id: "materials.text",
+      id: materialOperationIds.text,
       description: "Read a text or JSON selection.",
-      permission: "read",
-      input: wireSelectionSchema,
+      permission: standardPermission.read,
+      input: selectionSchema,
       output: z.strictObject({ text: z.string() }),
       mcp: { readOnlyHint: true, idempotentHint: true },
-      http: { method: "POST", path: "/materials/text" },
+      http: [{ method: "POST", path: "/materials/text" }],
       async execute(app, selection, context) {
         const ref = app.materials.resolve(selection.ref);
-        const resolved =
-          selection.range === undefined
-            ? { ref }
-            : { ref, range: selection.range };
+        const resolved = { ...selection, ref };
         return { text: await app.materials.text(resolved, context.options) };
       },
     }),
     defineOperation<App>()({
-      id: "materials.structure",
+      id: materialOperationIds.structure,
       description: "Read text blocks with source coordinates.",
-      permission: "read",
+      permission: standardPermission.read,
       input: requiredRef,
       output: z.array(textBlockSchema),
       mcp: { readOnlyHint: true, idempotentHint: true },
-      http: {
-        method: "GET",
-        path: "/materials/:ref/structure",
-        paramMap: { ref: "ref" },
-      },
+      http: [
+        {
+          method: "GET",
+          path: "/materials/:ref/structure",
+          paramMap: { ref: "ref" },
+        },
+      ],
       execute(app, { ref }, context) {
         return app.materials.structure(
           app.materials.resolve(ref),
@@ -163,18 +142,20 @@ export function contentOperations<
       },
     }),
     defineOperation<App>()({
-      id: "materials.sources",
+      id: materialOperationIds.sources,
       description: "Trace links from material or result to its sources.",
-      permission: "read",
-      input: requiredRef.extend({ depth: z.int().positive().optional() }),
+      permission: standardPermission.read,
+      input: sourceTraceOptionsSchema.extend({ ref: artifactRefSchema }),
       output: z.array(sourceLinkSchema),
       mcp: { readOnlyHint: true, idempotentHint: true },
-      http: {
-        method: "GET",
-        path: "/materials/:ref/sources",
-        paramMap: { ref: "ref" },
-        queryNumbers: ["depth"],
-      },
+      http: [
+        {
+          method: "GET",
+          path: "/materials/:ref/sources",
+          paramMap: { ref: "ref" },
+          queryNumbers: ["depth"],
+        },
+      ],
       execute(app, { ref, depth }) {
         return app.materials.sources(
           app.materials.resolve(ref),
@@ -183,24 +164,23 @@ export function contentOperations<
       },
     }),
     defineOperation<App>()({
-      id: "materials.list",
-      description: "List material metadata at a commit cut.",
-      permission: "read",
-      input: z.strictObject({
-        at: commitPointSchema.optional(),
-        after: artifactRefSchema.optional(),
-        limit: z.int().positive().max(1000).optional(),
-      }),
+      id: materialOperationIds.listRetained,
+      description:
+        "List explicitly retained materials and results at a commit cut.",
+      permission: standardPermission.read,
+      input: retainedListOptionsSchema,
       output: z.array(artifactInfoSchema),
       mcp: { readOnlyHint: true, idempotentHint: true },
-      http: {
-        method: "GET",
-        path: "/materials",
-        queryStrings: ["at", "after"],
-        queryNumbers: ["limit"],
-      },
+      http: [
+        {
+          method: "GET",
+          path: "/materials",
+          queryStrings: ["at", "after"],
+          queryNumbers: ["limit"],
+        },
+      ],
       execute(app, { at, after, limit }) {
-        return app.materials.list({
+        return app.materials.listRetained({
           ...(at === undefined ? {} : { at }),
           ...(after === undefined
             ? {}
@@ -210,61 +190,67 @@ export function contentOperations<
       },
     }),
     defineOperation<App>()({
-      id: "materials.retain",
+      id: materialOperationIds.retain,
       description: "Retain a material as a root.",
-      permission: "write",
+      permission: standardPermission.write,
       input: requiredRef,
       output: z.null(),
       mcp: { expose: false, idempotentHint: true },
-      http: {
-        method: "POST",
-        path: "/materials/:ref/retain",
-        paramMap: { ref: "ref" },
-        status: 204,
-      },
+      http: [
+        {
+          method: "POST",
+          path: "/materials/:ref/retain",
+          paramMap: { ref: "ref" },
+          status: 204,
+        },
+      ],
       execute(app, { ref }) {
         app.materials.retain(app.materials.resolve(ref));
         return null;
       },
     }),
     defineOperation<App>()({
-      id: "materials.release",
+      id: materialOperationIds.release,
       description: "Release a retained material root.",
-      permission: "write",
+      permission: standardPermission.write,
       input: requiredRef,
       output: z.null(),
       mcp: { expose: false, destructiveHint: true, idempotentHint: true },
-      http: {
-        method: "POST",
-        path: "/materials/:ref/release",
-        paramMap: { ref: "ref" },
-        status: 204,
-      },
+      http: [
+        {
+          method: "POST",
+          path: "/materials/:ref/release",
+          paramMap: { ref: "ref" },
+          status: 204,
+        },
+      ],
       execute(app, { ref }) {
         app.materials.release(app.materials.resolve(ref));
         return null;
       },
     }),
     defineOperation<App>()({
-      id: "results.save",
+      id: resultOperationIds.save,
       description: "Save a completed value and its source graph.",
-      permission: "write",
+      permission: standardPermission.write,
       input: wireCompletedSchema,
-      output: wireSavedSchema,
+      output: savedResultSchema,
       mcp: { expose: false },
-      http: { method: "POST", path: "/results", status: 201 },
+      http: [{ method: "POST", path: "/results", status: 201 }],
       execute(app, wire, context) {
         return app.results.save(decodeCompleted(wire), context.options);
       },
     }),
     defineOperation<App>()({
-      id: "results.read",
+      id: resultOperationIds.read,
       description: "Read a saved result and its precise source references.",
-      permission: "read",
+      permission: standardPermission.read,
       input: requiredRef,
-      output: wireSavedSchema,
+      output: savedResultSchema,
       mcp: { readOnlyHint: true, idempotentHint: true },
-      http: { method: "GET", path: "/results/:ref", paramMap: { ref: "ref" } },
+      http: [
+        { method: "GET", path: "/results/:ref", paramMap: { ref: "ref" } },
+      ],
       execute(app, { ref }, context) {
         return app.results.read(app.materials.resolve(ref), context.options);
       },

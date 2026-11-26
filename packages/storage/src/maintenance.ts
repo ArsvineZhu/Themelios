@@ -3,6 +3,8 @@ import { lstat, mkdir, open, readdir, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import {
   appError,
+  blobDigestAlgorithm,
+  blobRefFromDigest,
   errorCode,
   throwIfAborted,
   streamChunks,
@@ -10,11 +12,20 @@ import {
   type CommitPoint,
   type Instant,
 } from "@themelios/core";
-import { type BlobInfo, type Cas, objectPath } from "./cas.js";
+import {
+  casObjectsPath,
+  casStagingDirectory,
+  isObjectShard,
+  objectPath,
+  objectRef,
+  type BlobInfo,
+  type Cas,
+} from "./cas.js";
 import type { Database } from "./database.js";
 import { writeChunk } from "./files.js";
+import { foreignKeyParents } from "./foreign-keys.js";
 import {
-  resolveCut,
+  advanceHistory,
   synchronousResult,
   type ReadSql,
   type WriteTransaction,
@@ -35,6 +46,7 @@ export interface CollectionReport {
   historyFloor: CommitPoint;
   removedBlobs: number;
   reclaimedBytes: number;
+  /** Whether the sweep finished without cancellation or filesystem errors. */
   sweepComplete: boolean;
   problems: readonly { path: string; reason: string }[];
 }
@@ -50,37 +62,17 @@ export interface CollectionOptions {
   retainSince?: CommitPoint;
   signal?: AbortSignal;
   /** Delete expired application rows in the same transaction as the history floor advances. */
-  prune?: (tx: WriteTransaction, floor: bigint) => void;
-}
-
-function quoteIdentifier(name: string): string {
-  return `"${name.replaceAll('"', '""')}"`;
+  prune?: (tx: WriteTransaction, floor: bigint) => undefined;
 }
 
 function referencedBlobs(sql: ReadSql): Map<BlobRef, BlobInfo> {
-  // The owning rows are authoritative. A foreign key can use any table and column name.
-  const owners = sql
-    .query<{ table_name: string; column_name: string }>(
-      `
-    SELECT DISTINCT s.name AS table_name, fk."from" AS column_name
-    FROM main.sqlite_schema s JOIN pragma_foreign_key_list(s.name, 'main') fk
-    WHERE s.type = 'table' AND fk."table" = 'blobs' COLLATE NOCASE
-      AND (fk."to" IS NULL OR fk."to" = 'ref' COLLATE NOCASE)
-    `,
-    )
-    .all();
   const records = new Map<BlobRef, BlobInfo>();
-  for (const { table_name, column_name } of owners) {
-    const table = quoteIdentifier(table_name);
-    const column = quoteIdentifier(column_name);
-    const rows = sql
-      .query<BlobRecord>(
-        `SELECT DISTINCT b.ref, b.size_bytes FROM main.${table} o
-       JOIN main.blobs b ON b.ref = o.${column}`,
-      )
-      .iterate();
-    for (const { ref, size_bytes } of rows)
-      records.set(ref, { ref, sizeBytes: Number(size_bytes) });
+  for (const { ref, size_bytes } of foreignKeyParents<BlobRecord>(sql, {
+    table: "blobs",
+    key: "ref",
+    columns: ["ref", "size_bytes"],
+  })) {
+    records.set(ref, { ref, sizeBytes: Number(size_bytes) });
   }
   return records;
 }
@@ -155,7 +147,7 @@ export async function verifyObject(
   if (path) await mkdir(dirname(path), { recursive: true });
   // In a private backup/restore directory the enclosing rename publishes the bytes.
   const target = path ? await open(path, "wx", 0o600) : undefined;
-  const hash = createHash("sha256");
+  const hash = createHash(blobDigestAlgorithm);
   let sizeBytes = 0;
   try {
     const stream = await cas.read(record.ref, signal ? { signal } : undefined);
@@ -169,7 +161,7 @@ export async function verifyObject(
   } finally {
     await target?.close();
   }
-  const ref = `sha256:${hash.digest("hex")}`;
+  const ref = blobRefFromDigest(hash.digest("hex"));
   if (ref !== record.ref || sizeBytes !== record.sizeBytes) {
     throw appError("storage.blob_corrupt", {
       details: {
@@ -232,9 +224,9 @@ async function* storedObjects(
   problems: CollectionProblem[],
   signal?: AbortSignal,
 ): AsyncGenerator<BlobRef> {
-  const objects = join(root, "sha256");
+  const objects = casObjectsPath(root);
   const shards = (await directoryEntries(objects, problems, signal)).filter(
-    (entry) => entry.isDirectory() && /^[a-f0-9]{2}$/.test(entry.name),
+    (entry) => entry.isDirectory() && isObjectShard(entry.name),
   );
   for (const shard of shards) {
     if (signal?.aborted) return;
@@ -243,8 +235,9 @@ async function* storedObjects(
       problems,
     )) {
       if (signal?.aborted) return;
-      if (entry.isFile() && /^[a-f0-9]{62}$/.test(entry.name))
-        yield `sha256:${shard.name}${entry.name}`;
+      if (!entry.isFile()) continue;
+      const ref = objectRef(shard.name, entry.name);
+      if (ref) yield ref;
     }
   }
 }
@@ -266,7 +259,7 @@ async function sweepStorage(
       reclaimedBytes += bytes;
     }
   }
-  const temporary = join(root, "tmp");
+  const temporary = join(root, casStagingDirectory);
   for (const entry of await directoryEntries(temporary, problems, signal)) {
     if (signal?.aborted) break;
     await removeFile(join(temporary, entry.name), problems);
@@ -274,7 +267,7 @@ async function sweepStorage(
   return {
     removedBlobs,
     reclaimedBytes,
-    sweepComplete: signal?.aborted !== true,
+    sweepComplete: signal?.aborted !== true && problems.length === 0,
     problems,
   };
 }
@@ -288,18 +281,7 @@ export async function collectStorage(
   const { signal } = options;
   throwIfAborted(signal);
   const { floor, live } = database.write((tx) => {
-    const floor =
-      options.retainSince === undefined
-        ? tx.sql
-            .query<{ history_floor: bigint }>(
-              "SELECT history_floor FROM store_meta WHERE singleton = 1",
-            )
-            .get()!.history_floor
-        : resolveCut({ sql: tx.sql, cut: tx.seq - 1n }, options.retainSince);
-    tx.sql.run(
-      "UPDATE store_meta SET history_floor = ? WHERE singleton = 1",
-      floor,
-    );
+    const floor = advanceHistory(tx, options.retainSince);
     synchronousResult(options.prune?.(tx, floor), "write");
     const live = referencedBlobs(tx.sql);
     const registered = tx.sql

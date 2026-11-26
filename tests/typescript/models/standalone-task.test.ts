@@ -1,11 +1,11 @@
 import { expect, test } from "bun:test";
 import { mkdtemp, mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import { createModels, defineTask } from "@themelios/models";
+import { createModels, defineTask, presentTask } from "@themelios/models";
 import { z } from "zod";
 import { documentSummary } from "../../../apps/workbench/src/document-summary.js";
 
-test("standalone models.runTask runs inline templates on local files without storage and deduplicates repeated sourceKeys", async () => {
+test("standalone tasks preview, run and present an inline task on a local file", async () => {
   const work = join("temp", "work");
   await mkdir(work, { recursive: true });
   const dir = await mkdtemp(join(work, "standalone-task-"));
@@ -51,10 +51,16 @@ test("standalone models.runTask runs inline templates on local files without sto
 
   const inlineSummary = defineTask({
     ...documentSummary,
+    input: z.strictObject({
+      language: z.literal("en").transform((): string => "English"),
+      maxSections: z.number().int().positive(),
+      focus: z.string().nullable(),
+    }),
+    examples: [],
     templates: {
       inline: true,
       system: "Summarize the sources faithfully.",
-      user: "Summarize {{ sources[0].name }} in {{ language }} with up to {{ maxSections }} sections.",
+      user: "Summarize {{ sources[0].name }} in {{ language }} with up to {{ maxSections }} sections. Bytes: {{ sources[0].originalExtent.bytes }}.",
     },
   });
 
@@ -78,16 +84,22 @@ test("standalone models.runTask runs inline templates on local files without sto
         },
       },
     },
-    routes: {
+    tasks: {
       [inlineSummary.id]: { model: "summarizer" },
     },
   });
 
   try {
-    const completed = await models.runTask(inlineSummary, {
-      variables: { language: "en", maxSections: 3, focus: null },
-      materials: [{ path: notePath }],
+    const input = {
+      variables: { language: "en" as const, maxSections: 3, focus: null },
+      materials: [{ source: { file: notePath } }],
+    };
+    const preview = await models.tasks.preview(inlineSummary, input);
+    expect(preview.messages.flatMap(({ parts }) => parts)).toContainEqual({
+      kind: "text",
+      text: "Summarize note.txt in English with up to 3 sections. Bytes: 46.",
     });
+    const completed = await models.tasks.run(inlineSummary, input);
     expect(completed.value).toEqual({
       title: "Router Release",
       sections: [
@@ -103,23 +115,7 @@ test("standalone models.runTask runs inline templates on local files without sto
       mediaType: "text/plain",
       name: "note.txt",
     });
-
-    const quickTask = defineTask({
-      id: "custom.echo",
-      title: "Echo Title",
-      purpose: "Return uppercase text.",
-      input: z.strictObject({ prefix: z.string() }),
-      output: "text",
-      requirements: {
-        minMaterials: 1,
-        inputs: [{ mediaType: "text/plain", needs: ["text"] }],
-      },
-      templates: {
-        inline: true,
-        user: "{{ prefix }}",
-      },
-    });
-    expect(quickTask.title).toBe("Echo Title");
+    expect(presentTask(inlineSummary, completed)).toContain("source:S1");
   } finally {
     await models.close();
     await server.stop(true);

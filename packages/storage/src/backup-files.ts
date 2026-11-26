@@ -2,7 +2,14 @@ import { createReadStream, createWriteStream } from "node:fs";
 import { lstat, mkdir, readdir, rmdir, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { pipeline } from "node:stream/promises";
-import { appError, errorCode, throwIfAborted } from "@themelios/core";
+import {
+  appError,
+  errorCode,
+  instanceConfigurationFiles,
+  instanceDirectories,
+  instanceManifestFile,
+  throwIfAborted,
+} from "@themelios/core";
 
 export async function existing(path: string) {
   try {
@@ -27,10 +34,10 @@ export async function copyBackupFile(
 }
 
 export const defaultBackupPaths: readonly string[] = [
-  "config/instance.toml",
-  "config/managed.toml",
-  "config/prompts",
-];
+  instanceConfigurationFiles.instance,
+  instanceConfigurationFiles.managed,
+  instanceConfigurationFiles.prompts,
+].map((name) => `${instanceDirectories.config}/${name}`);
 
 export async function copyConfiguration(
   source: string,
@@ -41,14 +48,14 @@ export async function copyConfiguration(
   const { signal, required } = options;
   const copied: string[] = [];
   const selected = new Set([
-    "instance.json",
+    instanceManifestFile,
     ...paths.map((path) => path.replaceAll("\\", "/")),
   ]);
   for (const relative of selected) {
     throwIfAborted(signal);
     if (
-      relative !== "instance.json" &&
-      (!relative.startsWith("config/") ||
+      relative !== instanceManifestFile &&
+      (!relative.startsWith(`${instanceDirectories.config}/`) ||
         relative.split("/").some(
           (part) =>
             !part ||
@@ -85,7 +92,7 @@ export async function copyConfiguration(
       )
     ) {
       copied.push(relative);
-    } else if (required || relative === "instance.json") {
+    } else if (required || relative === instanceManifestFile) {
       throw appError("storage.backup_invalid", {
         details: {
           path: relative,

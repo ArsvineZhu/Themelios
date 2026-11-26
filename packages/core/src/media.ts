@@ -1,9 +1,24 @@
 import { z } from "zod";
-import type { Completed, Material, ProducedFile } from "./completion.js";
+import type {
+  Completed,
+  Material,
+  ProducedFile,
+  SavedResult,
+} from "./completion.js";
 import type { Json } from "./json.js";
 import { rangeSchema, type Range } from "./selection.js";
 import { AppError, appError } from "./errors.js";
 import { openCall, streamChunks, type CallOptions } from "./flow.js";
+
+export const defaultMediaInputBytes = 67_108_864;
+export const defaultInlineMaterialBytes = 8_388_608;
+export const defaultImagePixels = 40_000_000;
+
+export const modelInputRepresentationPurpose = "model-input";
+export const representationPurposeSchema = z.enum([
+  modelInputRepresentationPurpose,
+  "retrieval-text",
+]);
 
 export const extentSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("text"), bytes: z.int().nonnegative() }),
@@ -21,6 +36,23 @@ export const extentSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("unknown") }),
 ]);
 export type Extent = z.infer<typeof extentSchema>;
+export type MediaRange = Extract<Range, { kind: "image" | "pages" | "time" }>;
+
+/** Checks a validated range against the corresponding measured original extent. */
+export function mediaRangeFits(range: MediaRange, extent: Extent): boolean {
+  switch (range.kind) {
+    case "image":
+      return (
+        extent.kind === "image" &&
+        range.x + range.width <= extent.width &&
+        range.y + range.height <= extent.height
+      );
+    case "pages":
+      return extent.kind === "pages" && range.end <= extent.pages + 1;
+    case "time":
+      return extent.kind === "time" && range.endMs <= extent.durationMs;
+  }
+}
 
 export const representationCoverageSchema = z.strictObject({
   sourceRange: z
@@ -44,19 +76,20 @@ const deliveredMediaSchema = representationCoverageSchema.extend({
 });
 export type DeliveredMedia = z.infer<typeof deliveredMediaSchema>;
 
-export interface SourceCoverage {
-  readonly originalExtent: Extent;
-  readonly requestedRange: Range | null;
-  readonly delivered: readonly DeliveredMedia[];
-}
-
 export const sourceCoverageSchema = z.strictObject({
   originalExtent: extentSchema,
   requestedRange: rangeSchema.nullable(),
-  delivered: z.array(deliveredMediaSchema),
+  delivered: z.array(deliveredMediaSchema).readonly(),
 });
+export type SourceCoverage = Readonly<z.output<typeof sourceCoverageSchema>>;
 
-export type ModalityNeed = "text" | "visual" | "speech" | "motion";
+export const modalityNeedSchema = z.enum([
+  "text",
+  "visual",
+  "speech",
+  "motion",
+]);
+export type ModalityNeed = z.output<typeof modalityNeedSchema>;
 
 /** open() always reads the complete captured original. The range is relative to that original. */
 export interface MediaInput {
@@ -102,6 +135,11 @@ export interface PreparedRepresentation {
   readonly outputs: readonly string[];
 }
 
+export interface SavedRepresentation {
+  readonly result: SavedResult;
+  readonly outputs: readonly string[];
+}
+
 export type RepresentationFile = ProducedFile & {
   readonly coverage: RepresentationCoverage;
 };
@@ -140,7 +178,7 @@ export interface RepresentationAdapter {
 export async function readMediaBytes(
   input: MediaInput,
   options?: CallOptions,
-  maxBytes = 67_108_864,
+  maxBytes = defaultMediaInputBytes,
 ): Promise<Uint8Array> {
   const scope = openCall("input.media_read", options);
   const oversized = (actual: number): never => {

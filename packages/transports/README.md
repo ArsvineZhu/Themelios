@@ -4,7 +4,7 @@
 
 - `createHttpHandler(api, options)` 提供标准 Fetch handler，支持 JSON、原始材料字节和 SSE。
 - `createMcpEndpoint(api, options)` 提供 MCP Streamable HTTP，`serveMcpStdio(api, options)` 服务本机 stdio 客户端。
-- `runApplicationCli(installation, argv, {name, operations, principal})` 生成命令并打开相应实例。
+- `runApplicationCli(installation, argv, {name, operations, principal})` 生成命令并打开相应实例。需要支持 `--installation` 时传入 `useInstallation`，由它按指定路径创建安装实例。
 - `startGrpcServer(api, {address, tls}, options)` 从 `@themelios/transports/grpc` 启动 gRPC 监听，提供 `Operations.Invoke`、`Stream` 和 `Upload`。包内 `proto/operations.proto` 可供其他语言生成客户端。
 - `serveApplication(session, {http, grpc, signal})` 管理监听和关闭；`http.options.enableMcp` 将 MCP 与 REST 放在同一监听器。
 

@@ -6,6 +6,7 @@ import {
   throwIfAborted,
   toAppError,
   type Clock,
+  type InstanceManifest,
   type Json,
   type MessageParams,
 } from "@themelios/core";
@@ -32,7 +33,8 @@ import {
 import { createLocalizer, type Dictionaries } from "./locales.js";
 import {
   openInstanceLock,
-  type EndpointUpdate,
+  type EndpointPublication,
+  type Endpoints,
   type OwnedLock,
 } from "./lock.js";
 import { createSessionNetwork, type Network } from "./network.js";
@@ -40,10 +42,11 @@ import type { InstanceInfo, InstancePaths } from "./paths.js";
 import { SessionResources } from "./resources.js";
 import { createSecrets, type Secrets } from "./secrets.js";
 import type { Configuration, SettingsDefinition } from "./settings.js";
+import { shutdownGraceMsSchema } from "./settings.js";
 
 export interface ProvisionEnvironment<S> {
   readonly paths: InstancePaths;
-  readonly instance: Omit<InstanceInfo, "paths">;
+  readonly instance: InstanceManifest;
   readonly settings: Readonly<S>;
   readonly clock: Clock;
   readonly diagnostics: Diagnostics;
@@ -57,6 +60,7 @@ export interface OpenEnvironment<S> extends ProvisionEnvironment<S> {
   readonly secrets: Secrets;
   localize(key: string, params?: MessageParams, locale?: string): string;
   own<T extends Closable>(resource: T): T;
+  /** Builds a reloadable resource keyed by its settings and by any earlier slots read by the factory. */
   bindResource<T extends Closable>(
     select: (settings: Readonly<S>) => Json,
     create: (context: ResourceContext<S>) => Promise<T>,
@@ -83,8 +87,12 @@ export interface Session<Api, S> {
   readonly instance: InstanceInfo;
   readonly configuration: Configuration<S>;
   readonly languages: readonly string[];
+  readonly locale: string;
   localize(key: string, params?: MessageParams, locale?: string): string;
-  setEndpoints(update: EndpointUpdate): Promise<void>;
+  /** Replaces all endpoints currently recorded for this session. */
+  setEndpoints(endpoints: Endpoints): Promise<void>;
+  /** Registers these endpoints until the publication or session closes. */
+  publishEndpoints(endpoints: Endpoints): Promise<EndpointPublication>;
   close(options?: { graceMs?: number }): Promise<void>;
 }
 
@@ -158,7 +166,7 @@ export async function openSession<Api, S>(
           level: () => {
             try {
               return (
-                capturedExecution.current()?.resources.runtime.logging.level ??
+                capturedExecution.currentResources()?.runtime.logging.level ??
                 ownedResources.active.runtime.logging.level
               );
             } catch {
@@ -168,7 +176,7 @@ export async function openSession<Api, S>(
           capture: () => {
             try {
               return (
-                capturedExecution.current()?.resources.runtime.logging
+                capturedExecution.currentResources()?.runtime.logging
                   .captureModelContent ??
                 ownedResources.active.runtime.logging.captureModelContent
               );
@@ -182,26 +190,14 @@ export async function openSession<Api, S>(
           },
         }),
       (settings, candidateDiagnostics) =>
-        createSessionNetwork(
-          {
-            timeoutMs: settings.network.timeoutMs,
-            noProxy: settings.network.noProxy,
-            ...(settings.network.proxy
-              ? { proxy: settings.network.proxy }
-              : {}),
-            ...(settings.network.proxyAuthorization
-              ? { proxyAuthorization: settings.network.proxyAuthorization }
-              : {}),
-            ...(settings.network.caFile
-              ? { caFile: settings.network.caFile }
-              : {}),
-            secrets,
-            diagnostics: candidateDiagnostics,
-          },
-          () => {
+        createSessionNetwork(settings.network, {
+          secrets,
+          diagnostics: candidateDiagnostics,
+          current() {
             const capture = capturedExecution.current();
             try {
-              const active = capture?.resources ?? ownedResources.active;
+              const active =
+                capturedExecution.currentResources() ?? ownedResources.active;
               return {
                 call: capture?.call,
                 diagnostics: active.diagnostics,
@@ -211,13 +207,13 @@ export async function openSession<Api, S>(
               return undefined;
             }
           },
-        ),
+        }),
       closeFailure,
     );
     resources = ownedResources;
     capturedExecution = new SessionExecution(() => ownedResources.active);
     execution = capturedExecution;
-    const current = () => capturedExecution.current()?.resources;
+    const current = () => capturedExecution.currentResources();
     (await ownedResources.prepare(initial.value)).activate();
     diagnostics = ownedResources.active.diagnostics;
     const settings = new ActiveConfiguration(
@@ -269,7 +265,16 @@ export async function openSession<Api, S>(
         return resource;
       },
       bindResource: (select, create) =>
-        settings.serialize(() => ownedResources.bind(select, create, current)),
+        settings.serialize(() =>
+          ownedResources.bind(
+            select,
+            (candidate) =>
+              capturedExecution.withPreparingResources(candidate, () =>
+                create(candidate),
+              ),
+            current,
+          ),
+        ),
     };
     const api = await application.open(env);
     throwIfAborted(options.signal);
@@ -284,25 +289,36 @@ export async function openSession<Api, S>(
       instance,
       configuration: settings,
       languages: localize.languages,
+      get locale() {
+        return (current() ?? ownedResources.active).runtime.locale;
+      },
       localize: env.localize,
       setEndpoints(endpoints) {
         if (closing || !lock)
           return Promise.reject(
             appError("runtime.closed", { details: { state: "closed" } }),
           );
-        return lock.endpoints(endpoints);
+        return lock.setEndpoints(endpoints);
+      },
+      publishEndpoints(endpoints) {
+        if (closing || !lock)
+          return Promise.reject(
+            appError("runtime.closed", { details: { state: "closed" } }),
+          );
+        return lock.publishEndpoints(endpoints);
       },
       close(options) {
         if (closing) return closing;
         const graceMs =
           options?.graceMs ??
           ownedResources.active.runtime.runtime.shutdownGraceMs;
-        if (!Number.isSafeInteger(graceMs) || graceMs < 0 || graceMs > 300000) {
+        const grace = shutdownGraceMsSchema.safeParse(graceMs);
+        if (!grace.success) {
           return Promise.reject(
             appError("input.invalid", {
               details: {
                 issues: [
-                  { path: ["graceMs"], reason: "Expected 0..300000 ms" },
+                  { path: ["graceMs"], reason: grace.error.issues[0]!.message },
                 ],
               },
             }),
@@ -311,7 +327,7 @@ export async function openSession<Api, S>(
         capturedExecution.stop();
         const updates = settings.stop();
         closing = (async () => {
-          await capturedExecution.drain(graceMs);
+          await capturedExecution.drain(grace.data);
           await updates;
           await ownedResources.close(closeOwned);
           await closeLock();

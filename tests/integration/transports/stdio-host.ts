@@ -1,5 +1,8 @@
 import { standardOperations } from "@themelios/application";
-import { createApplicationModule } from "@themelios/application";
+import {
+  applicationSettings,
+  createApplicationModule,
+} from "@themelios/application";
 import { Installation } from "@themelios/runtime";
 import { serveMcpStdio } from "@themelios/transports";
 
@@ -8,6 +11,7 @@ if (!root) throw new Error("Missing installation root");
 const installation = Installation.at(
   root,
   createApplicationModule({
+    settings: applicationSettings,
     id: "test.protocols",
     formatId: "test.protocols",
     resourceRoot: root,

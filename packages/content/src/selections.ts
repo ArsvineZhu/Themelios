@@ -1,7 +1,9 @@
 import {
+  isJsonMedia,
   isTextMedia,
-  rangeSchema,
-  type Range,
+  mediaRangeFits,
+  parseJsonPointer,
+  type MediaRange,
   type Selection,
 } from "@themelios/core";
 import type { Cas } from "@themelios/storage";
@@ -19,11 +21,6 @@ function invalidRange(selection: Selection, reason: string): never {
   });
 }
 
-export function rangeKey(range?: Range): string {
-  if (range === undefined) return "";
-  return JSON.stringify(rangeSchema.parse(range));
-}
-
 export function checkExtent(
   artifact: ArtifactDraft,
   selection: Selection,
@@ -36,7 +33,7 @@ export function checkExtent(
         invalidRange(selection, "text byte interval is outside the material");
       break;
     case "json":
-      if (!isJson(artifact.mediaType))
+      if (!isJsonMedia(artifact.mediaType))
         invalidRange(selection, "material is not JSON");
       break;
     default: {
@@ -48,36 +45,28 @@ export function checkExtent(
 
 function outsideMediaExtent(
   { extent, mediaType }: ArtifactDraft,
-  range: Extract<Range, { kind: "image" | "pages" | "time" }>,
+  range: MediaRange,
 ): string | undefined {
   switch (range.kind) {
     case "image":
-      if (
-        extent.kind !== "image" ||
-        range.x + range.width > extent.width ||
-        range.y + range.height > extent.height
-      )
+      if (!mediaRangeFits(range, extent))
         return "pixel rectangle is outside the image";
       break;
     case "pages":
       if (
         mediaType !== "application/pdf" ||
-        (extent.kind === "pages" && range.end > extent.pages + 1)
+        (extent.kind === "pages" && !mediaRangeFits(range, extent))
       )
         return "page interval is outside the document";
       break;
     case "time":
       if (
         !/^(audio|video)\//.test(mediaType) ||
-        (extent.kind === "time" && range.endMs > extent.durationMs)
+        (extent.kind === "time" && !mediaRangeFits(range, extent))
       )
         return "time interval is outside the media";
       break;
   }
-}
-
-function isJson(mediaType: string): boolean {
-  return mediaType === "application/json" || mediaType.endsWith("+json");
 }
 
 export async function rawBytes(
@@ -152,9 +141,9 @@ async function selectedJson(
     artifact.ref,
   );
   const path = selection.range?.kind === "json" ? selection.range.pointer : "";
-  if (!path) return value;
-  for (const part of path.slice(1).split("/")) {
-    const key = part.replaceAll("~1", "/").replaceAll("~0", "~");
+  const parts = parseJsonPointer(path);
+  if (!parts) invalidRange(selection, "invalid JSON Pointer");
+  for (const key of parts) {
     if (Array.isArray(value) && !/^(0|[1-9]\d*)$/.test(key))
       invalidRange(selection, "invalid JSON array index");
     if (
@@ -210,7 +199,7 @@ export async function selectionText(
   checkExtent(artifact, selection);
   if (
     selection.range?.kind === "json" ||
-    (selection.range === undefined && isJson(artifact.mediaType))
+    (selection.range === undefined && isJsonMedia(artifact.mediaType))
   ) {
     const value = await selectedJson(cas, artifact, selection, signal);
     return typeof value === "string"

@@ -1,17 +1,20 @@
 import {
   appError,
   throwIfAborted,
+  type MediaInput,
   type RepresentationFile,
 } from "@themelios/core";
 import { PDFDocument, PDFName, PDFPageLeaf } from "pdf-lib";
 import type { PDFDocumentProxy } from "pdfjs-dist/legacy/build/pdf.mjs";
+import { bounds, pdfMediaType, type PageBounds } from "./document.js";
 
 export async function copyPages(
+  input: MediaInput,
   bytes: Uint8Array,
-  range: { start: number; end: number },
   signal: AbortSignal,
 ) {
   const document = await PDFDocument.load(bytes);
+  const range = bounds(input, document.getPageCount());
   const selection = await PDFDocument.create();
   const pages = Array.from(
     { length: range.end - range.start },
@@ -38,7 +41,7 @@ export async function copyPages(
     if (embedded.length !== pages.length)
       throw appError("input.capability_missing", {
         details: {
-          mediaType: "application/pdf",
+          mediaType: pdfMediaType,
           required: "a PDF text or visual route for linked pages",
         },
       });
@@ -48,7 +51,7 @@ export async function copyPages(
 
 export async function renderPages(
   pdf: PDFDocumentProxy,
-  range: { start: number; end: number },
+  range: PageBounds,
   maximum: {
     maxWidth: number;
     maxHeight: number;
@@ -60,7 +63,7 @@ export async function renderPages(
   const canvasLibrary = await import("@napi-rs/canvas").catch((cause) => {
     throw appError("input.capability_missing", {
       cause,
-      details: { mediaType: "application/pdf", required: ["visual"] },
+      details: { mediaType: pdfMediaType, required: ["visual"] },
     });
   });
   const files: RepresentationFile[] = [];

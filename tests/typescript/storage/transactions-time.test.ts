@@ -2,7 +2,42 @@ import { expect, test } from "bun:test";
 import { mkdtemp, mkdir, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { UTC_TIME_DOMAIN } from "@themelios/core";
-import { Cas, Database } from "@themelios/storage";
+import { Cas, Database, foreignKeyParents } from "@themelios/storage";
+
+test("ownership discovery follows the foreign key's parent comparison", async () => {
+  const workspace = join("temp", "work");
+  await mkdir(workspace, { recursive: true });
+  const directory = await mkdtemp(join(workspace, "foreign-key-owners-"));
+  const database = Database.init({
+    path: join(directory, "main.sqlite"),
+    formatId: "test.storage",
+    schemaSql: `
+      CREATE TABLE parent (ref TEXT PRIMARY KEY, kind TEXT, UNIQUE (ref, kind));
+      CREATE TABLE child (ref INTEGER REFERENCES parent(ref));
+      CREATE TABLE composite (
+        ref TEXT,
+        kind TEXT,
+        FOREIGN KEY (ref, kind) REFERENCES parent(ref, kind)
+      );
+    `,
+  });
+  try {
+    database.write(({ sql }) => {
+      sql.run(
+        "INSERT INTO parent VALUES ('01', 'item'), ('1', 'item'), ('orphan', 'item')",
+      );
+      sql.run("INSERT INTO child VALUES (1)");
+      sql.run("INSERT INTO composite VALUES ('orphan', NULL)");
+    });
+    expect(
+      database.read(({ sql }) => [
+        ...foreignKeyParents(sql, { table: "parent", key: "ref" }),
+      ]),
+    ).toEqual([{ ref: "1" }]);
+  } finally {
+    database.close();
+  }
+});
 
 test("a rollback keeps the previous cut and invalidates escaped SQL handles", async () => {
   const workspace = join("temp", "work");
@@ -21,6 +56,7 @@ test("a rollback keeps the previous cut and invalidates escaped SQL handles", as
       complete = resolve;
     });
     expect(() =>
+      // @ts-expect-error Verify rollback for an invalid callback from untyped code.
       database.write(async (tx) => {
         const statement = tx.sql.query("INSERT INTO ledger VALUES (?)");
         statement.run(1);
@@ -149,7 +185,13 @@ test("an interrupted CAS stream cleans up unpublished bytes and retains existing
   const cas = await Cas.open(directory);
   try {
     const bytes = new Uint8Array([0, 91, 122, 0, 255]);
-    const [left, right] = await Promise.all([cas.put(bytes), cas.put(bytes)]);
+    const mutable = new Uint8Array(bytes);
+    const publishing = cas.put(mutable);
+    mutable.fill(0);
+    const [left, right] = await Promise.all([
+      publishing,
+      cas.put(new Blob([bytes]).stream()),
+    ]);
     expect(left).toEqual(right);
     const range = await cas.read(left.ref, { start: 1, end: 4 });
     expect(new Uint8Array(await new Response(range).arrayBuffer())).toEqual(

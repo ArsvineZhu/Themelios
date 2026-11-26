@@ -1,4 +1,4 @@
-import type { Json } from "./json.js";
+import type { ErrorInfo, Json } from "./json.js";
 
 export type MessageParams = Readonly<Record<string, string | number | boolean>>;
 
@@ -10,14 +10,6 @@ export interface AppErrorOptions {
   retryable?: boolean;
   traceId?: string;
   cause?: unknown;
-}
-
-export interface ErrorInfo {
-  code: string;
-  message: string;
-  details?: Json;
-  retryable: boolean;
-  traceId?: string;
 }
 
 export class AppError extends Error {

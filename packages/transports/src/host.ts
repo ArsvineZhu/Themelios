@@ -1,5 +1,10 @@
-import { appError, toAppError, type MessageParams } from "@themelios/core";
-import type { Session } from "@themelios/runtime";
+import { appError, type MessageParams } from "@themelios/core";
+import type {
+  EndpointPublication,
+  Endpoints,
+  Session,
+} from "@themelios/runtime";
+import { z } from "zod";
 import { startGrpcServer } from "./grpc/index.js";
 import { createHttpHandler } from "./http/server.js";
 import { serveMcpStdio } from "./mcp/server.js";
@@ -10,7 +15,12 @@ import type {
   RemoteTransportOptions,
 } from "./types.js";
 
-const defaultHttpIdleSeconds = 180;
+const maxHttpIdleTimeoutSeconds = 255;
+export const httpIdleTimeoutSecondsSchema = z
+  .int()
+  .min(0)
+  .max(maxHttpIdleTimeoutSeconds)
+  .default(180);
 
 export interface ApplicationListeners<App> {
   signal?: AbortSignal;
@@ -21,16 +31,19 @@ export interface ApplicationListeners<App> {
   };
   grpc?: GrpcListener & { options: RemoteOperationOptions<App> };
   stdio?: McpStdioOptions<App>;
-  ready?: (endpoints: Readonly<Record<string, string>>) => void;
+  ready?: (endpoints: Endpoints) => void;
 }
 
 async function openHttp<App>(
   app: App,
   listener: NonNullable<ApplicationListeners<App>["http"]>,
-  defaults: Pick<RemoteTransportOptions<App>, "translate" | "languages">,
+  defaults: Pick<
+    RemoteTransportOptions<App>,
+    "translate" | "languages" | "locale"
+  >,
 ) {
   const { address, options } = listener;
-  const idle = listener.idleTimeoutSeconds ?? defaultHttpIdleSeconds;
+  const idle = httpIdleTimeoutSecondsSchema.parse(listener.idleTimeoutSeconds);
   const handler = createHttpHandler(app, { ...defaults, ...options });
   try {
     const server = Bun.serve({
@@ -41,7 +54,10 @@ async function openHttp<App>(
       fetch(request, server) {
         return handler.fetch(request, (seconds) => {
           if (idle > 0 && (seconds === 0 || seconds > idle))
-            server.timeout(request, seconds > 255 ? 0 : seconds);
+            server.timeout(
+              request,
+              seconds > maxHttpIdleTimeoutSeconds ? 0 : seconds,
+            );
         });
       },
     });
@@ -61,30 +77,8 @@ async function openHttp<App>(
   }
 }
 
-async function publishEndpoints(
-  session: Pick<Session<unknown, unknown>, "setEndpoints">,
-  endpoints: Readonly<Record<string, string>>,
-) {
-  const advertised = { ...endpoints };
-  await session.setEndpoints((current) => ({ ...current, ...advertised }));
-  return async () => {
-    try {
-      await session.setEndpoints((current) =>
-        Object.fromEntries(
-          Object.entries(current).filter(
-            ([name, address]) => advertised[name] !== address,
-          ),
-        ),
-      );
-    } catch (error) {
-      // A closed session has already removed its owner record.
-      if (toAppError(error).code !== "runtime.closed") throw error;
-    }
-  };
-}
-
 interface OpenListener {
-  readonly endpoints: Readonly<Record<string, string>>;
+  readonly endpoints: Endpoints;
   readonly closed?: Promise<void>;
   close(): void | Promise<void>;
 }
@@ -96,10 +90,12 @@ async function* openListeners<App, S>(
 ): AsyncGenerator<OpenListener> {
   const translate = (locale: string, key: string, params?: MessageParams) =>
     session.localize(key, params, locale);
-  const defaults = { translate, languages: session.languages };
+  const locale = () => session.locale;
+  const defaults = { translate, locale, languages: session.languages };
   if (options.stdio) {
     const stdio = await serveMcpStdio(session.api, {
       translate,
+      locale,
       ...options.stdio,
     });
     yield {
@@ -122,6 +118,7 @@ async function* openListeners<App, S>(
   }
 }
 
+/** Serves and closes the configured listeners. The caller owns the supplied session. */
 export async function serveApplication<App, S>(
   session: Session<App, S>,
   options: ApplicationListeners<App>,
@@ -132,7 +129,7 @@ export async function serveApplication<App, S>(
   const close: Array<() => void | Promise<void>> = [];
   const done = Promise.withResolvers<{ error?: unknown }>();
   let stopping = false;
-  let unpublish: (() => Promise<void>) | undefined;
+  let publication: EndpointPublication | undefined;
   const stop = (result: { error?: unknown } = {}) => {
     stopping = true;
     done.resolve(result);
@@ -154,7 +151,7 @@ export async function serveApplication<App, S>(
           details: { reason: "No listener configured" },
         });
       }
-      unpublish = await publishEndpoints(session, endpoints);
+      publication = await session.publishEndpoints(endpoints);
       if (!stopping) options.ready?.(endpoints);
     }
     const result = await done.promise;
@@ -169,7 +166,7 @@ export async function serveApplication<App, S>(
     cleanupErrors = shutdown.flatMap((item) =>
       item.status === "rejected" ? [item.reason] : [],
     );
-    await unpublish?.().catch((error) => cleanupErrors.push(error));
+    await publication?.close().catch((error) => cleanupErrors.push(error));
   }
   if (hostingError && !cleanupErrors.length) throw hostingError;
   if (hostingError) cleanupErrors.unshift(hostingError);

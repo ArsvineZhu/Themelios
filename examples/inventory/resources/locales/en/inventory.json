@@ -12,7 +12,6 @@
   "inventory.row_count": "The number of data records is outside the configured range.",
   "inventory.invalid_row": "A CSV record contains an invalid field.",
   "inventory.duplicate_sku": "The same SKU appears more than once in this import.",
-  "inventory.invalid_cut": "The requested commit position is invalid or has not been committed.",
   "inventory.invalid_sku": "The SKU must contain 1 to 64 uppercase letters, digits, dots, underscores or hyphens.",
   "inventory.source_not_found": "This source is not an inventory import.",
   "inventory.usage": "Usage: main.ts ROOT init | import CSV | list [CUT] | history SKU [CUT] | export REF DESTINATION"

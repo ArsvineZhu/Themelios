@@ -1,12 +1,13 @@
-import { z } from "zod";
-import { appError, type Json } from "@themelios/core";
-import type {
-  SettingDescription,
-  SettingIssue,
-  SettingMeta,
-  SettingsDefinition,
+import { appError, formatJsonPointer, type Json } from "@themelios/core";
+import {
+  combineSettings,
+  runtimeSettings,
+  type SettingDescription,
+  type SettingIssue,
+  type SettingMeta,
+  type SettingsDefinition,
 } from "../settings.js";
-import { isObject, matches, pathParts, pointer } from "./path.js";
+import { isObject, matches, pathParts } from "./path.js";
 
 export type Field = { parts: string[]; metadata: SettingMeta };
 
@@ -25,16 +26,24 @@ export function invalid(issues: readonly SettingIssue[], cause?: unknown) {
 
 export class SettingFields<S> {
   readonly #fields: Field[];
-  readonly #schema: Json;
+  readonly definition: SettingsDefinition<S>;
 
-  constructor(readonly definition: SettingsDefinition<S>) {
-    this.#fields = Object.entries(definition.fields).map(
+  constructor(definition: SettingsDefinition<S>) {
+    this.definition = definition.includes(runtimeSettings)
+      ? definition
+      : combineSettings(runtimeSettings, definition);
+    this.#fields = Object.entries(this.definition.fields).map(
       ([path, metadata]) => ({ parts: pathParts(path), metadata }),
     );
-    this.#schema = z.toJSONSchema(definition.schema, {
-      io: "input",
-      unrepresentable: "any",
-    }) as Json;
+    for (const { parts } of this.#fields) {
+      if (this.#schemaAt(parts) === undefined)
+        throw invalid([
+          {
+            path: formatJsonPointer(parts),
+            messageKey: "config.unknown_setting",
+          },
+        ]);
+    }
   }
 
   field(path: readonly string[]): Field | undefined {
@@ -105,7 +114,7 @@ export class SettingFields<S> {
       return;
     throw invalid([
       {
-        path: pointer(path),
+        path: formatJsonPointer(path),
         messageKey: nearest ? "config.invalid_scope" : "config.unknown_setting",
         params: { scope, ...(file ? { file } : {}) },
       },
@@ -113,8 +122,10 @@ export class SettingFields<S> {
   }
 
   #schemaAt(path: readonly string[]): Json | undefined {
-    let schema: Json | undefined = this.#schema;
-    for (const part of path) {
+    const [root, ...rest] = path;
+    if (!root) return undefined;
+    let schema = this.definition.inputSchema(root);
+    for (const part of rest) {
       schema = childSchema(schema, part);
     }
     return schema;
@@ -122,7 +133,7 @@ export class SettingFields<S> {
 
   #description(path: string[], metadata: SettingMeta): SettingDescription {
     return {
-      path: pointer(path),
+      path: formatJsonPointer(path),
       schema: structuredClone(this.#schemaAt(path) ?? {}),
       metadata: structuredClone(metadata),
     };

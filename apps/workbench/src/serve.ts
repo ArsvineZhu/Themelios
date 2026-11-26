@@ -1,25 +1,32 @@
 import {
   standardOperations,
   type ApplicationApi,
-  type ApplicationSettings,
 } from "@themelios/application";
+import { materialOperationIds } from "@themelios/content";
 import { createSecrets, type Session } from "@themelios/runtime";
-import type { Principal } from "@themelios/runtime/operations";
+import {
+  standardPermission,
+  type Principal,
+} from "@themelios/runtime/operations";
 import {
   serveApplication,
+  cliServeMode,
+  type CliServeMode,
   type ApplicationListeners,
 } from "@themelios/transports";
 
-type Workbench = ApplicationApi<ApplicationSettings>;
+import { mcpTransportMode, type WorkbenchSettings } from "./settings.js";
+
+type Workbench = ApplicationApi<WorkbenchSettings>;
 
 export const localPrincipal: Principal = {
   id: "local",
-  permissions: ["read", "write", "admin"],
+  permissions: Object.values(standardPermission),
 };
 
 export async function serve(
-  session: Session<ApplicationApi<ApplicationSettings>, ApplicationSettings>,
-  mode: "serve" | "stdio",
+  session: Session<ApplicationApi<WorkbenchSettings>, WorkbenchSettings>,
+  mode: CliServeMode,
   signal?: AbortSignal,
 ) {
   const current = () => session.configuration.snapshot();
@@ -36,15 +43,14 @@ export async function serve(
   const published = {
     operations: standardOperations<Workbench>(),
     ...(allowOperations === undefined ? {} : { allowOperations }),
-    locale: () => current().locale,
   };
   const tools = {
     name: "Themelios",
     resource: {
       name: "material",
       template: "themelios://materials/{ref}" as const,
-      operation: "materials.read",
-      linksFrom: ["materials.accept", "materials.inspect"],
+      operation: materialOperationIds.read,
+      linksFrom: [materialOperationIds.accept, materialOperationIds.inspect],
     },
     agentRefs: (app: Workbench) => ({
       resolveRef: app.materials.resolve,
@@ -52,7 +58,7 @@ export async function serve(
     }),
   };
   const listeners: ApplicationListeners<Workbench> = signal ? { signal } : {};
-  if (mode === "stdio" || mcp.mode === "stdio")
+  if (mode === cliServeMode.stdio || mcp.mode === mcpTransportMode.stdio)
     listeners.stdio = {
       ...published,
       ...tools,
@@ -62,7 +68,7 @@ export async function serve(
       },
       limits: policy,
     };
-  if (mode === "stdio") return serveApplication(session, listeners);
+  if (mode === cliServeMode.stdio) return serveApplication(session, listeners);
 
   const remote = {
     ...published,
@@ -72,10 +78,12 @@ export async function serve(
   if (http.listen)
     listeners.http = {
       address: http.listen,
-      ...(http.idleTimeoutSeconds === undefined
-        ? {}
-        : { idleTimeoutSeconds: http.idleTimeoutSeconds }),
-      options: { ...remote, ...tools, enableMcp: mcp.mode === "http" },
+      idleTimeoutSeconds: http.idleTimeoutSeconds,
+      options: {
+        ...remote,
+        ...tools,
+        enableMcp: mcp.mode === mcpTransportMode.http,
+      },
     };
   if (grpc.listen)
     listeners.grpc = {

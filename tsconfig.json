@@ -10,7 +10,7 @@
     "scripts/**/*.mjs",
     "scripts/**/*.ts",
     "tests/**/*.ts",
-    "examples/sdk/*.ts"
+    "examples/**/*.ts"
   ],
   "references": [
     { "path": "./packages/core" },
